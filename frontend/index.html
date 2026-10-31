@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#008A45">
+  <title>Stock Liquidity Intelligence</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=3">
+</head>
+<body>
+  <div id="onboarding" class="onboarding">
+    <header class="welcome-top">
+      <a class="brand" href="#"><span class="brand-mark">SLI</span><span>Stock Liquidity<br><strong>Intelligence</strong></span></a>
+      <span class="eyebrow">MARKET MICROSTRUCTURE · MVP</span>
+    </header>
+    <main class="welcome-shell">
+      <div class="welcome-copy">
+        <p id="welcome-step-label" class="eyebrow">XEM TRƯỚC</p>
+        <h1 id="welcome-title">Thanh khoản nhìn rõ hơn.</h1>
+        <p id="welcome-text">Theo dõi spread và độ sâu sổ lệnh cổ phiếu trong một màn hình rõ ràng, có giải thích và nguồn dữ liệu minh bạch.</p>
+        <div id="welcome-extra" class="welcome-extra"></div>
+        <div class="welcome-actions">
+          <button id="welcome-next" class="button button-primary">Xem giới thiệu →</button>
+          <button id="welcome-skip" class="button button-quiet">Bỏ qua, vào dashboard</button>
+        </div>
+        <div class="step-dots" aria-label="Tiến trình giới thiệu"><i class="active"></i><i></i><i></i></div>
+      </div>
+      <aside class="preview-card">
+        <div class="preview-head"><div><span class="eyebrow">BẢNG ĐIỀU KHIỂN</span><h2>Thanh khoản thị trường</h2></div><span class="badge badge-demo">DEMO</span></div>
+        <div class="preview-kpis">
+          <div><small>Mã theo dõi</small><strong>03</strong></div>
+          <div><small>Median spread</small><strong>2.8 <em>bps</em></strong></div>
+          <div><small>Top 3 depth</small><strong>—</strong></div>
+        </div>
+        <div class="preview-chart">
+          <div class="chart-label"><span>Spread theo thời gian</span><span>FPT · DEMO</span></div>
+          <svg viewBox="0 0 520 150" role="img" aria-label="Biểu đồ preview minh họa">
+            <path d="M0 120 C50 115 54 65 104 75 S160 113 205 92 S250 49 300 62 S350 94 396 54 S460 59 520 25" fill="none" stroke="#42a994" stroke-width="4" stroke-linecap="round"/>
+            <path d="M0 130 H520 M0 85 H520 M0 40 H520" fill="none" stroke="#e5ece9"/>
+          </svg>
+        </div>
+        <div class="preview-book">
+          <span class="eyebrow">SỔ LỆNH · TOP 3</span>
+          <div class="book-row"><span>Bid 1</span><b>100,000</b><small>1,500</small><i class="book-track bid"></i></div>
+          <div class="book-row"><span>Ask 1</span><b>100,100</b><small>1,200</small><i class="book-track ask"></i></div>
+          <p>Giá trị minh họa · không phải dữ liệu thị trường</p>
+        </div>
+      </aside>
+    </main>
+    <footer class="welcome-foot"><span>Spread · Depth · Queue imbalance</span><span>Dữ liệu minh họa được gắn nhãn DEMO</span></footer>
+  </div>
+
+  <div id="application" class="application hidden">
+    <header class="app-header">
+      <a class="brand brand-link" href="#" data-route="overview"><span class="brand-mark">SLI</span><span>Stock Liquidity<br><strong>Intelligence</strong></span></a>
+      <div class="header-status">
+        <span id="mode-badge" class="badge badge-demo">DEMO</span><span id="connection-dot" class="status-dot"></span>
+        <span id="connection-label">Đang tải trạng thái</span><span class="status-divider"></span>
+        <span class="muted">Cập nhật</span><strong id="last-update">—</strong>
+      </div>
+    </header>
+    <nav class="main-nav" aria-label="Điều hướng chính">
+      <button data-route="overview" class="nav-item active">Tổng quan</button>
+      <button data-route="detail" class="nav-item">Chi tiết cổ phiếu</button>
+      <button data-route="rankings" class="nav-item">Xếp hạng</button>
+      <button data-route="alerts" class="nav-item">Cảnh báo</button>
+      <button data-route="methodology" class="nav-item">Dữ liệu & phương pháp</button>
+      <button data-route="guide" class="nav-item">Hướng dẫn</button>
+      <button data-route="intro" class="nav-item">Giới thiệu</button>
+      <button data-route="project" class="nav-item">Về dự án</button>
+    </nav>
+    <main class="page-shell">
+      <div id="global-notice" class="notice notice-demo"><span class="notice-icon">i</span><span id="notice-text">Đang tải dữ liệu…</span></div>
+
+      <section id="view-overview" class="view">
+        <div class="page-heading">
+          <div><p class="eyebrow">BẢNG ĐIỀU KHIỂN</p><h1>Tổng quan thanh khoản</h1><p>Quan sát spread và độ sâu sổ lệnh của các mã đang theo dõi.</p></div>
+          <div class="filter-bar">
+            <label>Mã cổ phiếu<select id="overview-symbol"></select></label>
+            <label>Lịch sử<select id="overview-limit"><option value="60">60 snapshot</option><option value="120" selected>120 snapshot</option><option value="240">240 snapshot</option></select></label>
+          </div>
+        </div>
+        <div class="kpi-grid">
+          <article class="kpi-card"><span>Mã có dữ liệu</span><strong id="kpi-symbols">—</strong><small>Trong bộ mã đang theo dõi</small></article>
+          <article class="kpi-card"><span>Median spread</span><strong id="kpi-spread">—</strong><small>bps · quoted spread</small></article>
+          <article class="kpi-card"><span>Median total depth</span><strong id="kpi-depth">—</strong><small>Top 3 · đơn vị giá × khối lượng</small></article>
+          <article class="kpi-card"><span>Queue imbalance</span><strong id="kpi-imbalance">—</strong><small>Khối lượng bid so với ask</small></article>
+          <article class="kpi-card"><span>Snapshot hợp lệ</span><strong id="kpi-valid">—</strong><small id="kpi-valid-count">Chưa có quan sát</small></article>
+        </div>
+        <div class="content-grid">
+          <article class="panel panel-wide"><div class="panel-heading"><div><h2>Diễn biến spread</h2><p>Quoted spread theo các snapshot nhận được</p></div><span id="overview-symbol-label" class="chip">—</span></div><div id="spread-chart" class="chart-box"></div></article>
+          <article class="panel"><div class="panel-heading"><div><h2>Depth hai phía</h2><p>Giá trị niêm yết top 3</p></div></div><div id="depth-chart" class="chart-box chart-short"></div><div class="legend"><span><i class="legend-bid"></i>Bid depth</span><span><i class="legend-ask"></i>Ask depth</span></div></article>
+          <article class="panel"><div class="panel-heading"><div><h2>Xếp hạng spread</h2><p>Median trong cửa sổ đang chọn</p></div><button class="text-button" data-route="rankings">Xem tất cả →</button></div><div id="overview-ranking"></div></article>
+        </div>
+        <p class="footnote">Top 3 depth là lượng đang niêm yết, không phải toàn bộ sổ lệnh hay thanh khoản đảm bảo khớp.</p>
+      </section>
+
+      <section id="view-detail" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">PHÂN TÍCH MÃ</p><h1>Chi tiết cổ phiếu</h1><p>Xem snapshot, spread, depth và queue imbalance của một mã.</p></div><div class="filter-bar"><label>Mã cổ phiếu<select id="detail-symbol"></select></label></div></div>
+        <div class="kpi-grid">
+          <article class="kpi-card"><span>Spread hiện tại</span><strong id="detail-spread">—</strong><small>bps</small></article>
+          <article class="kpi-card"><span>Bid depth value</span><strong id="detail-bid-depth">—</strong><small>Top 3</small></article>
+          <article class="kpi-card"><span>Ask depth value</span><strong id="detail-ask-depth">—</strong><small>Top 3</small></article>
+          <article class="kpi-card"><span>Queue imbalance</span><strong id="detail-imbalance">—</strong><small>Từ −1 đến +1</small></article>
+          <article class="kpi-card"><span>Tỷ lệ hợp lệ</span><strong id="detail-valid">—</strong><small id="detail-snapshots">—</small></article>
+        </div>
+        <div class="content-grid">
+          <article class="panel panel-wide"><div class="panel-heading"><div><h2>Spread theo thời gian</h2><p>Snapshot được lưu trong database</p></div></div><div id="detail-spread-chart" class="chart-box"></div></article>
+          <article class="panel"><div class="panel-heading"><div><h2>Sổ lệnh gần nhất</h2><p id="book-time">Chưa có dữ liệu</p></div><span id="book-validity" class="chip">—</span></div><div id="orderbook"></div></article>
+          <article class="panel"><div class="panel-heading"><div><h2>Bid / ask depth</h2><p>Giá trị niêm yết top 3</p></div></div><div id="detail-depth-chart" class="chart-box chart-short"></div><div class="legend"><span><i class="legend-bid"></i>Bid</span><span><i class="legend-ask"></i>Ask</span></div></article>
+        </div>
+      </section>
+
+      <section id="view-rankings" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">SO SÁNH CÁC MÃ</p><h1>Xếp hạng thanh khoản</h1><p>Các bảng xếp hạng tách riêng từng thước đo, không gộp thành một điểm tổng hợp.</p></div><label class="filter-bar">Cửa sổ<select id="ranking-limit"><option value="60">60 snapshot</option><option value="120" selected>120 snapshot</option><option value="500">500 snapshot</option></select></label></div>
+        <div class="content-grid"><article class="panel"><div class="panel-heading"><div><h2>Spread thấp nhất</h2><p>Median quoted spread · bps</p></div></div><div id="ranking-spread"></div></article><article class="panel"><div class="panel-heading"><div><h2>Depth cao nhất</h2><p>Median total depth · top 3</p></div></div><div id="ranking-depth"></div></article></div>
+      </section>
+
+      <section id="view-alerts" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">GIÁM SÁT THAY ĐỔI</p><h1>Cảnh báo</h1><p>Các cảnh báo được so với baseline lịch sử của từng mã khi đủ số quan sát.</p></div></div>
+        <div id="alert-summary" class="notice"><span class="notice-icon">i</span><span>Đang tải cảnh báo…</span></div>
+        <article class="panel"><div class="panel-heading"><div><h2>Lịch sử cảnh báo</h2><p>Metric, ngưỡng tham chiếu và lý do phát cảnh báo</p></div></div><div id="alerts-table"></div></article>
+      </section>
+
+      <section id="view-methodology" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">NGUỒN VÀ PHƯƠNG PHÁP</p><h1>Dữ liệu & phương pháp</h1><p>Trạng thái collector, nguồn dữ liệu và quy tắc tính toán.</p></div></div>
+        <div class="content-grid">
+          <article class="panel"><div class="panel-heading"><div><h2>Collector</h2><p>Chạy độc lập với các tab dashboard</p></div></div><div id="collector-status" class="collector-status"></div><div class="button-row"><button id="start-live" class="button button-primary">Bắt đầu luồng NEO</button><button id="stop-live" class="button button-secondary">Dừng collector</button><button id="use-demo" class="button button-quiet">Dùng dữ liệu DEMO</button></div><p class="small-note">LIVE sẽ gửi thông tin đăng nhập từ .env tới API token VPBankS và access token tới WebSocket NEO. Chỉ chạy khi tài khoản và IP đã được cấp quyền.</p></article>
+          <article class="panel"><div class="panel-heading"><div><h2>Pipeline dữ liệu</h2><p>Các bước xử lý mỗi message</p></div></div><ol class="pipeline"><li><b>NEO stockInfo</b><span>Nhận message qua WebSocket</span></li><li><b>Map & validate</b><span>Chuẩn hóa trường và giữ null</span></li><li><b>SQLite</b><span>Lưu snapshot và payload đã lọc thông tin nhạy cảm</span></li><li><b>Analytics</b><span>Tính spread, depth và imbalance</span></li><li><b>Dashboard</b><span>Đọc dữ liệu lưu sẵn; không mở socket mới</span></li></ol></article>
+          <article class="panel panel-wide"><div class="panel-heading"><div><h2>Công thức và giới hạn</h2><p>Giải thích cách diễn giải chỉ tiêu</p></div></div><div id="method-content" class="method-grid"></div></article>
+        </div>
+      </section>
+
+      <section id="view-guide" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">BẮT ĐẦU NHANH</p><h1>Hướng dẫn sử dụng</h1><p>Đọc dữ liệu theo thứ tự để phân biệt snapshot, metric và cảnh báo.</p></div><button class="button button-primary" data-route="overview">Mở tổng quan →</button></div>
+        <div class="guide-steps">
+          <article><span>01</span><h2>Kiểm tra trạng thái</h2><p>Xem nhãn DEMO/LIVE, trạng thái collector và thời điểm nhận snapshot cuối.</p></article>
+          <article><span>02</span><h2>Chọn mã và cửa sổ</h2><p>Lọc mã cổ phiếu và số snapshot dùng để tổng hợp các chỉ tiêu.</p></article>
+          <article><span>03</span><h2>Đọc spread và depth</h2><p>Spread đo khoảng cách bid1–ask1. Depth là lượng niêm yết tối đa ba mức.</p></article>
+          <article><span>04</span><h2>Kiểm tra cảnh báo</h2><p>Đọc metric hiện tại, baseline, số mẫu và lý do. Thiếu lịch sử thì chưa phát cảnh báo percentile.</p></article>
+        </div>
+        <article class="panel disclaimer"><h2>Giới hạn diễn giải</h2><p>Snapshot sổ lệnh có thể thay đổi hoặc bị hủy trước khi khớp. Queue imbalance mô tả lượng niêm yết tại thời điểm quan sát, không dự báo giá và không phải khuyến nghị đầu tư.</p></article>
+      </section>
+
+      <section id="view-intro" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">GIỚI THIỆU</p><h1>Stock Liquidity Intelligence</h1><p>Hệ thống phân tích và giám sát thanh khoản cổ phiếu từ dữ liệu sổ lệnh.</p></div></div>
+        <div class="content-grid">
+          <article class="panel"><span class="eyebrow">MỤC TIÊU</span><h2>Nhìn vào điều kiện giao dịch đang niêm yết</h2><p>SLI quan sát giá và khối lượng chờ mua/bán để mô tả spread, độ sâu và mức cân bằng giữa hai phía sổ lệnh.</p></article>
+          <article class="panel"><span class="eyebrow">PHẠM VI</span><h2>Hỗ trợ quan sát, không thực hiện giao dịch</h2><p>Sản phẩm không đặt lệnh, không khẳng định có thể dự báo chiều giá và không đảm bảo snapshot sẽ khớp được.</p></article>
+          <article class="panel"><span class="eyebrow">CÁCH ĐỌC</span><h2>Mỗi metric có công thức và giới hạn</h2><p>Chỉ tiêu được tính từ dữ liệu hợp lệ; trường thiếu được đánh dấu không khả dụng thay vì tự thay bằng 0.</p></article>
+        </div>
+      </section>
+
+      <section id="view-project" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">VỀ DỰ ÁN</p><h1>Mô tả dự án</h1><p>Đề tài học thuật về thanh khoản niêm yết và vi cấu trúc thị trường.</p></div></div>
+        <article class="panel project-copy"><h2>Vấn đề nghiên cứu</h2><p>Giá và khối lượng khớp lệnh chưa mô tả đầy đủ điều kiện giao dịch đang hiển thị. SLI bổ sung quan sát khoảng cách bid–ask, khối lượng niêm yết và cách các chỉ tiêu thay đổi theo thời gian.</p><h2>Đầu ra</h2><p>Collector, kho snapshot cục bộ, analytics có thể tái lập, bảng tổng quan, biểu đồ, ranking và cảnh báo dựa trên baseline từng mã.</p><h2>Giới hạn</h2><p>Dữ liệu top 3 không đại diện toàn bộ order book; lệnh niêm yết có thể thay đổi trước khi khớp. Cảnh báo là quy tắc thống kê của sản phẩm, không phải chuẩn pháp lý hay khuyến nghị đầu tư.</p></article>
+      </section>
+    </main>
+    <footer class="app-footer"><span>SLI · Stock Liquidity Intelligence</span><span>Snapshot sổ lệnh · Không phải khuyến nghị đầu tư</span></footer>
+  </div>
+  <script src="/assets/app.js" defer></script>
+  <script src="/assets/enhancements.js?v=10" defer></script>
+</body>
+</html>
+
+
+
