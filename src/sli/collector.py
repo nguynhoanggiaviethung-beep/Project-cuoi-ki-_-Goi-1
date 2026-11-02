@@ -1,6 +1,9 @@
+import base64
+import binascii
 import json
 import os
 import threading
+import time
 
 import requests
 import websocket
@@ -74,10 +77,25 @@ class NeoCollector:
         self.runtime.update(connection_status="disconnected")
 
     def _token(self):
+        configured_token = os.getenv("NEO_ACCESS_TOKEN", "").strip()
+        if configured_token:
+            # Read only the JWT expiry locally; the server still validates its signature.
+            try:
+                payload = configured_token.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(payload))
+                expires_at = int(claims["exp"])
+                if expires_at > int(time.time()):
+                    return configured_token
+            except (IndexError, KeyError, TypeError, ValueError, binascii.Error):
+                pass
+
         username = os.getenv("VPBS_USERNAME")
         password = os.getenv("VPBS_PASSWORD")
         if not username or not password:
-            raise RuntimeError("Thiếu VPBS_USERNAME hoặc VPBS_PASSWORD trong .env.")
+            if configured_token:
+                raise RuntimeError("NEO_ACCESS_TOKEN hết hạn hoặc không hợp lệ; cập nhật token trong .env.")
+            raise RuntimeError("Thiếu NEO_ACCESS_TOKEN hoặc VPBS_USERNAME/VPBS_PASSWORD trong .env.")
         response = requests.post(
             config.TOKEN_URL,
             headers={"Content-Type": "application/json"},
@@ -104,9 +122,22 @@ class NeoCollector:
         while not self._stop.is_set():
             try:
                 token = self._token()
+                auth_received = threading.Event()
 
                 def on_open(socket_app):
                     socket_app.send(json.dumps({"action": "auth", "data": token}))
+
+                    def auth_timeout():
+                        if not auth_received.is_set() and not self._stop.is_set():
+                            self.runtime.update(
+                                connection_status="error",
+                                last_error="Đã gửi auth nhưng NEO không phản hồi trong 15 giây.",
+                            )
+                            socket_app.close()
+
+                    timer = threading.Timer(15, auth_timeout)
+                    timer.daemon = True
+                    timer.start()
 
                 def on_message(socket_app, message):
                     self.runtime.increment("messages_received")
@@ -118,6 +149,7 @@ class NeoCollector:
                         return
 
                     if isinstance(payload, dict) and payload.get("type") == "auth":
+                        auth_received.set()
                         if payload.get("status") == "success":
                             self.runtime.update(connection_status="connected", last_error=None)
                             socket_app.send(json.dumps({
