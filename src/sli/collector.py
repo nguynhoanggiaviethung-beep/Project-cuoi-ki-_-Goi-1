@@ -48,12 +48,14 @@ class NeoCollector:
         self._thread = None
         self._ws = None
         self._lock = threading.Lock()
+        self._run_id = None
 
     def start(self):
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return False
             self._stop.clear()
+            self._run_id = database.start_collector_run()
             self.runtime.update(
                 mode="live", connection_status="connecting",
                 last_error=None, messages_received=0,
@@ -75,6 +77,8 @@ class NeoCollector:
             except Exception:
                 pass
         self.runtime.update(connection_status="disconnected")
+        database.finish_collector_run(self._run_id, "stopped", self.runtime.snapshot())
+        self._run_id = None
 
     def _token(self):
         configured_token = os.getenv("NEO_ACCESS_TOKEN", "").strip()
@@ -146,6 +150,7 @@ class NeoCollector:
                     except (json.JSONDecodeError, TypeError):
                         self.runtime.increment("rows_invalid")
                         self.runtime.update(last_error="WebSocket gửi message không phải JSON.")
+                        database.log_ingestion_error("websocket_message_not_json")
                         return
 
                     if isinstance(payload, dict) and payload.get("type") == "auth":
@@ -171,6 +176,7 @@ class NeoCollector:
                         self.runtime.update(
                             last_error="Payload chưa map được; cần xác minh cấu trúc JSON thực tế."
                         )
+                        database.log_ingestion_error("payload_shape_unmapped", payload)
                         return
                     for observation in observations:
                         self.runtime.update(last_message_at=observation["received_at_utc"])
@@ -181,6 +187,10 @@ class NeoCollector:
                             self.runtime.increment("rows_valid")
                         else:
                             self.runtime.increment("rows_invalid")
+                            database.log_ingestion_error(
+                                observation.get("validation_reason") or observation["validation_status"],
+                                observation.get("raw_payload"), observation.get("symbol"),
+                            )
 
                 def on_error(_socket_app, error):
                     self.runtime.update(
@@ -190,7 +200,9 @@ class NeoCollector:
 
                 def on_close(_socket_app, _status, _message):
                     if not self._stop.is_set():
-                        self.runtime.update(connection_status="reconnecting")
+                        current = self.runtime.snapshot().get("connection_status")
+                        if current != "error":
+                            self.runtime.update(connection_status="reconnecting")
 
                 socket_app = websocket.WebSocketApp(
                     config.NEO_WS_URL,
@@ -218,3 +230,5 @@ class NeoCollector:
 
         self._ws = None
         self.runtime.update(connection_status="disconnected")
+        database.finish_collector_run(self._run_id, "stopped", self.runtime.snapshot())
+        self._run_id = None

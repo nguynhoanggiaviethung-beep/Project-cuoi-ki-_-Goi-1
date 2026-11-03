@@ -3,11 +3,13 @@ from statistics import median
 import threading
 import time
 
-from fastapi import FastAPI, Query
+from fastapi import Body, FastAPI, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config, database
+from .bookwalk import estimate as estimate_bookwalk
+from .market_rules import session_phase
 from .collector import NeoCollector, RuntimeState
 
 STATIC_DIR = config.ROOT_DIR / "frontend"
@@ -79,8 +81,13 @@ def status():
     rows = database.fetch_observations(source, limit=1)
     latest = rows[0]["received_at_utc"] if rows else None
     is_stale = False
+    now = datetime.now(config.TIMEZONE)
+    markets = {config.SYMBOL_MARKETS.get(symbol, "HOSE") for symbol in config.WATCHLIST}
+    phases = {session_phase(now, market) for market in markets}
+    market_open = any(database.is_session_open(now.date().isoformat(), market) for market in markets)
+    expected_stream = market_open and bool(phases.intersection({"CONTINUOUS_AM", "CONTINUOUS_PM"}))
     if source == "live":
-        if latest:
+        if latest and expected_stream:
             try:
                 stamp = datetime.fromisoformat(latest.replace("Z", "+00:00"))
                 if stamp.tzinfo is None:
@@ -90,7 +97,7 @@ def status():
                 ).total_seconds() > config.STALE_AFTER_SECONDS
             except ValueError:
                 is_stale = True
-        else:
+        elif not latest and expected_stream:
             is_stale = True
     state.update({
         "source": source,
@@ -98,11 +105,14 @@ def status():
         "is_stale": is_stale,
         "stale_after_seconds": config.STALE_AFTER_SECONDS,
         "configured_watchlist": config.WATCHLIST,
+        "market_phase": sorted(phases)[0] if len(phases) == 1 else sorted(phases),
+        "market_session_expected": expected_stream,
     })
     if source == "demo":
         state["connection_status"] = "demo"
     elif is_stale and state["connection_status"] == "connected":
         state["connection_status"] = "stale"
+    database.update_stale_alert(source, is_stale, config.STALE_AFTER_SECONDS, latest)
     return state
 
 
@@ -116,13 +126,16 @@ def symbols():
 
 
 @app.get("/api/overview")
-def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le=2000)):
+def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le=2000),
+             start_at: str | None = None, end_at: str | None = None,
+             phase: str | None = Query(default=None, pattern="^(ATO|CONTINUOUS_AM|BREAK|CONTINUOUS_PM|ATC|CLOSED)$")):
     source = _source()
     available = database.list_symbols(source)
     selected = symbol.upper() if symbol and symbol.upper() not in ("__ALL__", "ALL") else None
     groups = {}
     for ticker in ([selected] if selected else available):
-        rows = list(reversed(database.fetch_observations(source, symbol=ticker, limit=limit)))
+        rows = list(reversed(database.fetch_observations(source, symbol=ticker, limit=limit,
+                                                         start_at=start_at, end_at=end_at, phase=phase)))
         if rows:
             groups[ticker] = [_serialize_row(row) for row in rows]
     flattened = [row for series in groups.values() for row in series]
@@ -141,8 +154,11 @@ def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le
 
 
 @app.get("/api/symbol/{symbol}")
-def symbol_detail(symbol: str, limit: int = Query(default=300, ge=1, le=2000)):
-    rows = list(reversed(database.fetch_observations(_source(), symbol=symbol, limit=limit)))
+def symbol_detail(symbol: str, limit: int = Query(default=300, ge=1, le=2000),
+                  start_at: str | None = None, end_at: str | None = None,
+                  phase: str | None = Query(default=None, pattern="^(ATO|CONTINUOUS_AM|BREAK|CONTINUOUS_PM|ATC|CLOSED)$")):
+    rows = list(reversed(database.fetch_observations(_source(), symbol=symbol, limit=limit,
+                                                      start_at=start_at, end_at=end_at, phase=phase)))
     if not rows:
         return {"source": _source(), "symbol": symbol.upper(), "latest": None, "series": []}
     valid = [row for row in rows if row["validation_status"] == "valid"]
@@ -169,47 +185,197 @@ def company(symbol: str):
 
 
 @app.get("/api/rankings")
-def rankings(limit: int = Query(default=500, ge=1, le=2000)):
+def rankings(limit: int = Query(default=500, ge=1, le=2000), start_at: str | None = None,
+              end_at: str | None = None, phase: str | None = Query(default=None, pattern="^(OPEN|MID|CLOSE)$")):
     source = _source()
     results = []
     for symbol in database.list_symbols(source):
-        rows = database.fetch_observations(source, symbol=symbol, limit=limit)
-        valid = [row for row in rows if row["validation_status"] == "valid"]
-        if not valid:
+        bars_for_symbol = database.fetch_bars(source, symbol=symbol, limit=limit,
+                                              start_at=start_at, end_at=end_at, bucket=phase)
+        if source == "live" and bars_for_symbol:
+            points = bars_for_symbol
+            spreads = _numeric([row["spread_bps"] for row in points])
+            depths = _numeric([row["total_depth_value"] for row in points])
+            valid_count = len(points)
+            sample_kind = "bars_1m"
+            latest_spread = points[-1]["spread_bps"]
+            latest_depth = points[-1]["total_depth_value"]
+            snapshot_count = len(database.fetch_observations(source, symbol=symbol, limit=limit,
+                                                             start_at=start_at, end_at=end_at))
+        else:
+            rows = database.fetch_observations(source, symbol=symbol, limit=limit,
+                                               start_at=start_at, end_at=end_at)
+            valid = [row for row in rows if row["validation_status"] == "valid"]
+            spreads = _numeric([row["spread_bps"] for row in valid])
+            depths = _numeric([row["total_depth_value"] for row in valid])
+            valid_count = len(valid)
+            snapshot_count = len(rows)
+            sample_kind = "synthetic_demo_snapshots" if source == "demo" else "snapshots"
+            latest_spread = valid[0]["spread_bps"] if valid else None
+            latest_depth = valid[0]["total_depth_value"] if valid else None
+        if valid_count == 0:
             continue
-        spreads = _numeric([row["spread_bps"] for row in valid])
-        depths = _numeric([row["total_depth_value"] for row in valid])
         results.append({
             "symbol": symbol,
-            "snapshot_count": len(rows),
+            "snapshot_count": snapshot_count,
+            "sample_count": valid_count,
+            "bar_count": valid_count if sample_kind == "bars_1m" else 0,
+            "sample_kind": sample_kind,
             "median_spread_bps": median(spreads) if spreads else None,
             "median_total_depth_value": median(depths) if depths else None,
-            "latest_spread_bps": valid[0]["spread_bps"],
-            "latest_total_depth_value": valid[0]["total_depth_value"],
+            "latest_spread_bps": latest_spread,
+            "latest_total_depth_value": latest_depth,
+            "spread_expansion_bps": (latest_spread - median(spreads)) if spreads and latest_spread is not None else None,
+            "depth_change_pct": ((latest_depth / median(depths) - 1) * 100) if depths and median(depths) and latest_depth is not None else None,
         })
+    minimum_samples = config.RANKING_MIN_BARS if source == "live" else config.RANKING_MIN_SNAPSHOTS
+    eligible = [row for row in results if row["sample_count"] >= minimum_samples]
+    low_spread = sorted(eligible, key=lambda row: row["median_spread_bps"] if row["median_spread_bps"] is not None else float("inf"))
+    high_depth = sorted(eligible, key=lambda row: row["median_total_depth_value"] if row["median_total_depth_value"] is not None else float("-inf"), reverse=True)
+    depth_falling = sorted((row for row in eligible if row["depth_change_pct"] is not None), key=lambda row: row["depth_change_pct"])
+    spread_widening = sorted((row for row in eligible if row["spread_expansion_bps"] is not None), key=lambda row: row["spread_expansion_bps"], reverse=True)
     return {
         "source": source,
         "sample_window": limit,
-        "lowest_spread": sorted(
-            results,
-            key=lambda row: row["median_spread_bps"] if row["median_spread_bps"] is not None else float("inf"),
-        ),
-        "highest_depth": sorted(
-            results,
-            key=lambda row: row["median_total_depth_value"] if row["median_total_depth_value"] is not None else float("-inf"),
-            reverse=True,
-        ),
+        "minimum_eligible_samples": minimum_samples,
+        "filter": {"start_at": start_at, "end_at": end_at, "phase": phase},
+        "lowest_spread": low_spread,
+        "highest_depth": high_depth,
+        "depth_falling": depth_falling,
+        "spread_widening": spread_widening,
         "symbols": results,
     }
 
 
+@app.get("/api/bars")
+def bars(symbol: str | None = None, limit: int = Query(default=1000, ge=1, le=10000),
+         source: str | None = None, start_at: str | None = None, end_at: str | None = None,
+         phase: str | None = Query(default=None, pattern="^(OPEN|MID|CLOSE)$")):
+    return {"source": source or _source(), "bars": database.fetch_bars(
+        source or _source(), symbol, limit, start_at, end_at, phase)}
+
+
+@app.get("/api/intraday-profile")
+def intraday_profile(symbol: str | None = None, start_at: str | None = None,
+                     end_at: str | None = None, source: str | None = None):
+    selected_source = source or _source()
+    bars_data = database.fetch_bars(selected_source, symbol, 10000, start_at, end_at)
+    grouped = {}
+    for row in bars_data:
+        minute = datetime.fromisoformat(row["minute_vn"]).strftime("%H:%M")
+        slot = grouped.setdefault(minute, {"spread": [], "ticks": [], "depth": [], "snapshots": 0, "symbols": set()})
+        for key, target in (("spread_bps", "spread"), ("spread_ticks", "ticks"), ("total_depth_value", "depth")):
+            if row.get(key) is not None:
+                slot[target].append(row[key])
+        slot["snapshots"] += row["n_snapshots"]
+        slot["symbols"].add(row["symbol"])
+    profile = [{"minute": minute, "median_spread_bps": median(v["spread"]) if v["spread"] else None,
+                "median_spread_ticks": median(v["ticks"]) if v["ticks"] else None,
+                "median_total_depth_value": median(v["depth"]) if v["depth"] else None,
+                "bar_count": len(v["spread"]) or len(v["depth"]), "snapshot_count": v["snapshots"],
+                "symbols_count": len(v["symbols"])} for minute, v in sorted(grouped.items())]
+    return {"source": selected_source, "symbol": symbol.upper() if symbol else None,
+            "profile": profile, "basis": "bars_1m", "note": "Chỉ tổng hợp bar đã lưu trong phiên liên tục."}
+
+
+@app.get("/api/liquidity-map")
+def liquidity_map(limit: int = Query(default=2000, ge=1, le=10000),
+                  start_at: str | None = None, end_at: str | None = None,
+                  source: str | None = None):
+    selected_source = source or _source()
+    points = []
+    for symbol in database.list_symbols(selected_source):
+        bars_data = database.fetch_bars(selected_source, symbol, limit, start_at, end_at)
+        if selected_source == "live" and bars_data:
+            spreads = _numeric([row["spread_bps"] for row in bars_data])
+            depths = _numeric([row["total_depth_value"] for row in bars_data])
+            count, basis = len(bars_data), "bars_1m"
+        else:
+            rows = database.fetch_observations(selected_source, symbol, limit, start_at, end_at)
+            valid = [row for row in rows if row["validation_status"] == "valid"]
+            spreads = _numeric([row["spread_bps"] for row in valid])
+            depths = _numeric([row["total_depth_value"] for row in valid])
+            count, basis = len(valid), "synthetic_demo_snapshots" if selected_source == "demo" else "snapshots"
+        minimum = config.RANKING_MIN_BARS if basis == "bars_1m" else config.RANKING_MIN_SNAPSHOTS
+        if count >= minimum and spreads and depths:
+            points.append({"symbol": symbol, "median_spread_bps": median(spreads),
+                           "median_total_depth_value": median(depths), "sample_count": count,
+                           "sample_kind": basis})
+    spread_mid = median([p["median_spread_bps"] for p in points]) if points else None
+    depth_mid = median([p["median_total_depth_value"] for p in points]) if points else None
+    for point in points:
+        point["quadrant"] = ("spread_wide_depth_thin" if point["median_spread_bps"] > spread_mid and point["median_total_depth_value"] < depth_mid
+                             else "spread_narrow_depth_thick" if point["median_spread_bps"] <= spread_mid and point["median_total_depth_value"] >= depth_mid
+                             else "spread_wide_depth_thick" if point["median_spread_bps"] > spread_mid
+                             else "spread_narrow_depth_thin")
+    return {"source": selected_source, "points": points, "spread_median": spread_mid,
+            "depth_median": depth_mid, "minimum_samples": config.RANKING_MIN_BARS if selected_source == "live" else config.RANKING_MIN_SNAPSHOTS,
+            "depth_axis": "log", "note": "Bản đồ mô tả tương đối trong watchlist, không đại diện toàn thị trường."}
+
+
+@app.post("/api/bookwalk/{symbol}")
+def bookwalk(symbol: str, side: str = Query(..., pattern="^(buy|sell)$"),
+             quantity: int | None = Query(default=None, ge=1),
+             notional: float | None = Query(default=None, gt=0),
+             max_slippage_bps: float | None = Query(default=None, ge=0)):
+    rows = database.fetch_observations(_source(), symbol=symbol, limit=1)
+    if not rows:
+        return {"status": "unavailable", "reason": "no snapshot for symbol", "symbol": symbol.upper()}
+    row = rows[0]
+    observation = {key: row.get(key) for key in (
+        "bid_price_1", "bid_volume_1", "bid_price_2", "bid_volume_2", "bid_price_3", "bid_volume_3",
+        "ask_price_1", "ask_volume_1", "ask_price_2", "ask_volume_2", "ask_price_3", "ask_volume_3", "market")}
+    try:
+        result = estimate_bookwalk(observation, side, quantity, notional, max_slippage_bps)
+    except ValueError as exc:
+        return {"status": "invalid_input", "reason": str(exc)}
+    return {"symbol": symbol.upper(), "snapshot_at": row.get("received_at_vn", row.get("received_at_utc")), **result}
+
+
 @app.get("/api/alerts")
 def alerts(limit: int = Query(default=100, ge=1, le=500)):
+    state = status()
+    items = database.fetch_alerts(_source(), limit)
     return {
         "source": _source(),
-        "baseline_min_observations": config.BASELINE_MIN_OBSERVATIONS,
-        "alerts": database.fetch_alerts(_source(), limit),
+        "baseline_min_observations": config.BASELINE_MIN_BARS,
+        "baseline_min_bars": config.BASELINE_MIN_BARS,
+        "baseline_sessions": config.BASELINE_SESSIONS,
+        "alerts": items[:limit],
     }
+
+
+@app.get("/api/collector/runs")
+def collector_runs(limit: int = Query(default=20, ge=1, le=100)):
+    return {"runs": database.recent_collector_runs(limit)}
+
+
+@app.get("/api/quality")
+def data_quality():
+    return database.data_quality_summary(_source())
+
+
+@app.get("/api/calendar/{session_date}")
+def get_session_calendar(session_date: str, market: str = "HOSE"):
+    try:
+        parsed = datetime.fromisoformat(session_date).date()
+    except ValueError:
+        return {"error": "session_date must use YYYY-MM-DD"}
+    with database.connect() as db:
+        row = db.execute("SELECT * FROM session_calendar WHERE session_date=? AND market=?", (parsed.isoformat(), market.upper())).fetchone()
+    return dict(row) if row else {"session_date": parsed.isoformat(), "market": market.upper(),
+                                  "is_open": database.is_session_open(parsed.isoformat(), market),
+                                  "source": "weekday_default; configure exchange holidays explicitly"}
+
+
+@app.put("/api/calendar/{session_date}")
+def set_session_calendar(session_date: str, market: str = "HOSE", is_open: bool = Body(...), note: str | None = Body(default=None)):
+    try:
+        parsed = datetime.fromisoformat(session_date).date()
+    except ValueError:
+        return {"error": "session_date must use YYYY-MM-DD"}
+    database.set_session_day(parsed.isoformat(), market, is_open, note)
+    return {"session_date": parsed.isoformat(), "market": market.upper(), "is_open": is_open, "note": note}
 
 
 @app.get("/api/methodology")
@@ -259,7 +425,11 @@ def methodology():
             "Demo values are synthetic and must not be interpreted as market data.",
         ],
         "configuration": {
-            "baseline_min_observations": config.BASELINE_MIN_OBSERVATIONS,
+            "baseline_min_bars": config.BASELINE_MIN_BARS,
+            "baseline_sessions": config.BASELINE_SESSIONS,
+            "minimum_snapshots_per_bar": config.MIN_BAR_SNAPSHOTS,
+            "alert_consecutive_bars": config.ALERT_CONSECUTIVE_BARS,
+            "alert_cooldown_minutes": config.ALERT_COOLDOWN_MIN,
             "spread_percentile": config.SPREAD_PERCENTILE,
             "depth_percentile": config.DEPTH_PERCENTILE,
             "imbalance_threshold": config.IMBALANCE_THRESHOLD,
