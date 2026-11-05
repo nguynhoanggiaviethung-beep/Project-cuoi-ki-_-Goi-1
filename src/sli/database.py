@@ -157,7 +157,7 @@ def initialize():
             ask_price_2 REAL, ask_volume_2 REAL, ask_price_3 REAL, ask_volume_3 REAL,
             raw_payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
             validation_status TEXT NOT NULL, validation_reason TEXT,
-            source TEXT NOT NULL CHECK(source IN ('demo','live')),
+            source TEXT NOT NULL CHECK(source IN ('demo','live','ssi')),
             UNIQUE(source, payload_hash)
         );
         CREATE INDEX IF NOT EXISTS ix_observations_symbol_time
@@ -201,6 +201,23 @@ def initialize():
             coverage_status TEXT NOT NULL, UNIQUE(source,symbol,minute_vn)
         );
         CREATE INDEX IF NOT EXISTS ix_bars_symbol_minute ON bars_1m(source,symbol,minute_vn);
+        CREATE TABLE IF NOT EXISTS historical_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL DEFAULT 'ssi', symbol TEXT NOT NULL,
+            trading_date TEXT NOT NULL, timeframe TEXT NOT NULL DEFAULT '1d',
+            open_price REAL, high_price REAL, low_price REAL, close_price REAL,
+            volume REAL, value REAL, fetched_at TEXT NOT NULL,
+            UNIQUE(source,symbol,timeframe,trading_date)
+        );
+        CREATE INDEX IF NOT EXISTS ix_historical_prices_symbol_date
+            ON historical_prices(source,symbol,timeframe,trading_date);
+        CREATE TABLE IF NOT EXISTS securities_catalog (
+            source TEXT NOT NULL DEFAULT 'ssi', symbol TEXT NOT NULL,
+            board TEXT, name_vi TEXT, name_en TEXT, stock_type TEXT,
+            listed_shares REAL, first_trading_date TEXT, last_trading_date TEXT,
+            updated_at TEXT NOT NULL, PRIMARY KEY(source,symbol)
+        );
+        CREATE INDEX IF NOT EXISTS ix_securities_catalog_name ON securities_catalog(source,name_vi);
         CREATE TABLE IF NOT EXISTS session_calendar (
             session_date TEXT NOT NULL, market TEXT NOT NULL, is_open INTEGER NOT NULL DEFAULT 1,
             note TEXT, PRIMARY KEY(session_date,market)
@@ -225,6 +242,30 @@ def initialize():
         );
         CREATE INDEX IF NOT EXISTS ix_system_alerts_status ON system_alerts(source,status,triggered_at);
         """)
+        schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='observations'").fetchone()
+        if schema and "'ssi'" not in (schema[0] or ""):
+            db.execute("PRAGMA foreign_keys=OFF")
+            columns = [row[1] for row in db.execute("PRAGMA table_info(observations)")]
+            db.execute("""CREATE TABLE observations_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
+                source_timestamp TEXT, received_at_utc TEXT NOT NULL,
+                bid_price_1 REAL, bid_volume_1 REAL, bid_price_2 REAL, bid_volume_2 REAL,
+                bid_price_3 REAL, bid_volume_3 REAL, ask_price_1 REAL, ask_volume_1 REAL,
+                ask_price_2 REAL, ask_volume_2 REAL, ask_price_3 REAL, ask_volume_3 REAL,
+                raw_payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
+                validation_status TEXT NOT NULL, validation_reason TEXT,
+                source TEXT NOT NULL CHECK(source IN ('demo','live','ssi')),
+                source_ts_vn TEXT, received_at_vn TEXT, market TEXT NOT NULL DEFAULT 'HOSE',
+                session_phase TEXT NOT NULL DEFAULT 'UNKNOWN', flags TEXT NOT NULL DEFAULT '[]',
+                ref_price REAL, ceiling_price REAL, floor_price REAL, last_price REAL,
+                total_trading_value REAL, total_trading_volume REAL, UNIQUE(source,payload_hash))""")
+            names = ",".join(columns)
+            db.execute(f"INSERT INTO observations_new ({names}) SELECT {names} FROM observations")
+            db.execute("DROP TABLE observations")
+            db.execute("ALTER TABLE observations_new RENAME TO observations")
+            db.execute("CREATE INDEX IF NOT EXISTS ix_observations_symbol_time ON observations(source,symbol,received_at_utc)")
+            db.execute("CREATE INDEX IF NOT EXISTS ix_observations_received ON observations(source,received_at_utc)")
+            db.execute("PRAGMA foreign_keys=ON")
         _migrate_schema(db)
     seed_demo_if_empty()
 
@@ -498,6 +539,48 @@ def fetch_observations(source, symbol=None, limit=500, start_at=None, end_at=Non
     return [dict(row) for row in rows]
 
 
+def upsert_historical_prices(symbol, bars, source="ssi"):
+    fetched_at = datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
+    saved = 0
+    with connect() as db:
+        for bar in bars:
+            trading_date = str(getattr(bar, "trading_date", "") or "").replace("-", "/")[:10]
+            if not trading_date:
+                continue
+            db.execute("""INSERT INTO historical_prices(
+                source,symbol,trading_date,timeframe,open_price,high_price,low_price,
+                close_price,volume,value,fetched_at) VALUES (?,?,?,'1d',?,?,?,?,?,?,?)
+                ON CONFLICT(source,symbol,timeframe,trading_date) DO UPDATE SET
+                open_price=excluded.open_price,high_price=excluded.high_price,
+                low_price=excluded.low_price,close_price=excluded.close_price,
+                volume=excluded.volume,value=excluded.value,fetched_at=excluded.fetched_at""",
+                (source,symbol.upper(),trading_date,
+                 getattr(bar,"open_price",None),getattr(bar,"high_price",None),
+                 getattr(bar,"low_price",None),getattr(bar,"close_price",None),
+                 getattr(bar,"volume",None),getattr(bar,"value",None),fetched_at))
+            saved += 1
+    return saved
+
+
+def fetch_historical_prices(symbol=None, limit=90, source="ssi"):
+    query="SELECT symbol,trading_date,timeframe,open_price,high_price,low_price,close_price,volume,value,fetched_at FROM historical_prices WHERE source=? AND timeframe='1d'"
+    args=[source]
+    if symbol:
+        query += " AND symbol=?"
+        args.append(symbol.upper())
+    query += " ORDER BY trading_date DESC LIMIT ?"
+    args.append(max(1,min(int(limit),1000)))
+    with connect() as db:
+        rows=db.execute(query,args).fetchall()
+    return list(reversed([dict(row) for row in rows]))
+
+
+def list_historical_symbols(source="ssi"):
+    with connect() as db:
+        rows=db.execute("SELECT DISTINCT symbol FROM historical_prices WHERE source=? ORDER BY symbol",(source,)).fetchall()
+    return [row["symbol"] for row in rows]
+
+
 def list_symbols(source):
     with connect() as db:
         rows = db.execute(
@@ -567,3 +650,122 @@ def add_demo_tick():
             if _insert(db, observation, "demo") is not None:
                 inserted += 1
     return inserted
+
+
+def upsert_securities_catalog(records, source="ssi"):
+    now = datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
+    saved = 0
+    with connect() as db:
+        for board, item in records:
+            get = (lambda key, default=None: item.get(key, default)) if isinstance(item, dict) else (lambda key, default=None: getattr(item, key, default))
+            symbol = str(get("symbol", "") or "").strip().upper()
+            stock_type = str(get("stock_type", "") or "").strip()
+            if not symbol or stock_type.lower() != "stock":
+                continue
+            db.execute("""INSERT INTO securities_catalog(source,symbol,board,name_vi,name_en,stock_type,listed_shares,first_trading_date,last_trading_date,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,symbol) DO UPDATE SET board=excluded.board,
+                name_vi=excluded.name_vi,name_en=excluded.name_en,stock_type=excluded.stock_type,
+                listed_shares=excluded.listed_shares,first_trading_date=excluded.first_trading_date,
+                last_trading_date=excluded.last_trading_date,updated_at=excluded.updated_at""",
+                (source,symbol,board,str(get("symbol_name_vi", "") or ""),
+                 str(get("symbol_name_en", "") or ""),stock_type,
+                 get("listed_shares"),str(get("first_trading_date", "") or ""),
+                 str(get("last_trading_date", "") or ""),now))
+            saved += 1
+    return saved
+
+
+def list_catalog_symbols(source="ssi"):
+    with connect() as db:
+        rows=db.execute("SELECT symbol FROM securities_catalog WHERE source=? ORDER BY symbol",(source,)).fetchall()
+    return [row["symbol"] for row in rows]
+
+
+def fetch_latest_historical_page(search=None, page=1, page_size=50, source="ssi"):
+    page=max(1,int(page)); page_size=max(1,min(int(page_size),200)); offset=(page-1)*page_size
+    where=" WHERE c.source=?"; args=[source]
+    if search:
+        where += " AND (c.symbol LIKE ? OR c.name_vi LIKE ? OR c.name_en LIKE ?)"
+        term=f"%{search.strip()}%"; args.extend([term,term,term])
+    with connect() as db:
+        total=db.execute("SELECT COUNT(*) FROM securities_catalog c"+where,args).fetchone()[0]
+        rows=db.execute("""WITH latest AS (
+            SELECT h.*,ROW_NUMBER() OVER(PARTITION BY h.symbol ORDER BY h.trading_date DESC) AS rn
+            FROM historical_prices h WHERE h.source=? AND h.timeframe='1d'
+        ) SELECT c.symbol,c.name_vi,c.name_en,c.board,l.trading_date,l.close_price,l.volume,l.fetched_at
+          FROM securities_catalog c LEFT JOIN latest l ON l.symbol=c.symbol AND l.rn=1"""+where+
+          " ORDER BY c.symbol LIMIT ? OFFSET ?",[source,*args, page_size,offset]).fetchall()
+    return {"total":total,"page":page,"page_size":page_size,"rows":[dict(row) for row in rows]}
+
+
+def insert_observation_batch(observations, source="ssi"):
+    counts={"inserted":0,"duplicate":0,"valid":0,"invalid":0,"last_message_at":None}
+    if not observations:return counts
+    with connect() as db:
+        for observation in observations:
+            observation_id=_insert(db,observation,source)
+            if observation_id is None: counts["duplicate"]+=1
+            else:
+                counts["inserted"]+=1
+                counts["valid" if observation.get("validation_status")=="valid" else "invalid"]+=1
+            counts["last_message_at"]=observation.get("received_at_utc") or counts["last_message_at"]
+    return counts
+
+
+def list_catalog_boards(source="ssi"):
+    with connect() as db:
+        rows=db.execute("SELECT DISTINCT board FROM securities_catalog WHERE source=? AND board IS NOT NULL ORDER BY board",(source,)).fetchall()
+    return [row["board"] for row in rows]
+
+
+def fetch_market_breadth(limit=90, source="ssi"):
+    limit=max(2,min(int(limit),1000))
+    with connect() as db:
+        rows=db.execute("""WITH daily AS (
+            SELECT symbol,trading_date,close_price,volume,
+              LAG(close_price) OVER(PARTITION BY symbol ORDER BY trading_date) AS prior_close
+            FROM historical_prices WHERE source=? AND timeframe='1d' AND close_price IS NOT NULL
+        ), breadth AS (
+            SELECT trading_date,
+              SUM(CASE WHEN close_price>prior_close THEN 1 ELSE 0 END) AS advancing,
+              SUM(CASE WHEN close_price<prior_close THEN 1 ELSE 0 END) AS declining,
+              SUM(CASE WHEN close_price=prior_close THEN 1 ELSE 0 END) AS unchanged,
+              SUM(COALESCE(volume,0)) AS total_volume
+            FROM daily WHERE prior_close IS NOT NULL GROUP BY trading_date
+        ) SELECT * FROM breadth ORDER BY trading_date DESC LIMIT ?""",(source,limit)).fetchall()
+    return list(reversed([dict(row) for row in rows]))
+
+
+def historical_symbols_fetched_on(day, source="ssi"):
+    prefix=str(day)+"%"
+    with connect() as db:
+        rows=db.execute("SELECT DISTINCT symbol FROM historical_prices WHERE source=? AND fetched_at LIKE ?",(source,prefix)).fetchall()
+    return {row["symbol"] for row in rows}
+
+
+def count_historical_prices(source="ssi"):
+    with connect() as db:
+        return db.execute("SELECT COUNT(*) FROM historical_prices WHERE source=?",(source,)).fetchone()[0]
+
+
+def fetch_market_leaders(limit=20, source="ssi"):
+    limit=max(5,min(int(limit),100))
+    with connect() as db:
+        rows=db.execute("""WITH ranked AS (
+            SELECT symbol,trading_date,close_price,volume,value,
+              ROW_NUMBER() OVER(PARTITION BY symbol ORDER BY trading_date DESC) AS rn
+            FROM historical_prices WHERE source=? AND timeframe='1d' AND close_price IS NOT NULL
+        ), paired AS (
+            SELECT symbol,
+              MAX(CASE WHEN rn=1 THEN trading_date END) AS trading_date,
+              MAX(CASE WHEN rn=1 THEN close_price END) AS close_price,
+              MAX(CASE WHEN rn=2 THEN close_price END) AS prior_close,
+              MAX(CASE WHEN rn=1 THEN volume END) AS volume,
+              MAX(CASE WHEN rn=1 THEN value END) AS traded_value
+            FROM ranked WHERE rn<=2 GROUP BY symbol HAVING MAX(CASE WHEN rn=2 THEN close_price END) IS NOT NULL
+        ) SELECT c.symbol,c.name_vi,c.board,p.trading_date,p.close_price,p.prior_close,p.volume,
+            COALESCE(p.traded_value,p.close_price*p.volume) AS traded_value,
+            CASE WHEN p.prior_close>0 THEN (p.close_price-p.prior_close)*100.0/p.prior_close END AS change_pct
+          FROM paired p LEFT JOIN securities_catalog c ON c.source=? AND c.symbol=p.symbol
+          ORDER BY traded_value DESC LIMIT ?""",(source,source,limit)).fetchall()
+    return [dict(row) for row in rows]

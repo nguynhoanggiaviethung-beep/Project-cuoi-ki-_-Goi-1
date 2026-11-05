@@ -8,8 +8,6 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(ROOT_DIR / ".env")
 
 DB_PATH = Path(os.getenv("DB_PATH", str(ROOT_DIR / "database" / "sli.sqlite3")))
-NEO_WS_URL = os.getenv("NEO_WS_URL", "wss://neoapi.vpbanks.com.vn/stock-stream/broker")
-TOKEN_URL = os.getenv("TOKEN_URL", "https://external.vpbanks.com.vn/auth/token")
 WATCHLIST = [item.strip().upper() for item in os.getenv("WATCHLIST", "FPT,HPG,VPB").split(",") if item.strip()]
 SYMBOL_MARKETS = {
     item.split(":", 1)[0].strip().upper(): item.split(":", 1)[1].strip().upper()

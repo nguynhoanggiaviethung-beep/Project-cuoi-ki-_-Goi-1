@@ -1,55 +1,41 @@
 # Stock Liquidity Intelligence
 
-Dashboard thanh khoản cổ phiếu, gồm spread, độ sâu sổ lệnh, queue imbalance, bar 1 phút, cảnh báo theo baseline và mô phỏng book-walk. Backend FastAPI lưu dữ liệu vào SQLite; dữ liệu DEMO luôn được tách khỏi LIVE.
+Dashboard theo dõi thanh khoản cổ phiếu: spread, độ sâu sổ lệnh, queue imbalance, xếp hạng, cảnh báo và mô phỏng sổ lệnh. Backend dùng FastAPI và SQLite.
 
-## Yêu cầu
+## Chạy web bằng PowerShell
 
-- Python 3.10 trở lên
-- Windows PowerShell (các lệnh dưới đây)
-
-## Cài đặt và chạy
-
-Mở PowerShell tại thư mục dự án:
+Mở Terminal trong VS Code, chọn PowerShell, rồi chạy lần lượt:
 
 ```powershell
+cd C:\Project-cuoi-ki-_-Goi-1
+.\.venv\Scripts\python.exe app.py
+```
+
+Để chạy lần đầu nếu chưa có thư mục `.venv`, tạo môi trường và cài thư viện trước:
+
+```powershell
+cd C:\Project-cuoi-ki-_-Goi-1
 py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python app.py
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
-Nếu PowerShell chặn kích hoạt môi trường, chạy lệnh sau trong cửa sổ hiện tại rồi kích hoạt lại:
+Khi Terminal hiện server đang chạy, mở <http://127.0.0.1:8000/>. Giữ Terminal mở khi sử dụng web; nhấn `Ctrl+C` trong Terminal để dừng. Nếu báo cổng `8000` đang được sử dụng, đóng Terminal đang chạy server cũ rồi chạy lại.
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
+## Chế độ dữ liệu
 
-Mở <http://127.0.0.1:8000/>. Nhấn `Ctrl+C` trong Terminal để dừng server.
+Ứng dụng khởi động với nguồn SSI FastConnect; không tự thay bằng dữ liệu mô phỏng:
 
-## Dữ liệu DEMO và dữ liệu VPBankS
+- Điền `SSI_API_KEY` và `SSI_API_SECRET` vào `.env` bằng thông tin SSI FastConnect. Không chia sẻ hai khóa này trong chat.
+- Khởi chạy web. Backend tự kết nối SSI, tải danh mục cổ phiếu thường HOSE/HNX/UPCoM và đồng bộ OHLC ngày lịch sử cho từng mã và lưu vào SQLite. Trong tab **Dữ liệu & phương pháp**, nút **Kết nối SSI FastConnect** dùng để kết nối lại khi cần.
 
-Ứng dụng khởi chạy với dữ liệu **DEMO** tổng hợp. Để nhận dữ liệu NEO thật:
+Giá đóng cửa lịch sử hiển thị riêng với quote realtime. Spread và độ sâu chỉ được tính khi SSI gửi dữ liệu sổ lệnh; hệ thống không tự tạo dữ liệu thay thế.
 
-1. Đảm bảo tài khoản được cấp quyền NeoAPI và IP public đã được VPBankS whitelist.
-2. Sao chép `.env.example` thành `.env`, rồi điền `VPBS_USERNAME` và `VPBS_PASSWORD`. Khai báo `WATCHLIST` và sàn của từng mã trong `SYMBOL_MARKETS` (ví dụ `FPT:HOSE,ABC:HNX`).
-3. Khởi động ứng dụng, mở tab **Dữ liệu & phương pháp** và chọn **Bắt đầu luồng NEO**.
-4. Chỉ xem dữ liệu là LIVE khi trạng thái kết nối thành công và có snapshot mới.
+Không chia sẻ hoặc commit file `.env`; file này chứa thông tin đăng nhập.
 
-Giữ `.env` riêng tư; không gửi thông tin đăng nhập/token và không commit file này. Mã chỉ được xem là LIVE khi có xác thực thành công và snapshot mới. Nếu kết nối thất bại, kiểm tra quyền API, IP whitelist và trạng thái collector.
+## Thành phần chính
 
-## Backend
-
-- `GET /api/status`, `/api/quality`, `/api/collector/runs` — trạng thái, chất lượng dữ liệu và lịch sử collector.
-- `GET /api/bars` — bar 1 phút; hỗ trợ lọc mã, thời gian và bucket `OPEN/MID/CLOSE`.
-- `GET /api/rankings`, `/api/alerts` — xếp hạng và cảnh báo.
-- `POST /api/bookwalk/{symbol}?side=buy&quantity=100` — mô phỏng khớp theo sổ lệnh hiển thị; không gửi lệnh thật.
-- `GET/PUT /api/calendar/{YYYY-MM-DD}?market=HOSE` — xem/đặt lịch nghỉ cho ngày giao dịch. Ngày lễ cần được cấu hình từ lịch chính thức.
-
-Các tham số baseline, số bar xác nhận cảnh báo và cooldown có thể chỉnh trong file `.env` sau khi sao chép từ `.env.example`. Quy tắc tick và giờ phiên trong code là cấu hình theo sàn; xác minh đơn vị giá và mapping sàn của NEO trước khi phân tích LIVE.
-
-## Cấu trúc chính
-
-- `app.py` — khởi chạy web server
-- `src/sli/` — API, collector, phân tích và SQLite
-- `frontend/` — giao diện dashboard
-- `database/` — cơ sở dữ liệu cục bộ
+- `app.py` — chạy web server.
+- `src/sli/` — API, collector, phân tích và lưu SQLite.
+- `frontend/` — giao diện dashboard.
+- `database/` — cơ sở dữ liệu cục bộ.

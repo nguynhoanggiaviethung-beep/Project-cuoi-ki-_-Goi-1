@@ -1,20 +1,22 @@
 from datetime import datetime, timezone
 from statistics import median
+from functools import lru_cache
 import threading
 import time
 
-from fastapi import Body, FastAPI, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config, database
 from .bookwalk import estimate as estimate_bookwalk
 from .market_rules import session_phase
-from .collector import NeoCollector, RuntimeState
+from .collector import RuntimeState
+from .ssi_collector import SsiCollector
 
 STATIC_DIR = config.ROOT_DIR / "frontend"
 runtime = RuntimeState()
-collector = NeoCollector(runtime)
+ssi_collector = SsiCollector(runtime)
 _demo_thread = None
 _demo_stop = threading.Event()
 
@@ -43,13 +45,12 @@ app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 @app.on_event("startup")
 def startup():
     database.initialize()
-    runtime.update(mode="demo", connection_status="demo", watchlist=config.WATCHLIST)
-    _start_demo_loop()
+    ssi_collector.start()
 
 
 @app.on_event("shutdown")
 def shutdown():
-    collector.stop()
+    ssi_collector.stop()
     _stop_demo_loop()
 
 
@@ -82,11 +83,11 @@ def status():
     latest = rows[0]["received_at_utc"] if rows else None
     is_stale = False
     now = datetime.now(config.TIMEZONE)
-    markets = {config.SYMBOL_MARKETS.get(symbol, "HOSE") for symbol in config.WATCHLIST}
+    markets = set(database.list_catalog_boards("ssi")) or {"HOSE", "HNX", "UPCOM"}
     phases = {session_phase(now, market) for market in markets}
     market_open = any(database.is_session_open(now.date().isoformat(), market) for market in markets)
     expected_stream = market_open and bool(phases.intersection({"CONTINUOUS_AM", "CONTINUOUS_PM"}))
-    if source == "live":
+    if source in {"live", "ssi"}:
         if latest and expected_stream:
             try:
                 stamp = datetime.fromisoformat(latest.replace("Z", "+00:00"))
@@ -105,6 +106,7 @@ def status():
         "is_stale": is_stale,
         "stale_after_seconds": config.STALE_AFTER_SECONDS,
         "configured_watchlist": config.WATCHLIST,
+        "historical_symbols_with_data": len(database.list_historical_symbols("ssi")),
         "market_phase": sorted(phases)[0] if len(phases) == 1 else sorted(phases),
         "market_session_expected": expected_stream,
     })
@@ -116,14 +118,52 @@ def status():
     return state
 
 
+@app.get("/api/price-history")
+def price_history(symbol: str | None = None, limit: int = Query(default=90, ge=1, le=1000),
+                 page: int = Query(default=1, ge=1), page_size: int = Query(default=50, ge=1, le=200),
+                 search: str | None = None):
+    selected = symbol.upper() if symbol and symbol.upper() not in ("ALL", "__ALL__") else None
+    if selected:
+        rows=database.fetch_historical_prices(selected,limit=limit,source="ssi")
+        return {"source":"ssi","timeframe":"1d","symbols_count":1 if rows else 0,
+                "symbols":[selected] if rows else [],"series_by_symbol":{selected:rows} if rows else {},
+                "note":"Giá OHLC ngày lịch sử từ SSI Market Data API; không phải quote realtime hoặc dữ liệu sổ lệnh."}
+    catalog=database.fetch_latest_historical_page(search=search,page=page,page_size=page_size,source="ssi")
+    return {"source":"ssi","timeframe":"1d","symbols_count":catalog["total"],
+            "page":catalog["page"],"page_size":catalog["page_size"],"total":catalog["total"],
+            "rows":catalog["rows"],"note":"Danh mục cổ phiếu thường và giá OHLC mới nhất lấy trực tiếp từ SSI; giá chưa đồng bộ được để trống."}
+
+
+@lru_cache(maxsize=8)
+def _cached_market_leaders(limit):
+    return database.fetch_market_leaders(limit=limit,source="ssi")
+
+
+@app.get("/api/market-leaders")
+def market_leaders(limit: int = Query(default=25, ge=5, le=100)):
+    rows=_cached_market_leaders(limit)
+    return {"source":"ssi","rows":rows,"count":len(rows),
+            "note":"OHLC ngày SSI; giá trị giao dịch lấy từ SSI hoặc giá đóng cửa × khối lượng nếu SSI không có trường giá trị. Mức đổi giá so với phiên trước."}
+
+
+@lru_cache(maxsize=8)
+def _cached_market_breadth(limit):
+    return database.fetch_market_breadth(limit=limit,source="ssi")
+
+
+@app.get("/api/market-breadth")
+def market_breadth(limit: int = Query(default=90, ge=2, le=1000)):
+    rows=_cached_market_breadth(limit)
+    return {"source":"ssi","rows":rows,"count":len(rows),
+            "note":"Độ rộng thị trường được tổng hợp từ OHLC ngày SSI của cổ phiếu thường: số mã tăng/giảm/đứng giá so với phiên trước. Không phải dữ liệu sổ lệnh."}
+
+
 @app.get("/api/symbols")
 def symbols():
     source = _source()
-    available = database.list_symbols(source)
-    if source == "live" and not available:
-        available = config.WATCHLIST
-    return {"source": source, "symbols": available}
-
+    available = database.list_catalog_symbols("ssi") if source == "ssi" else database.list_symbols(source)
+    if source == "live" and not available: available=config.WATCHLIST
+    return {"source":source,"symbols":available,"count":len(available)}
 
 @app.get("/api/overview")
 def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le=2000),
@@ -180,7 +220,7 @@ def company(symbol: str):
         "VPB": {"name": "Ngân hàng TMCP Việt Nam Thịnh Vượng", "sector": "Ngân hàng", "description": "Ngân hàng thương mại cổ phần; mã VPB được dùng làm ví dụ trong bộ dữ liệu DEMO."},
     }
     ticker = symbol.upper()
-    profile = profiles.get(ticker, {"name": ticker, "sector": "Chưa xác định", "description": "Tên doanh nghiệp chưa có trong danh mục cục bộ; có thể bổ sung từ stockDetail khi NEO LIVE được cấp quyền mạng."})
+    profile = profiles.get(ticker, {"name": ticker, "sector": "Chưa xác định", "description": "Tên doanh nghiệp chưa có trong danh mục cục bộ; hãy bổ sung vào danh mục doanh nghiệp của hệ thống."})
     return {"symbol": ticker, **profile}
 
 
@@ -192,7 +232,7 @@ def rankings(limit: int = Query(default=500, ge=1, le=2000), start_at: str | Non
     for symbol in database.list_symbols(source):
         bars_for_symbol = database.fetch_bars(source, symbol=symbol, limit=limit,
                                               start_at=start_at, end_at=end_at, bucket=phase)
-        if source == "live" and bars_for_symbol:
+        if source in {"live", "ssi"} and bars_for_symbol:
             points = bars_for_symbol
             spreads = _numeric([row["spread_bps"] for row in points])
             depths = _numeric([row["total_depth_value"] for row in points])
@@ -228,7 +268,7 @@ def rankings(limit: int = Query(default=500, ge=1, le=2000), start_at: str | Non
             "spread_expansion_bps": (latest_spread - median(spreads)) if spreads and latest_spread is not None else None,
             "depth_change_pct": ((latest_depth / median(depths) - 1) * 100) if depths and median(depths) and latest_depth is not None else None,
         })
-    minimum_samples = config.RANKING_MIN_BARS if source == "live" else config.RANKING_MIN_SNAPSHOTS
+    minimum_samples = config.RANKING_MIN_BARS if source in {"live", "ssi"} else config.RANKING_MIN_SNAPSHOTS
     eligible = [row for row in results if row["sample_count"] >= minimum_samples]
     low_spread = sorted(eligible, key=lambda row: row["median_spread_bps"] if row["median_spread_bps"] is not None else float("inf"))
     high_depth = sorted(eligible, key=lambda row: row["median_total_depth_value"] if row["median_total_depth_value"] is not None else float("-inf"), reverse=True)
@@ -286,7 +326,7 @@ def liquidity_map(limit: int = Query(default=2000, ge=1, le=10000),
     points = []
     for symbol in database.list_symbols(selected_source):
         bars_data = database.fetch_bars(selected_source, symbol, limit, start_at, end_at)
-        if selected_source == "live" and bars_data:
+        if selected_source in {"live", "ssi"} and bars_data:
             spreads = _numeric([row["spread_bps"] for row in bars_data])
             depths = _numeric([row["total_depth_value"] for row in bars_data])
             count, basis = len(bars_data), "bars_1m"
@@ -309,7 +349,7 @@ def liquidity_map(limit: int = Query(default=2000, ge=1, le=10000),
                              else "spread_wide_depth_thick" if point["median_spread_bps"] > spread_mid
                              else "spread_narrow_depth_thin")
     return {"source": selected_source, "points": points, "spread_median": spread_mid,
-            "depth_median": depth_mid, "minimum_samples": config.RANKING_MIN_BARS if selected_source == "live" else config.RANKING_MIN_SNAPSHOTS,
+            "depth_median": depth_mid, "minimum_samples": config.RANKING_MIN_BARS if selected_source in {"live", "ssi"} else config.RANKING_MIN_SNAPSHOTS,
             "depth_axis": "log", "note": "Bản đồ mô tả tương đối trong watchlist, không đại diện toàn thị trường."}
 
 
@@ -382,7 +422,7 @@ def set_session_calendar(session_date: str, market: str = "HOSE", is_open: bool 
 def methodology():
     return {
         "project": "Stock Liquidity Intelligence",
-        "source": "NEO API market stream, channel stockInfo",
+        "source": "Dữ liệu báo giá thị trường SSI FastConnect qua WebSocket; snapshot được lưu vào SQLite sau khi xác thực và đăng ký quote thành công.",
         "fields": [
             "symbol", "bidPrice1-3", "bidVol1-3",
             "askPrice1-3", "askVol1-3",
@@ -397,17 +437,17 @@ def methodology():
             {"name": "Value imbalance", "formula": "(bid depth value - ask depth value) / total depth value"},
         ],
         "interpretations": [
-            {"metric": "Quoted spread", "meaning": "Chi phí tức thời quan sát được giữa giá mua tốt nhất và giá bán tốt nhất. Spread thấp thường thuận lợi hơn cho giao dịch nhỏ tại thời điểm snapshot.", "caveat": "Không tính phí, trượt giá, kích thước lệnh hay khả năng khớp; phải so sánh theo thời gian và giữa các mã cùng bối cảnh."},
-            {"metric": "Depth top 3", "meaning": "Giá trị chào mua/chào bán đang hiển thị trong ba mức giá tốt nhất. Depth lớn biểu thị nhiều lượng niêm yết hơn gần giá hiện tại.", "caveat": "Lệnh có thể bị hủy; đây không phải thanh khoản thực hiện được hay toàn bộ sổ lệnh."},
-            {"metric": "Queue imbalance", "meaning": "Chuẩn hóa chênh lệch khối lượng hiển thị hai phía về khoảng [-1, 1]. Dương nghĩa là khối lượng bid lớn hơn ask trong các mức hợp lệ.", "caveat": "Mô tả trạng thái sổ lệnh, không phải order-flow imbalance (OFI), không chứng minh chiều giá tiếp theo."},
-            {"metric": "Cảnh báo percentile", "meaning": "So spread hiện tại với P90 lịch sử hoặc depth với P10 lịch sử của chính mã sau tối thiểu số mẫu cấu hình.", "caveat": "Ngưỡng là quy tắc giám sát nội bộ; kết quả phụ thuộc cửa sổ, phiên, chất lượng dữ liệu và không phải chuẩn đầu tư."}
+            {"metric": "Chênh lệch theo báo giá (quoted spread)", "meaning": "Chi phí tức thời quan sát được giữa giá mua tốt nhất và giá bán tốt nhất. Chênh lệch giá (spread) thấp thường thuận lợi hơn cho giao dịch nhỏ tại thời điểm ảnh chụp dữ liệu (snapshot).", "caveat": "Không tính phí, trượt giá, kích thước lệnh hay khả năng khớp; cần so sánh theo thời gian và giữa các mã cùng bối cảnh."},
+            {"metric": "Độ sâu ba mức giá đầu (top-3 depth)", "meaning": "Giá trị chào mua/chào bán đang hiển thị trong ba mức giá tốt nhất. Độ sâu (depth) lớn biểu thị nhiều lượng niêm yết hơn gần giá hiện tại.", "caveat": "Lệnh có thể bị hủy; đây không phải thanh khoản thực hiện được hay toàn bộ sổ lệnh."},
+            {"metric": "Mất cân bằng khối lượng chờ (queue imbalance)", "meaning": "Chuẩn hóa chênh lệch khối lượng hiển thị hai phía về khoảng [-1, 1]. Số dương nghĩa là khối lượng bên mua (bid) lớn hơn bên bán (ask) trong các mức hợp lệ.", "caveat": "Mô tả trạng thái sổ lệnh, không phải mất cân bằng dòng lệnh (order-flow imbalance, OFI), không chứng minh chiều giá tiếp theo."},
+            {"metric": "Cảnh báo theo phân vị (percentile)", "meaning": "So sánh chênh lệch giá (spread) hiện tại với phân vị 90 (P90) lịch sử hoặc độ sâu (depth) với phân vị 10 (P10) lịch sử của chính mã sau khi đạt số mẫu tối thiểu đã cấu hình.", "caveat": "Ngưỡng là quy tắc giám sát nội bộ; kết quả phụ thuộc cửa sổ, phiên, chất lượng dữ liệu và không phải chuẩn đầu tư."}
         ],
         "theoretical_framework": [
-            {"title": "Spread như chi phí giao dịch tức thời", "body": "Bid–ask spread biểu thị khoảng cách giữa mức giá mua tốt nhất và bán tốt nhất đang được niêm yết. Theo vi cấu trúc thị trường, spread bù đắp một phần chi phí xử lý lệnh, nắm giữ tồn kho và rủi ro giao dịch với đối tác có thông tin tốt hơn. SLI tính quoted spread theo điểm cơ bản so với mid-price để giảm lệ thuộc vào thang giá tuyệt đối. Đây là chỉ báo từ báo giá, không phải effective spread từ giao dịch đã khớp."},
-            {"title": "Depth và khả năng hấp thụ lệnh", "body": "Depth top 3 cộng lượng niêm yết ở ba mức giá đầu tiên cho mỗi phía; depth value nhân mỗi mức giá với khối lượng tương ứng. Nhiều lượng hiển thị gần giá có thể cho thấy vùng đệm niêm yết dày hơn, nhưng không chứng minh thị trường hấp thụ được một lệnh cụ thể: lệnh có thể bị rút, thứ tự ưu tiên và tốc độ cập nhật có ý nghĩa, còn SLI không mô phỏng khớp lệnh."},
-            {"title": "Queue imbalance là ảnh chụp trạng thái sổ lệnh", "body": "Queue imbalance chuẩn hóa chênh lệch tổng khối lượng bid và ask. Chỉ số gần +1 cho biết khối lượng bid hiển thị trội; gần −1 cho biết ask trội; gần 0 cho biết tương đối cân bằng. Nghiên cứu order-flow imbalance thường xét biến động của sổ lệnh qua sự kiện thêm, hủy và khớp lệnh. Vì SLI hiện tính từ snapshot, không được gọi chỉ số này là OFI hoặc dùng như dự báo giá."},
-            {"title": "Baseline riêng từng mã và cảnh báo percentile", "body": "Ngưỡng được tính từ phân phối lịch sử của chính mã: spread cao hơn P90 hoặc depth thấp hơn P10 khi đủ tối thiểu số mẫu cấu hình. Cách so sánh theo mã giúp hạn chế việc áp một thang giá trị tuyệt đối cho các cổ phiếu khác nhau. Percentile nhạy với cửa sổ, phiên giao dịch, ngoại lệ và chế độ thị trường; cảnh báo cần được xem cùng số mẫu và trạng thái nguồn."},
-            {"title": "Tính nhất quán và dữ liệu thiếu", "body": "Mỗi snapshot được lưu cùng payload gốc, thời điểm nhận cục bộ, mã nguồn và trạng thái kiểm tra; chỉ tiêu được tính có thể tái lập từ các trường bid/ask hợp lệ. Trường thiếu được để null, không tự thay bằng 0. Nếu payload không có timestamp máy chủ thì thời điểm nhận không thể thay thế chính xác thời điểm tạo dữ liệu."}
+            {"title": "Chênh lệch giá (spread) như chi phí giao dịch tức thời", "body": "Chênh lệch giá mua – bán (bid–ask spread) biểu thị khoảng cách giữa giá mua tốt nhất và giá bán tốt nhất đang được niêm yết. Theo vi cấu trúc thị trường, mức chênh lệch này bù đắp một phần chi phí xử lý lệnh, nắm giữ tồn kho và rủi ro giao dịch với đối tác có thông tin tốt hơn. SLI tính chênh lệch theo báo giá (quoted spread) bằng điểm cơ bản (bps) so với giá giữa (mid-price) để giảm lệ thuộc vào thang giá tuyệt đối. Đây là chỉ báo từ báo giá, không phải chênh lệch thực tế (effective spread) tính từ giao dịch đã khớp."},
+            {"title": "Độ sâu sổ lệnh (depth) và khả năng hấp thụ lệnh", "body": "Độ sâu ba mức giá đầu (top-3 depth) cộng lượng niêm yết ở ba mức giá tốt nhất cho mỗi phía; giá trị độ sâu (depth value) nhân giá từng mức với khối lượng tương ứng. Nhiều lượng hiển thị gần giá có thể cho thấy vùng đệm niêm yết dày hơn, nhưng không chứng minh thị trường hấp thụ được một lệnh cụ thể: lệnh có thể bị rút, thứ tự ưu tiên và tốc độ cập nhật có ý nghĩa, còn SLI không mô phỏng khớp lệnh."},
+            {"title": "Mất cân bằng khối lượng chờ (queue imbalance) là ảnh chụp sổ lệnh", "body": "Chỉ số mất cân bằng khối lượng chờ (queue imbalance) chuẩn hóa chênh lệch tổng khối lượng bên mua (bid) và bên bán (ask). Chỉ số gần +1 cho biết lượng mua hiển thị trội; gần −1 cho biết lượng bán trội; gần 0 cho biết tương đối cân bằng. Nghiên cứu mất cân bằng dòng lệnh (order-flow imbalance, OFI) thường xét biến động sổ lệnh qua sự kiện thêm, hủy và khớp lệnh. Vì SLI hiện tính từ ảnh chụp dữ liệu (snapshot), không được gọi chỉ số này là OFI hoặc dùng như dự báo giá."},
+            {"title": "Mốc tham chiếu (baseline) riêng từng mã và cảnh báo theo phân vị", "body": "Ngưỡng được tính từ phân phối lịch sử của chính mã: chênh lệch giá (spread) cao hơn phân vị 90 (P90) hoặc độ sâu sổ lệnh (depth) thấp hơn phân vị 10 (P10) khi đủ số mẫu tối thiểu đã cấu hình. Cách so sánh theo mã giúp hạn chế việc áp một thang giá trị tuyệt đối cho các cổ phiếu khác nhau. Phân vị (percentile) nhạy với cửa sổ, phiên giao dịch, ngoại lệ và chế độ thị trường; cần đọc cảnh báo cùng số mẫu và trạng thái nguồn."},
+            {"title": "Tính nhất quán và dữ liệu thiếu", "body": "Mỗi ảnh chụp dữ liệu (snapshot) được lưu cùng gói dữ liệu gốc (payload), thời điểm nhận cục bộ, mã nguồn và trạng thái kiểm tra; các chỉ tiêu có thể được tính lại từ trường mua/bán (bid/ask) hợp lệ. Trường thiếu được để null (không có giá trị), không tự thay bằng 0. Nếu gói dữ liệu (payload) không có mốc thời gian máy chủ (server timestamp), thời điểm nhận không thể thay thế chính xác thời điểm tạo dữ liệu."}
         ],
         "references": [
             {"citation": "Glosten, L. R. & Milgrom, P. R. (1985). Bid, ask and transaction prices in a specialist market with heterogeneously informed traders.", "doi": "10.1016/0304-405X(85)90044-3", "relevance": "Cơ sở kinh tế học cho quoted bid–ask spread và chi phí giao dịch bất lợi."},
@@ -440,23 +480,26 @@ def methodology():
 @app.post("/api/collector/start")
 def start_collector():
     _stop_demo_loop()
-    started = collector.start()
-    return {
-        "ok": True,
-        "message": "Đã yêu cầu kết nối NEO." if started else "Collector đang chạy.",
-        "status": runtime.snapshot(),
-    }
+    started = ssi_collector.start()
+    return {"ok": True,
+            "message": "Đã yêu cầu kết nối SSI FastConnect WebSocket." if started else "Collector SSI WebSocket đang chạy.",
+            "status": runtime.snapshot()}
+
+
+@app.post("/api/collector/ssi/start")
+def start_ssi_collector():
+    return start_collector()
 
 
 @app.post("/api/collector/stop")
 def stop_collector():
-    collector.stop()
+    ssi_collector.stop()
     return {"ok": True, "status": runtime.snapshot()}
 
 
 @app.post("/api/collector/demo")
 def use_demo():
-    collector.stop()
+    ssi_collector.stop()
     runtime.update(mode="demo", connection_status="demo", last_error=None)
     _start_demo_loop()
     return {"ok": True, "status": runtime.snapshot()}
