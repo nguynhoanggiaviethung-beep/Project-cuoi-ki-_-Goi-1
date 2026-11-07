@@ -6,6 +6,7 @@ confirm them with the relevant exchange before relying on production results.
 from datetime import datetime, time
 
 from . import config
+from .market_clock import get_market_state
 
 CONTINUOUS_WINDOWS = {
     "HOSE": ((time(9, 15), time(11, 30), "CONTINUOUS_AM"), (time(13, 0), time(14, 30), "CONTINUOUS_PM")),
@@ -36,29 +37,18 @@ def tick_size(price, market="HOSE"):
 
 
 def session_phase(value, market="HOSE"):
-    """Classify local market time; holidays are handled by session_calendar."""
+    """Compatibility label backed by the shared market clock."""
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return "UNKNOWN"
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=config.TIMEZONE)
-    local = value.astimezone(config.TIMEZONE).time().replace(tzinfo=None)
-    market = market.upper()
-    if market == "HOSE" and time(9, 0) <= local < time(9, 15):
-        return "ATO"
-    windows = CONTINUOUS_WINDOWS.get(market, CONTINUOUS_WINDOWS["HOSE"])
-    for start, end, phase in windows:
-        if start <= local < end:
-            return phase
-    if time(11, 30) <= local < time(13, 0):
-        return "BREAK"
-    if market in {"HOSE", "HNX"} and time(14, 30) <= local <= time(14, 45):
-        return "ATC"
-    if time(9, 0) <= local <= time(15, 0):
-        return "CLOSED"
-    return "CLOSED"
+    result=get_market_state(value,market.upper())
+    if result["state"]=="LUNCH_BREAK":return "BREAK"
+    if result["state"]=="CLOSED":return "CLOSED"
+    if result["phase"] in {"ATO","ATC"}:return result["phase"]
+    local=value.replace(tzinfo=config.TIMEZONE) if value.tzinfo is None else value.astimezone(config.TIMEZONE)
+    return "CONTINUOUS_AM" if local.hour<12 else "CONTINUOUS_PM"
 
 
 def baseline_bucket(value, market="HOSE"):

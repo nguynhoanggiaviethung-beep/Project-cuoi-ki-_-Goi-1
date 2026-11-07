@@ -1,4 +1,30 @@
-const state = { route: "overview", symbols: [], source: "demo", status: null };
+const state = { route: "overview", symbols: [], source: "ssi", status: null };
+window.MarketClock = (() => {
+  let meta=null,timer=null,lastAsOf=null,lastSyncState=null;const listeners=new Set();
+  const notify=()=>listeners.forEach(fn=>{try{fn(meta);}catch(_){}});
+  const schedule=()=>{
+    clearTimeout(timer);if(document.hidden||!meta)return;
+    if(meta.next_change_at){const delay=Math.max(250,(Date.parse(meta.next_change_at)-Date.now())/(meta.clock_speed||1));timer=setTimeout(()=>refreshStatus(),delay);}
+  };
+  const update=value=>{
+    if(!value)return;const prior=meta;meta=value;
+    const banner=document.querySelector('#market-clock-simulation');
+    if(value.clock_simulated){if(!banner){const node=document.createElement('div');node.id='market-clock-simulation';node.textContent='ĐANG GIẢ LẬP GIỜ';document.body.appendChild(node);}}
+    else banner?.remove();
+    const syncState=JSON.stringify(value.session_sync||null);
+    const clockChanged=prior&&(prior.state!==value.state||prior.phase!==value.phase||prior.session_date!==value.session_date||JSON.stringify(prior.exchange_states)!==JSON.stringify(value.exchange_states));
+    const outsideDataChanged=prior&&((lastAsOf!==null&&lastAsOf!==value.data_as_of)||lastSyncState!==syncState)&&value.state!=="IN_SESSION";
+    if(clockChanged||outsideDataChanged){
+      document.dispatchEvent(new Event('sli-market-data-changed'));
+      if(!document.hidden)notify();
+    }
+    lastAsOf=value.data_as_of;lastSyncState=syncState;schedule();
+  };
+  const subscribe=fn=>{listeners.add(fn);return()=>listeners.delete(fn);};
+  const get=()=>meta;
+  const visibilityChanged=()=>{if(document.hidden)clearTimeout(timer);else refreshStatus();};
+  return {update,subscribe,get,visibilityChanged};
+})();
 const viStatus = (value) => ({connected:"Đã kết nối (connected)",connecting:"Đang kết nối (connecting)",reconnecting:"Đang kết nối lại (reconnecting)",disconnected:"Đã ngắt kết nối (disconnected)",error:"Có lỗi (error)",stopped:"Đã dừng (stopped)",demo:"Mô phỏng (DEMO)",live:"Trực tiếp (LIVE)",valid:"Hợp lệ (valid)",invalid:"Không hợp lệ (invalid)",full:"Đủ khối lượng (full)",partial:"Khớp một phần (partial)",resolved:"Đã xử lý (resolved)",active:"Đang có hiệu lực (active)",warning:"Cảnh báo (warning)",medium:"Trung bình (medium)",high:"Cao (high)",low:"Thấp (low)"}[String(value ?? "").toLowerCase()] || value || "—");
 const viAlert = (value) => ({spread_widening:"Chênh lệch giá mua – bán nới rộng (spread widening)",depth_drop:"Độ sâu sổ lệnh suy giảm (depth drop)",combined_liquidity_stress:"Căng thẳng thanh khoản kết hợp (combined liquidity stress)",strong_queue_imbalance:"Mất cân bằng khối lượng chờ mạnh (strong queue imbalance)",stale_data:"Dữ liệu quá hạn (stale data)"}[value] || value || "—");
 const $ = (selector) => document.querySelector(selector);
@@ -13,23 +39,33 @@ function fmt(value, digits = 2) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
   return Number(value).toLocaleString("vi-VN", { maximumFractionDigits: digits });
 }
-function attachChartTooltip(node, svg, points, viewWidth) {
+function attachChartTooltip(node, svg, points, viewWidth, viewHeight = null) {
   if (!node || !svg || !points || !points.length) return;
-  node.style.position = "relative";
-  let tip = node.querySelector(".chart-tooltip");
-  if (!tip) { tip = document.createElement("div"); tip.className = "chart-tooltip"; tip.setAttribute("role", "status"); node.appendChild(tip); }
+  let tip = node._chartTooltip;
+  if (!tip) { tip = document.createElement("div"); tip.className = "chart-tooltip"; tip.setAttribute("role", "status"); document.body.appendChild(tip); node._chartTooltip = tip; }
   const hide = () => { tip.style.display = "none"; };
   svg.addEventListener("pointermove", (event) => {
     const rect = svg.getBoundingClientRect();
     if (!rect.width) return;
     const pointerX = (event.clientX - rect.left) / rect.width * viewWidth;
-    let closest = points[0], distance = Math.abs(points[0].x - pointerX);
-    for (const point of points) { const nextDistance = Math.abs(point.x - pointerX); if (nextDistance < distance) { closest = point; distance = nextDistance; } }
-    const box = node.getBoundingClientRect();
+    const pointerY = viewHeight ? (event.clientY - rect.top) / rect.height * viewHeight : null;
+    const distanceTo = (point) => {
+      const dx = point.x - pointerX;
+      const dy = pointerY !== null && Number.isFinite(point.y) ? point.y - pointerY : 0;
+      return dx * dx + dy * dy;
+    };
+    let closest = points.find((point) => point.visible !== false) || points[0];
+    let distance = distanceTo(closest);
+    for (const point of points) { if (point.visible === false) continue; const nextDistance = distanceTo(point); if (nextDistance < distance) { closest = point; distance = nextDistance; } }
     tip.textContent = closest.text;
     tip.style.display = "block";
-    tip.style.left = Math.max(6, Math.min(event.clientX - box.left + 12, box.width - 270)) + "px";
-    tip.style.top = Math.max(4, event.clientY - box.top - 42) + "px";
+    const tipWidth = tip.offsetWidth, tipHeight = tip.offsetHeight, gap = 12, edge = 8;
+    const left = Math.max(edge, Math.min(event.clientX + gap, window.innerWidth - tipWidth - edge));
+    let top = event.clientY - tipHeight - gap;
+    if (top < edge) top = event.clientY + gap;
+    if (top + tipHeight > window.innerHeight - edge) top = window.innerHeight - tipHeight - edge;
+    tip.style.left = left + "px";
+    tip.style.top = Math.max(edge, top) + "px";
   });
   svg.addEventListener("pointerleave", hide);
 }
@@ -37,7 +73,13 @@ function fmtTime(value) {
   if (!value) return "—";
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? escapeHtml(value) :
-    date.toLocaleString("vi-VN", { hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "2-digit" });
+    date.toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "2-digit" });
+}
+function fmtDate(value) {
+  if(!value)return "chưa có dữ liệu";
+  const day=String(value).replaceAll("/","-").slice(0,10);
+  const date=new Date(day+"T00:00:00+07:00");
+  return Number.isNaN(date.valueOf())?escapeHtml(value):date.toLocaleDateString("vi-VN",{timeZone:"Asia/Ho_Chi_Minh",day:"2-digit",month:"2-digit",year:"numeric"});
 }
 async function api(path, options = {}) {
   const response = await fetch(path, { headers: { "Accept": "application/json" }, ...options });
@@ -53,19 +95,59 @@ function setRoute(route) {
   state.route = route;
   $$(".view").forEach((view) => view.classList.toggle("hidden", view.id !== "view-" + route));
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.route === route));
-  if (route === "overview") loadOverview();
-  if (route === "detail") loadDetail();
-  if (route === "rankings") loadRankings();
-  if (route === "alerts") loadAlerts();
-  if (route === "methodology") loadMethodology();
+  if (route === "overview") (window.loadOverview || loadOverview)();
+  if (route === "detail") (window.loadDetail || loadDetail)();
+  if (route === "rankings") (window.loadRankings || loadRankings)();
+  if (route === "alerts") (window.loadAlerts || loadAlerts)();
+  if (route === "methodology") (window.loadMethodology || loadMethodology)();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
+window.setRoute = setRoute;
 function enterApp(route = "overview") {
   localStorage.setItem("sli-onboarding-done", "1");
   $("#onboarding").classList.add("hidden");
   $("#application").classList.remove("hidden");
   setRoute(route);
-  refreshStatus();
+  refreshStatus().then(showConnectionDialog);
+}
+function showConnectionDialog() {
+  const dialog = $("#connection-dialog");
+  if (dialog && !dialog.open) dialog.showModal();
+  updateConnectionDialog();
+}
+function feedStateText(data) {
+  const age = data.quote_age_seconds == null ? "" : " · trễ " + fmt(data.quote_age_seconds, 0) + " giây";
+  if (data.feed_state === "live") return "Đang kết nối và nhận dữ liệu trực tiếp (LIVE)" + age;
+  if (data.feed_state === "connecting") return "Đang kết nối SSI FastConnect";
+  if (data.feed_state === "delayed") return "Đang kết nối, dữ liệu đến chậm" + age;
+  if (data.feed_state === "stale") return "Tiến trình còn chạy nhưng dữ liệu đã quá hạn" + age;
+  if (data.feed_state === "outside_session") {
+    if ((data.meta||data).state === "LUNCH_BREAK" || data.market_phase === "BREAK") return "Thị trường đang nghỉ trưa; kết nối SSI vẫn hoạt động, đang giữ dữ liệu mới nhất đến 11:30";
+    return "Thị trường ngoài giờ giao dịch liên tục; kết nối SSI vẫn hoạt động, quote sẽ tiếp tục khi phiên mở lại";
+  }
+  if (data.feed_state === "awaiting_quote") return "Đã kết nối, đang chờ báo giá đầu tiên";
+  if (data.feed_state === "error") return "Kết nối dữ liệu gặp lỗi";
+  return "Dữ liệu đã ngắt kết nối. Vui lòng khởi động kết nối.";
+}
+function updateConnectionDialog(data = state.status) {
+  if (!data) return;
+  const message = $("#connection-dialog-status");
+  const button = $("#connect-now");
+  const disconnect = $("#disconnect-data");
+  const skipButton = $("#connection-dialog-skip");
+  const title = $("#connection-dialog-title");
+  const copy = $("#connection-dialog-copy");
+  if (!message || !button) return;
+  message.textContent = feedStateText(data);
+  const active = data.worker_status === "running";
+  button.disabled = active;
+  button.textContent = active ? "Tiến trình đang hoạt động" : "Kết nối dữ liệu";
+  if (disconnect) disconnect.hidden = !active;
+  if (title) title.textContent = active ? "SSI đang kết nối" : "Kết nối SSI FastConnect?";
+  if (copy) copy.textContent = active
+    ? "Tiến trình SSI đang hoạt động. Bạn có thể vào bảng điều khiển để xem dữ liệu và trạng thái kết nối."
+    : "Dữ liệu báo giá (quote) và khớp lệnh sẽ được thu thập bằng một tiến trình riêng. Kết nối chỉ bắt đầu khi bạn chọn nút bên dưới.";
+  if (skipButton) skipButton.textContent = active ? "Vào trang web" : "Tiếp tục không kết nối";
 }
 function onboardingStage(stage) {
   const labels = ["XEM TRƯỚC", "GIỚI THIỆU", "HƯỚNG DẪN"];
@@ -93,12 +175,12 @@ function renderLineChart(target, series, key, color, label) {
   const node = document.querySelector(target); if (!node) return;
   const rows=(series||[]).filter(row=>row[key]!==null&&row[key]!==undefined&&Number.isFinite(Number(row[key]))),data=rows.map(row=>Number(row[key]));
   if(data.length<2){node.innerHTML='<div class="empty-state">Chưa đủ dữ liệu để vẽ biểu đồ.</div>';return;}
-  const width=800,height=260,left=72,right=14,top=18,bottom=44;let min=Math.min(...data),max=Math.max(...data);if(min===max){const pad=Math.abs(max)*.05||1;min-=pad;max+=pad;}const span=max-min;
-  const points=data.map((value,index)=>[left+index/(data.length-1)*(width-left-right),top+(max-value)/span*(height-top-bottom)]);
+  const width=800,height=260,left=86,right=14,top=20,bottom=46;let min=Math.min(...data),max=Math.max(...data);if(min===max){const pad=Math.abs(max)*.05||1;min-=pad;max+=pad;}const raw=(max-min)/4,power=10**Math.floor(Math.log10(raw)),ratio=raw/power,step=(ratio<=1?1:ratio<=2?2:ratio<=2.5?2.5:ratio<=5?5:10)*power,axisMin=Math.floor(min/step)*step,axisMax=Math.ceil(max/step)*step,span=axisMax-axisMin||1,ticks=[];for(let value=axisMin;value<=axisMax+step*.0001;value+=step)ticks.push(Number(value.toPrecision(12)));
+  const points=data.map((value,index)=>[left+index/(data.length-1)*(width-left-right),top+(axisMax-value)/span*(height-top-bottom)]);
   const path=points.map((point,index)=>(index?'L':'M')+point[0].toFixed(1)+' '+point[1].toFixed(1)).join(' '),grid=[];
-  for(let i=0;i<=4;i++){const y=top+i*(height-top-bottom)/4,v=max-i*span/4;grid.push('<line x1="'+left+'" y1="'+y+'" x2="'+(width-right)+'" y2="'+y+'" stroke="#e2ebe4"/><text x="'+(left-9)+'" y="'+(y+4)+'" text-anchor="end" fill="#71857a" font-size="11">'+fmt(v,key.includes('imbalance')?3:2)+'</text>');}
-  const unit=key.includes('spread')?' điểm cơ bản (bps)':key.includes('depth')?' giá trị':'',hover=points.map((point,index)=>{const row=rows[index],stamp=row.minute||row.received_at_vn||row.source_timestamp||row.received_at_utc||row.timestamp||'Thời điểm không có trong dữ liệu';return {x:point[0],text:stamp+' · '+label+': '+fmt(data[index],key.includes('imbalance')?3:2)+unit};});
-  const xTicks=[0,Math.floor((rows.length-1)/2),rows.length-1].map((index,pos)=>{const x=left+index/Math.max(rows.length-1,1)*(width-left-right),row=rows[index],raw=row.minute||row.received_at_vn||row.source_timestamp||row.received_at_utc||row.timestamp||'—',d=new Date(raw),stamp=Number.isNaN(d.valueOf())?String(raw).slice(0,8):d.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit',second:'2-digit'}),anchor=pos===0?'start':pos===2?'end':'middle';return '<line x1="'+x+'" y1="'+(height-bottom)+'" x2="'+x+'" y2="'+(height-bottom+4)+'" stroke="#9caf9f"/><text x="'+x+'" y="'+(height-9)+'" text-anchor="'+anchor+'" fill="#71857a" font-size="10">'+escapeHtml(stamp)+'</text>';}).join('');
+  for(const v of ticks){const y=top+(axisMax-v)/span*(height-top-bottom),labelValue=key.includes('depth')&&Math.abs(v)>=1e9?fmt(v/1e9,1)+' tỷ':fmt(v,key.includes('imbalance')?2:key.includes('spread')?1:0);grid.push('<line x1="'+left+'" y1="'+y+'" x2="'+(width-right)+'" y2="'+y+'" stroke="#e2ebe4"/><text x="'+(left-9)+'" y="'+(y+4)+'" text-anchor="end" fill="#526b5d" font-size="11">'+labelValue+'</text>');}
+  const unit=key.includes('spread')?' điểm cơ bản (bps)':key.includes('depth')?' giá trị':'',hover=points.map((point,index)=>{const row=rows[index],stamp=row.minute||row.source_ts_vn||row.received_at_vn||row.source_timestamp||row.received_at_utc||row.timestamp||'Thời điểm không có trong dữ liệu';return {x:point[0],text:stamp+' · '+label+': '+fmt(data[index],key.includes('imbalance')?3:2)+unit};});
+  const xTicks=Array.from({length:5},(_,pos)=>{const index=Math.round(pos*(rows.length-1)/4),x=left+pos/4*(width-left-right),row=rows[index],raw=row.trading_date||row.minute||row.source_ts_vn||row.received_at_vn||row.source_timestamp||row.received_at_utc||row.timestamp||'—',d=new Date(String(raw).replaceAll('/','-')+(String(raw).length===10?'T00:00:00+07:00':'')),stamp=Number.isNaN(d.valueOf())?String(raw).slice(0,10):row.trading_date?d.toLocaleDateString('vi-VN',{timeZone:'Asia/Ho_Chi_Minh',day:'2-digit',month:'2-digit'}):d.toLocaleTimeString('vi-VN',{timeZone:'Asia/Ho_Chi_Minh',hour:'2-digit',minute:'2-digit'}),anchor=pos===0?'start':pos===4?'end':'middle';return '<line x1="'+x+'" y1="'+(height-bottom)+'" x2="'+x+'" y2="'+(height-bottom+4)+'" stroke="#9caf9f"/><text x="'+x+'" y="'+(height-9)+'" text-anchor="'+anchor+'" fill="#526b5d" font-size="10">'+escapeHtml(stamp)+'</text>';}).join('');
   const marks=points.map((point,index)=>'<circle class="chart-hover-point" cx="'+point[0]+'" cy="'+point[1]+'" r="8" fill="transparent" tabindex="0"><title>'+escapeHtml(hover[index].text)+'</title></circle>').join('');
   node.innerHTML='<svg viewBox="0 0 '+width+' '+height+'" role="img" aria-label="'+escapeHtml(label)+'">'+grid.join('')+'<path d="'+path+'" fill="none" stroke="'+color+'" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>'+marks+xTicks+'<text x="'+left+'" y="12" fill="#587264" font-size="10">'+escapeHtml(label+unit)+'</text></svg>';
   attachChartTooltip(node,node.querySelector('svg'),hover,width);
@@ -107,11 +189,11 @@ function renderDepthChart(target, series) {
   const node=document.querySelector(target);if(!node)return;
   const rows=(series||[]).filter(row=>row.bid_depth_value!==null&&row.bid_depth_value!==undefined&&row.ask_depth_value!==null&&row.ask_depth_value!==undefined&&Number.isFinite(Number(row.bid_depth_value))&&Number.isFinite(Number(row.ask_depth_value))),bids=rows.map(row=>Number(row.bid_depth_value)),asks=rows.map(row=>Number(row.ask_depth_value));
   if(bids.length<2||asks.length<2){node.innerHTML='<div class="empty-state">Chưa đủ dữ liệu độ sâu sổ lệnh (depth) hai phía.</div>';return;}
-  const width=800,height=240,left=72,right=14,top=16,bottom=40;let min=Math.min(...bids,...asks),max=Math.max(...bids,...asks);if(min===max){const pad=Math.abs(max)*.05||1;min-=pad;max+=pad;}const span=max-min;
-  const coords=values=>values.map((value,index)=>({value,x:left+index/Math.max(values.length-1,1)*(width-left-right),y:top+(max-value)/span*(height-top-bottom)})),bp=coords(bids),ap=coords(asks),pathFor=points=>points.map((p,i)=>(i?'L':'M')+p.x.toFixed(1)+' '+p.y.toFixed(1)).join(' '),grid=[];
-  for(let i=0;i<=4;i++){const y=top+i*(height-top-bottom)/4,v=max-i*span/4;grid.push('<line x1="'+left+'" y1="'+y+'" x2="'+(width-right)+'" y2="'+y+'" stroke="#e2ebe4"/><text x="'+(left-9)+'" y="'+(y+4)+'" text-anchor="end" fill="#71857a" font-size="10">'+fmt(v,0)+'</text>');}
-  const stampAt=i=>{const row=rows[i],raw=row.minute||row.received_at_vn||row.source_timestamp||row.received_at_utc||row.timestamp||'—',d=new Date(raw);return Number.isNaN(d.valueOf())?String(raw).slice(0,8):d.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit',second:'2-digit'});};
-  const xTicks=[0,Math.floor((rows.length-1)/2),rows.length-1].map((index,pos)=>{const x=bp[index].x,anchor=pos===0?'start':pos===2?'end':'middle';return '<line x1="'+x+'" y1="'+(height-bottom)+'" x2="'+x+'" y2="'+(height-bottom+4)+'" stroke="#9caf9f"/><text x="'+x+'" y="'+(height-8)+'" text-anchor="'+anchor+'" fill="#71857a" font-size="10">'+escapeHtml(stampAt(index))+'</text>';}).join('');
+  const width=800,height=240,left=86,right=14,top=18,bottom=44;let min=Math.min(...bids,...asks),max=Math.max(...bids,...asks);if(min===max){const pad=Math.abs(max)*.05||1;min-=pad;max+=pad;}const raw=(max-min)/4,power=10**Math.floor(Math.log10(raw)),ratio=raw/power,step=(ratio<=1?1:ratio<=2?2:ratio<=2.5?2.5:ratio<=5?5:10)*power,axisMin=Math.floor(min/step)*step,axisMax=Math.ceil(max/step)*step,span=axisMax-axisMin||1,ticks=[];for(let value=axisMin;value<=axisMax+step*.0001;value+=step)ticks.push(Number(value.toPrecision(12)));
+  const coords=values=>values.map((value,index)=>({value,x:left+index/Math.max(values.length-1,1)*(width-left-right),y:top+(axisMax-value)/span*(height-top-bottom)})),bp=coords(bids),ap=coords(asks),pathFor=points=>points.map((p,i)=>(i?'L':'M')+p.x.toFixed(1)+' '+p.y.toFixed(1)).join(' '),grid=[];
+  for(const v of ticks){const y=top+(axisMax-v)/span*(height-top-bottom),labelValue=Math.abs(v)>=1e9?fmt(v/1e9,1)+' tỷ':fmt(v,0);grid.push('<line x1="'+left+'" y1="'+y+'" x2="'+(width-right)+'" y2="'+y+'" stroke="#e2ebe4"/><text x="'+(left-9)+'" y="'+(y+4)+'" text-anchor="end" fill="#526b5d" font-size="10">'+labelValue+'</text>');}
+  const stampAt=i=>{const row=rows[i],raw=row.minute||row.source_ts_vn||row.received_at_vn||row.source_timestamp||row.received_at_utc||row.timestamp||'—',d=new Date(raw);return Number.isNaN(d.valueOf())?String(raw).slice(0,8):d.toLocaleTimeString('vi-VN',{timeZone:'Asia/Ho_Chi_Minh',hour:'2-digit',minute:'2-digit',second:'2-digit'});};
+  const xTicks=Array.from({length:5},(_,pos)=>{const index=Math.round(pos*(rows.length-1)/4),x=left+pos/4*(width-left-right),anchor=pos===0?'start':pos===4?'end':'middle';return '<line x1="'+x+'" y1="'+(height-bottom)+'" x2="'+x+'" y2="'+(height-bottom+4)+'" stroke="#9caf9f"/><text x="'+x+'" y="'+(height-8)+'" text-anchor="'+anchor+'" fill="#526b5d" font-size="10">'+escapeHtml(stampAt(index))+'</text>';}).join('');
   const marks=(points,side)=>points.map((p,i)=>'<circle class="chart-hover-point" cx="'+p.x+'" cy="'+p.y+'" r="8" fill="transparent" tabindex="0"><title>'+escapeHtml(stampAt(i)+' · '+(side==='Bid'?'Bên mua (bid)':'Bên bán (ask)')+' · Độ sâu sổ lệnh (depth): '+fmt(p.value,0)+' giá trị (giá × khối lượng)')+'</title></circle>').join('');
   const hover=rows.map((row,i)=>({x:bp[i].x,text:stampAt(i)+' · Bên mua (bid): '+fmt(bids[i],0)+' · Bên bán (ask): '+fmt(asks[i],0)+' · giá trị độ sâu (depth), tính bằng giá × khối lượng'}));
   node.innerHTML='<svg viewBox="0 0 '+width+' '+height+'" role="img" aria-label="Độ sâu sổ lệnh bên mua và bên bán theo thời gian (bid và ask depth)">'+grid.join('')+'<path d="'+pathFor(bp)+'" fill="none" stroke="#006B3F" stroke-width="3"/><path d="'+pathFor(ap)+'" fill="none" stroke="#E2231A" stroke-width="3"/>'+marks(bp,'Bid')+marks(ap,'Ask')+xTicks+'<text x="'+left+'" y="11" fill="#587264" font-size="10">Giá trị độ sâu (depth) · giá × khối lượng</text></svg>';
@@ -130,12 +212,13 @@ async function refreshStatus() {
   try {
     const data = await api("/api/status");
     state.status = data;
+    window.MarketClock.update(data.meta||data);
     state.source = data.source;
     const live = ["live", "ssi"].includes(data.source);
-    const liveReady = live && data.connection_status === "connected" && Boolean(data.last_data_at);
+    const liveReady = live && data.feed_state === "live" && Boolean(data.last_data_at);
     const historyReady = live && Number(data.historical_prices_rows || 0) > 0;
     const liveLabel = "SSI FASTCONNECT";
-    $("#mode-badge").textContent = live ? liveReady ? liveLabel + " · LIVE" : historyReady ? liveLabel + " · GIÁ LỊCH SỬ" : liveLabel + " · CHƯA CÓ DATA" : "MÔ PHỎNG (DEMO)";
+    $("#mode-badge").textContent = live ? ({live:liveLabel+" · LIVE",delayed:liveLabel+" · TRỄ",stale:liveLabel+" · QUÁ HẠN",outside_session:historyReady?liveLabel+" · GIÁ LỊCH SỬ":liveLabel+" · NGOÀI PHIÊN",awaiting_quote:liveLabel+" · ĐANG CHỜ QUOTE",connecting:liveLabel+" · ĐANG KẾT NỐI",disconnected:historyReady?liveLabel+" · ĐÃ NGẮT KẾT NỐI":liveLabel+" · CHƯA KẾT NỐI",error:liveLabel+" · LỖI KẾT NỐI"}[data.feed_state] || liveLabel+" · CHƯA CÓ DATA") : "MÔ PHỎNG (DEMO)";
     $("#mode-badge").className = "badge " + (liveReady ? "badge-live" : "badge-demo");
     $("#connection-label").textContent = viStatus(data.connection_status);
     $("#connection-dot").className = "status-dot " + (
@@ -144,32 +227,50 @@ async function refreshStatus() {
     );
     $("#last-update").textContent = fmtTime(data.last_data_at);
     const notice = $("#global-notice");
-    notice.className = "notice " + (live && (data.connection_status === "error" || data.connection_status === "disconnected") ? "notice-error" : liveReady ? "notice-live" : "notice-demo");
+    const feedWarning = ["disconnected", "error", "delayed", "stale"].includes(data.feed_state);
+    notice.className = "notice " + (live && feedWarning ? "notice-error" : live && (liveReady || data.feed_state === "outside_session") ? "notice-live" : "notice-demo");
+    const clock=data.meta||data;
+    const marketMessage=clock.state==="IN_SESSION"?`Trong phiên · cập nhật mỗi ${clock.refresh_seconds||5} giây`:
+      clock.state==="LUNCH_BREAK"?`Nghỉ trưa · dữ liệu đến 11:30`:
+      `Ngoài phiên · phiên gần nhất ${fmtDate(clock.session_date)} · mở phiên lúc ${fmtTime(clock.next_open_at)}`;
     let message = live
-      ? "TRỰC TIẾP (LIVE) · Nguồn SSI FastConnect. Trạng thái kết nối: " + viStatus(data.connection_status) + "."
+      ? feedStateText(data) + ". Nguồn SSI FastConnect. Trạng thái kết nối: " + viStatus(data.connection_status) + "."
       : "MÔ PHỎNG (DEMO) · Dữ liệu tổng hợp để xem trước, không phải dữ liệu thị trường thật.";
-    if (live && !data.last_data_at) message += historyReady ? " Chưa có quote sổ lệnh realtime; đang hiển thị giá OHLC lịch sử SSI." : " Chưa nhận được snapshot nào nên chưa có dữ liệu live để hiển thị.";
-    if (data.is_stale) message += " Dữ liệu đã cũ; không xem là trực tiếp (LIVE).";
-    if (data.last_error) message += " " + data.last_error;
+    if(live)message=marketMessage+" · "+message;
+    if (live && !data.last_data_at) message += historyReady ? " Chưa có báo giá sổ lệnh trực tiếp; đang hiển thị giá OHLC lịch sử SSI." : " Chưa nhận được snapshot nào nên chưa có dữ liệu sổ lệnh để hiển thị.";
+    if (data.processing_delayed) message += ` SSI vẫn nhận quote lúc ${fmtTime(data.last_quote_received_at)}, nhưng snapshot lưu gần nhất cách đây ${fmt(data.persistence_lag_seconds, 0)} giây; dữ liệu hiển thị chưa theo kịp.`;
+    else if (data.is_stale) message += " Không nhận quote hợp lệ mới trong phiên liên tục; dữ liệu hiển thị đã cũ và không được xem là trực tiếp (LIVE).";
+    if (data.last_error) message += " Worker ghi nhận lỗi trong phiên gần nhất; hãy kiểm tra nhật ký kết nối.";
     $("#notice-text").textContent = message;
+    updateConnectionDialog(data);
     if (state.route === "methodology") renderCollectorStatus(data);
   } catch (error) {
     $("#connection-label").textContent = "Backend không phản hồi";
-    $("#notice-text").textContent = "Không gọi được backend: " + error.message;
+    $("#notice-text").textContent = "Không lấy được trạng thái kết nối dữ liệu. Hãy kiểm tra web backend.";
+    const dialogStatus = $("#connection-dialog-status");
+    if (dialogStatus) dialogStatus.textContent = "Chưa liên hệ được web backend nên chưa thể yêu cầu kết nối SSI.";
     $("#global-notice").className = "notice notice-error";
   }
 }
 function renderCollectorStatus(data) {
+  const workerState = ({running:"Tiến trình đang chạy",heartbeat_lost:"Mất nhịp cập nhật",stopped:"Đã dừng",
+    abandoned:"Bị dừng đột ngột",failed:"Dừng do lỗi",connecting:"Đang khởi tạo"}[data.worker_status]) ||
+    (data.worker_status ? "Không hoạt động" : "Chưa có tiến trình hoạt động");
+  const heartbeatAge = data.worker_heartbeat_age_seconds == null ? "—" : fmt(data.worker_heartbeat_age_seconds, 0) + " giây trước";
   const items = [
-    ["Nguồn dữ liệu", data.provider || (data.source === "ssi" ? "SSI FastConnect · quote WebSocket" : "Mô phỏng (DEMO)")],
-    ["Trạng thái", viStatus(data.connection_status)],
-    ["Đăng ký quote SSI", data.subscription_status === "confirmed" ? "Đã xác nhận · " + (data.subscribed_boards || []).join(", ") : ({pending:"Đang chờ đăng ký",subscribing:"Đang gửi đăng ký",partial:"Đã nhận một phần",unconfirmed:"Chưa xác nhận",unverified:"Chưa kiểm tra"}[data.subscription_status] || data.subscription_status || "Chưa có")],
-    ["ACK đăng ký", fmt(data.subscription_ack_count, 0)],
+    ["Nguồn dữ liệu", "SSI FastConnect"],
+    ["Tiến trình thu thập", workerState],
+    ["Tình trạng dữ liệu", feedStateText(data)],
+    ["Trạng thái kết nối", viStatus(data.connection_status)],
+    ["Nhịp hoạt động (heartbeat)", fmtTime(data.worker_heartbeat_at) + (heartbeatAge !== "—" ? " · " + heartbeatAge : "")],
+    ["Mã lượt thu thập", data.collector_run_id ?? "—"],
     ["Thông điệp nhận được (message)", fmt(data.messages_received, 0)],
     ["Ảnh chụp dữ liệu hợp lệ (snapshot)", fmt(data.rows_valid, 0)],
     ["Lỗi / trùng", fmt(data.rows_invalid, 0) + " / " + fmt(data.duplicate_messages, 0)],
     ["Kết nối lại (reconnect)", fmt(data.reconnect_count, 0)],
-    ["Thông điệp gần nhất (message)", fmtTime(data.last_data_at)]
+    ["Báo giá SSI nhận gần nhất", fmtTime(data.last_quote_received_at)],
+    ["Snapshot lưu gần nhất / độ trễ", fmtTime(data.last_persisted_at) + " / " + fmt(data.persistence_lag_seconds, 0) + " giây"],
+    ["Lỗi phiên gần nhất", data.last_error ? "Tiến trình gặp lỗi; hãy kiểm tra nhật ký kết nối" : "Không ghi nhận lỗi"]
   ];
   $("#collector-status").innerHTML = items.map((item) => statusCell(item[0], item[1])).join("");
 }
@@ -204,13 +305,17 @@ async function loadOverview() {
     renderLineChart("#spread-chart", data.series, "spread_bps", "#008A45", "Chênh lệch giá mua – bán (spread) theo thời gian");
       renderDepthChart("#depth-chart", data.series);
     const rankings = await api("/api/rankings?limit=" + limit);
-    const preview = (rankings.lowest_spread || []).slice(0, 5).map((row, index) => [
-      '<strong>' + (index + 1) + '</strong>',
-      '<strong>' + escapeHtml(row.symbol) + '</strong>',
-      fmt(row.median_spread_bps) + " điểm cơ bản (bps)",
-      fmt(row.snapshot_count, 0)
-    ]);
-    $("#overview-ranking").innerHTML = table(["Hạng", "Mã", "Trung vị chênh lệch giá (spread)", "Số ảnh chụp dữ liệu (snapshots)"], preview);
+    if (window.renderOverviewSpreadRanking) {
+      window.renderOverviewSpreadRanking(rankings, Number($("#overview-limit")?.value || 60), window.MarketClock?.get() || {});
+    } else {
+      const preview = (rankings.lowest_spread || []).slice(0, 5).map((row, index) => [
+        '<strong>' + (index + 1) + '</strong>',
+        '<strong>' + escapeHtml(row.symbol) + '</strong>',
+        fmt(row.median_spread_bps) + " điểm cơ bản (bps)",
+        fmt(row.snapshot_count, 0)
+      ]);
+      $("#overview-ranking").innerHTML = table(["Hạng", "Mã", "Trung vị chênh lệch giá (spread)", "Số ảnh chụp dữ liệu (snapshots)"], preview);
+    }
   } catch (error) {
     $("#spread-chart").innerHTML = '<div class="empty-state">Lỗi tải dữ liệu: ' + escapeHtml(error.message) + '</div>';
   }
@@ -308,20 +413,6 @@ async function loadMethodology() {
     $("#method-content").innerHTML = '<div class="empty-state">' + escapeHtml(error.message) + '</div>';
   }
 }
-async function collectorAction(path, confirmMessage) {
-  if (confirmMessage && !window.confirm(confirmMessage)) return;
-  try {
-    const data = await api(path, { method: "POST" });
-    await refreshStatus();
-    if (state.route === "methodology") renderCollectorStatus(state.status);
-    if (path.endsWith("/start")) {
-      $("#collector-status").insertAdjacentHTML("afterend", '<p class="small-note">' + escapeHtml(data.message || "Đang mở WebSocket SSI…") + '</p>');
-    }
-  } catch (error) {
-    window.alert("Không thực hiện được: " + error.message);
-  }
-}
-
 $$(".nav-item").forEach((button) => button.addEventListener("click", () => setRoute(button.dataset.route)));
 $$("[data-route]").forEach((button) => {
   if (!button.classList.contains("nav-item")) button.addEventListener("click", () => setRoute(button.dataset.route));
@@ -332,22 +423,65 @@ $("#welcome-next").addEventListener("click", () => {
   else onboardingStage(stage + 1);
 });
 $("#welcome-skip").addEventListener("click", () => enterApp("overview"));
+$("#open-connection-dialog").addEventListener("click", () => {
+  showConnectionDialog();
+  refreshStatus();
+});
+$("#connect-now").addEventListener("click", async () => {
+  const button = $("#connect-now");
+  const message = $("#connection-dialog-status");
+  button.disabled = true;
+  button.textContent = "Đang khởi chạy…";
+  message.textContent = "Đang yêu cầu kết nối SSI FastConnect…";
+  try {
+    const result = await api("/api/collector/start", { method: "POST" });
+    if (!result.ok) {
+      if (result.worker_command) {
+        message.textContent = "Web backend đang dùng phiên bản cũ. Hãy khởi động lại web rồi thử kết nối lại.";
+      } else {
+        message.textContent = result.message || "Chưa khởi chạy được kết nối SSI.";
+      }
+      button.disabled = false;
+      button.textContent = "Thử kết nối lại";
+      return;
+    }
+    message.textContent = result.message || "Đã gửi yêu cầu; trạng thái kết nối sẽ tự cập nhật.";
+    await refreshStatus();
+    window.setTimeout(refreshStatus, 1500);
+  } catch (_) {
+    message.textContent = "Chưa khởi chạy được tiến trình thu thập. Hãy kiểm tra cấu hình SSI rồi thử lại.";
+    button.disabled = false;
+    button.textContent = "Thử kết nối lại";
+  }
+});
+$("#disconnect-data").addEventListener("click", async () => {
+  const button = $("#disconnect-data");
+  button.disabled = true;
+  $("#connection-dialog-status").textContent = "Đang gửi yêu cầu ngắt kết nối…";
+  try {
+    await api("/api/collector/stop", { method: "POST" });
+    $("#connection-dialog-status").textContent = "Đã gửi yêu cầu ngắt kết nối SSI.";
+    window.setTimeout(refreshStatus, 1000);
+  } catch (_) {
+    $("#connection-dialog-status").textContent = "Chưa gửi được yêu cầu ngắt kết nối. Hãy thử lại.";
+  } finally {
+    button.disabled = false;
+  }
+});
 $("#overview-symbol").addEventListener("change", () => (window.loadOverview || loadOverview)());
 $("#overview-limit").addEventListener("change", () => (window.loadOverview || loadOverview)());
 $("#detail-symbol").addEventListener("change", () => (window.loadDetail || loadDetail)());
 $("#ranking-limit").addEventListener("change", () => (window.loadRankings || loadRankings)());
-$("#start-live").addEventListener("click", () => collectorAction(
-  "/api/collector/start",
-  "Khởi động WebSocket SSI FastConnect bằng API Key và API Secret trong .env?"
-));
-$("#stop-live").addEventListener("click", () => collectorAction("/api/collector/stop"));
-
-
-if (localStorage.getItem("sli-onboarding-done") === "1") enterApp("overview");
-else onboardingStage(0);
+// enhancements.js replaces the legacy overview loader. Defer the first route
+// until all deferred scripts have initialized so the legacy loader cannot
+// finish later and overwrite the SSI-specific charts with empty placeholders.
+window.setTimeout(() => {
+  if (localStorage.getItem("sli-onboarding-done") === "1") enterApp("overview");
+  else onboardingStage(0);
+}, 0);
 refreshStatus();
-window.setInterval(refreshStatus, 5000);
-window.setInterval(() => {
-  if (state.route === "overview") (window.loadOverview || loadOverview)();
-  if (state.route === "detail") (window.loadDetail || loadDetail)();
-}, 10000);
+const marketEvents=new EventSource('/api/stream');
+for(const eventName of ['market_state','data_diff','heartbeat'])marketEvents.addEventListener(eventName,event=>{
+  try{const payload=JSON.parse(event.data),meta=payload.meta||payload;window.MarketClock.update(meta);if(!document.hidden&&eventName==='data_diff')window.enhancedRefresh?.();}catch(_){ }
+});
+document.addEventListener('visibilitychange',()=>window.MarketClock.visibilityChanged());

@@ -59,13 +59,26 @@ def map_message(payload):
         seen.add(symbol)
         received = datetime.now(config.TIMEZONE).isoformat(timespec="milliseconds")
         source_timestamp = _source_time(item)
-        event_time = _to_local_timestamp(source_timestamp) or received
+        source_time_vn = _to_local_timestamp(source_timestamp)
+        event_time = source_time_vn or received
+        delay_seconds = None
+        time_flags = []
+        if source_timestamp and source_time_vn is None:
+            time_flags.append("invalid_source_timestamp")
+        elif source_time_vn:
+            delay_seconds = (datetime.fromisoformat(received) - datetime.fromisoformat(source_time_vn)).total_seconds()
+            if delay_seconds > config.MAX_EVENT_DELAY_SECONDS:
+                time_flags.append("late_message")
+            elif delay_seconds < -config.CLOCK_SKEW_TOLERANCE_SECONDS:
+                time_flags.append("future_source_timestamp")
         market = market_for(symbol, item.get("market", item.get("exchange")))
         phase = session_phase(event_time, market)
         observation = {
             "symbol": symbol,
             "source_timestamp": source_timestamp,
-            "source_ts_vn": _to_local_timestamp(source_timestamp),
+            "source_ts_vn": source_time_vn,
+            "source_delay_seconds": delay_seconds,
+            "time_flags": time_flags,
             "received_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "received_at_vn": received,
             "market": market,
@@ -93,7 +106,7 @@ def map_message(payload):
 
 
 def validate_observation(observation):
-    flags = []
+    flags = list(observation.get("time_flags", []))
     if not observation.get("symbol"):
         return {"status": "invalid", "reason": "missing_symbol"}
     bid1 = observation.get("bid_price_1")
@@ -215,8 +228,20 @@ def payload_hash(payload):
 def _to_local_timestamp(value):
     if not value:
         return None
+    text = str(value).strip()
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+            for pattern in ("%Y/%m/%d %H:%M:%S.%f", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(text, pattern)
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                raise ValueError("unsupported timestamp format")
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=config.TIMEZONE)
         return parsed.astimezone(config.TIMEZONE).isoformat(timespec="milliseconds")

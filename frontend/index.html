@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#008A45">
   <title>Stock Liquidity Intelligence</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=10">
+  <link rel="stylesheet" href="/assets/styles.css?v=38">
 </head>
 <body>
   <div id="onboarding" class="onboarding">
@@ -57,6 +57,7 @@
         <span id="mode-badge" class="badge badge-demo">MÔ PHỎNG (DEMO)</span><span id="connection-dot" class="status-dot"></span>
         <span id="connection-label">Đang tải trạng thái</span><span class="status-divider"></span>
         <span class="muted">Cập nhật lần cuối</span><strong id="last-update">—</strong>
+        <button id="open-connection-dialog" class="button button-primary header-connect-button" type="button">Kết nối dữ liệu</button>
       </div>
     </header>
     <nav class="main-nav" aria-label="Điều hướng chính">
@@ -77,7 +78,7 @@
           <div><p class="eyebrow">BẢNG ĐIỀU KHIỂN</p><h1>Tổng quan thanh khoản</h1><p>Quan sát spread, độ sâu sổ lệnh và giá lịch sử SSI của các mã đang theo dõi.</p></div>
           <div class="filter-bar">
             <label>Mã cổ phiếu<select id="overview-symbol"></select></label>
-            <label>Cửa sổ dữ liệu<select id="overview-limit"><option value="60">60 ảnh chụp dữ liệu (snapshot)</option><option value="120" selected>120 ảnh chụp dữ liệu (snapshot)</option><option value="240">240 ảnh chụp dữ liệu (snapshot)</option></select></label>
+            <label>Cửa sổ biểu đồ<select id="overview-limit"><option value="30">30 phút đã hoàn tất</option><option value="60" selected>60 phút đã hoàn tất</option><option value="390">Phiên hôm nay</option></select></label>
           </div>
         </div>
         <div class="kpi-grid">
@@ -88,32 +89,52 @@
           <article class="kpi-card"><span>Ảnh chụp dữ liệu hợp lệ (snapshot)</span><strong id="kpi-valid">—</strong><small id="kpi-valid-count">Chưa có quan sát</small></article>
         </div>
         <div class="content-grid">
-          <article class="panel panel-wide"><div class="panel-heading"><div><h2>Diễn biến chênh lệch giá mua – bán (spread)</h2><p>Chênh lệch theo báo giá trong các ảnh chụp dữ liệu nhận được</p></div><span id="overview-symbol-label" class="chip">—</span></div><div id="spread-chart" class="chart-box"></div></article>
-          <article class="panel"><div class="panel-heading"><div><h2>Độ sâu hai phía sổ lệnh (depth)</h2><p>Giá trị niêm yết ba mức giá đầu</p></div></div><div id="depth-chart" class="chart-box chart-short"></div><div class="legend"><span><i class="legend-bid"></i>Độ sâu bên mua (bid depth)</span><span><i class="legend-ask"></i>Độ sâu bên bán (ask depth)</span></div></article>
-          <article class="panel"><div class="panel-heading"><div><h2>Xếp hạng chênh lệch giá (spread)</h2><p>Trung vị trong cửa sổ đang chọn</p></div><button class="text-button" data-route="rankings">Xem tất cả →</button></div><div id="overview-ranking"></div></article>
+          <article class="panel panel-wide"><div class="panel-heading"><div><h2>Spread trung vị theo thời gian</h2><p>Dùng chung bar một phút đã hoàn tất với biểu đồ diễn biến phiên; chọn mã để lọc riêng</p></div><span id="overview-symbol-label" class="chip">—</span></div><div id="spread-chart" class="chart-box"></div></article>
+          <article class="panel depth-overview-panel"><div class="panel-heading"><div><h2>Độ sâu hai phía sổ lệnh</h2><p>Trung vị giá trị top 3 của nhóm cổ phiếu đủ dữ liệu · đơn vị tự động</p></div><div class="depth-header-badges"><span id="depth-session-label" class="chip"></span><span id="depth-panel-count" class="chip"></span></div></div><div class="depth-legend"><span><i class="legend-bid"></i>Độ sâu mua · phía trên 0</span><span><i class="legend-ask"></i>Độ sâu bán · phía dưới 0</span></div><div id="depth-chart" class="depth-butterfly-chart" aria-label="Biểu đồ độ sâu mua và bán theo phút"></div><p class="depth-method-note">Độ sâu lớn hơn nghĩa là giá trị đang niêm yết nhiều hơn, không bảo đảm sẽ khớp. Lệnh lớn có thể tiêu thụ nhiều mức giá, làm giá bình quân khác giá tốt nhất; cơ sở nghiên cứu: <a href="https://arxiv.org/abs/1011.6402" target="_blank" rel="noreferrer">Cont, Kukanov &amp; Stoikov (2014)</a> và <a href="https://par.nsf.gov/servlets/purl/10424646" target="_blank" rel="noreferrer">Papanicolaou và cộng sự (2023)</a>. Mô phỏng ứng dụng là phép tính tĩnh theo mức giá SSI đang hiển thị.</p><div id="depth-tooltip" class="depth-tooltip" hidden></div></article>
+          <article class="panel"><div class="panel-heading"><div><h2>Xếp hạng chênh lệch giá (spread)</h2><p>Top 5 mã có spread trung vị thấp nhất trong cửa sổ đủ mẫu</p></div><button class="text-button" data-route="rankings">Xem tất cả →</button></div><div id="overview-ranking"></div></article>
         </div>
         <p class="footnote">Độ sâu ba mức giá đầu (top 3 depth) là lượng đang niêm yết, không phải toàn bộ sổ lệnh hay thanh khoản đảm bảo khớp.</p>
       </section>
 
       <section id="view-detail" class="view hidden">
-        <div class="page-heading"><div><p class="eyebrow">PHÂN TÍCH MÃ</p><h1>Chi tiết cổ phiếu</h1><p>Xem ảnh chụp dữ liệu (snapshot), chênh lệch giá (spread), độ sâu (depth) và mất cân bằng khối lượng chờ (queue imbalance) của một mã.</p></div><div class="filter-bar"><label>Mã cổ phiếu<select id="detail-symbol"></select></label></div></div>
+        <div class="page-heading"><div><p class="eyebrow">PHÂN TÍCH MÃ</p><h1>Chi tiết cổ phiếu</h1><p>Trong phiên: xem quote sổ lệnh SSI. Ngoài phiên hoặc chưa có quote: xem giá và khối lượng OHLC lịch sử của mã.</p></div><div class="filter-bar"><div class="detail-symbol-picker"><label for="detail-symbol-search">Tìm mã hoặc tên doanh nghiệp</label><input id="detail-symbol-search" type="search" placeholder="Ví dụ: FPT hoặc Công ty FPT" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="detail-symbol-options"><select id="detail-symbol" class="hidden" aria-hidden="true" tabindex="-1"></select><div id="detail-symbol-options" class="symbol-suggestions hidden" role="listbox"></div><p id="detail-company-name" class="detail-company-name" aria-live="polite">Đang tải danh mục doanh nghiệp…</p></div></div></div>
         <div class="kpi-grid">
           <article class="kpi-card"><span>Chênh lệch giá mua – bán (spread) hiện tại</span><strong id="detail-spread">—</strong><small>Điểm cơ bản (bps)</small></article>
           <article class="kpi-card"><span>Giá trị độ sâu bên mua (bid depth)</span><strong id="detail-bid-depth">—</strong><small>Ba mức giá đầu</small></article>
           <article class="kpi-card"><span>Giá trị độ sâu bên bán (ask depth)</span><strong id="detail-ask-depth">—</strong><small>Ba mức giá đầu</small></article>
           <article class="kpi-card"><span>Mất cân bằng khối lượng chờ (queue imbalance)</span><strong id="detail-imbalance">—</strong><small>Từ −1 đến +1</small></article>
-          <article class="kpi-card"><span>Tỷ lệ hợp lệ</span><strong id="detail-valid">—</strong><small id="detail-snapshots">—</small></article>
+          <article class="kpi-card"><span>Mất cân bằng giá trị chờ (value imbalance)</span><strong id="detail-value-imbalance">—</strong><small>Từ −1 đến +1 · riêng với mất cân bằng khối lượng</small></article>
+          <article class="kpi-card"><span>Cảnh báo đang hoạt động</span><strong id="detail-valid">—</strong><small id="detail-snapshots">—</small></article>
         </div>
         <div class="content-grid">
           <article class="panel panel-wide"><div class="panel-heading"><div><h2>Chênh lệch giá (spread) theo thời gian</h2><p>Ảnh chụp dữ liệu (snapshot) được lưu trong cơ sở dữ liệu</p></div></div><div id="detail-spread-chart" class="chart-box"></div></article>
-          <article class="panel"><div class="panel-heading"><div><h2>Sổ lệnh gần nhất</h2><p id="book-time">Chưa có dữ liệu</p></div><span id="book-validity" class="chip">—</span></div><div id="orderbook"></div></article>
-          <article class="panel"><div class="panel-heading"><div><h2>Độ sâu bên mua / bên bán (bid / ask depth)</h2><p>Giá trị niêm yết ba mức giá đầu</p></div></div><div id="detail-depth-chart" class="chart-box chart-short"></div><div class="legend"><span><i class="legend-bid"></i>Bên mua (bid)</span><span><i class="legend-ask"></i>Bên bán (ask)</span></div></article>
+          <article class="panel detail-book-panel"><div class="panel-heading"><div><h2>Sổ lệnh gần nhất</h2><p id="book-time">Chưa có dữ liệu</p></div><span id="book-validity" class="chip">—</span></div><div id="orderbook"></div></article>
+          <article class="panel detail-depth-panel"><div class="panel-heading"><div><h2>Độ sâu theo thời gian</h2><p>Giá trị sổ lệnh ba mức giá đầu của mã đang chọn</p></div></div><div id="detail-depth-chart" class="chart-box chart-short"></div><div class="legend"><span><i class="legend-bid"></i>Bên mua (bid)</span><span><i class="legend-ask"></i>Bên bán (ask)</span></div></article>
+          <article class="panel panel-wide"><div class="panel-heading"><div><h2>Cảnh báo đang hoạt động</h2><p>Cảnh báo của mã đang chọn tại cùng mốc dữ liệu</p></div><a class="text-link" href="#alerts" data-route="alerts">Mở trang Cảnh báo →</a></div><div id="detail-alerts" class="empty-state">Đang tải cảnh báo…</div></article>
+          <details class="panel panel-wide detail-history"><summary><span><b>Lịch sử giá giao dịch</b><small>OHLC ngày từ SSI · khối lượng khớp theo ngày</small></span><span id="detail-history-summary">Mở để xem</span></summary><div id="detail-history-table" class="table-wrap"></div></details>
         </div>
       </section>
 
       <section id="view-rankings" class="view hidden">
-        <div class="page-heading"><div><p class="eyebrow">SO SÁNH CÁC MÃ</p><h1>Xếp hạng thanh khoản</h1><p>Các bảng xếp hạng tách riêng từng thước đo, không gộp thành một điểm tổng hợp.</p></div><label class="filter-bar">Cửa sổ dữ liệu<select id="ranking-limit"><option value="60">60 ảnh chụp dữ liệu (snapshot)</option><option value="120" selected>120 ảnh chụp dữ liệu (snapshot)</option><option value="500">500 ảnh chụp dữ liệu (snapshot)</option></select></label></div>
-        <div class="content-grid"><article class="panel"><div class="panel-heading"><div><h2>Chênh lệch giá mua – bán (spread) thấp nhất</h2><p>Trung vị chênh lệch theo báo giá · điểm cơ bản (bps)</p></div></div><div id="ranking-spread"></div></article><article class="panel"><div class="panel-heading"><div><h2>Độ sâu sổ lệnh (depth) cao nhất</h2><p>Trung vị tổng độ sâu · ba mức giá đầu</p></div></div><div id="ranking-depth"></div></article></div>
+        <article class="panel ranking-panel">
+          <div class="ranking-controls">
+            <label>Cửa sổ dữ liệu<select id="ranking-limit"><option value="30">30 phút</option><option value="60" selected>60 phút</option><option value="390">Phiên hôm nay</option></select></label>
+            <label>Sàn<select id="ranking-board"><option value="">Tất cả sàn</option><option>HOSE</option><option>HNX</option><option>UPCOM</option></select></label>
+            <label>Tìm mã<input id="ranking-search" type="search" placeholder="Nhập mã cổ phiếu" autocomplete="off"></label>
+            <label>Số dòng<select id="ranking-size"><option value="10" selected>Top 10</option><option value="25">Top 25</option><option value="50">Top 50</option></select></label>
+          </div>
+          <div class="ranking-tabs" role="tablist" aria-label="Chọn bảng xếp hạng">
+            <button type="button" role="tab" aria-selected="true" data-ranking-tab="spread">Spread thấp</button>
+            <button type="button" role="tab" aria-selected="false" data-ranking-tab="depth">Độ sâu cao</button>
+            <button type="button" role="tab" aria-selected="false" data-ranking-tab="widen">Spread nới rộng</button>
+            <button type="button" role="tab" aria-selected="false" data-ranking-tab="fall">Độ sâu suy giảm</button>
+          </div>
+          <div id="ranking-table-scroll" class="ranking-table-scroll" tabindex="0" aria-label="Bảng xếp hạng thanh khoản">
+            <div id="ranking-table-container" aria-live="polite"><div class="empty-state">Đang tải xếp hạng…</div></div>
+          </div>
+          <div class="ranking-pagination"><button id="ranking-more" class="button button-secondary" type="button">Xem thêm 25</button><span id="ranking-count"></span><span id="ranking-updated" role="status">Đang tải…</span></div>
+          <div id="ranking-live-note" class="ranking-note" role="note">Dữ liệu tính từ bar một phút hợp lệ; thời gian nghỉ trưa và ATO/ATC không được đưa vào.</div>
+        </article>
       </section>
 
       <section id="view-alerts" class="view hidden">
@@ -125,7 +146,7 @@
       <section id="view-methodology" class="view hidden">
         <div class="page-heading"><div><p class="eyebrow">NGUỒN DỮ LIỆU · CÁCH TÍNH · GIỚI HẠN</p><h1>Dữ liệu & phương pháp</h1><p>Dữ liệu đến từ đâu, hệ thống xử lý ra sao và mỗi chỉ số có ý nghĩa gì?</p></div></div>
         <div class="content-grid">
-          <article class="panel methodology-collector"><div class="panel-heading"><div><p class="eyebrow">ĐIỀU KHIỂN NGUỒN DỮ LIỆU</p><h2>Kết nối WebSocket SSI FastConnect</h2><p>Collector nhận quote từ HOSE, HNX và UPCoM, rồi tự lưu snapshot vào SQLite.</p></div></div><div id="collector-status" class="collector-status"></div><div class="button-row"><button id="start-live" class="button button-primary">Kết nối SSI FastConnect</button><button id="stop-live" class="button button-secondary">Dừng kết nối</button></div><p class="small-note">Cần SSI_API_KEY và SSI_API_SECRET trong file <code>.env</code>. Collector đăng ký luồng báo giá toàn sàn HOSE, HNX và UPCoM; danh mục cổ phiếu thường và OHLC ngày được đồng bộ riêng từ SSI. Quote realtime chỉ có trong giờ thị trường gửi báo giá.</p></article>
+          <article class="panel methodology-collector"><div class="panel-heading"><div><p class="eyebrow">GIÁM SÁT NGUỒN DỮ LIỆU</p><h2>Trạng thái kết nối SSI FastConnect</h2><p>Tiến trình thu thập riêng nhận báo giá (quote) và khớp lệnh từ SSI, rồi lưu vào SQLite. Trạng thái tự cập nhật mỗi 5 giây.</p></div></div><div id="collector-status" class="collector-status" aria-live="polite"></div><p class="small-note">Báo giá sổ lệnh chỉ cập nhật khi tiến trình SSI đang chạy và thị trường gửi dữ liệu trong phiên liên tục. Ngoài thời gian đó, hệ thống có thể hiển thị OHLC lịch sử; dữ liệu lịch sử không được gắn nhãn trực tiếp (LIVE).</p></article>
           <article class="panel methodology-pipeline"><div class="panel-heading"><div><p class="eyebrow">ĐƯỜNG ĐI CỦA DỮ LIỆU</p><h2>Hệ thống xử lý như thế nào?</h2><p>Mỗi message đi qua các bước sau trước khi xuất hiện trên bảng tổng quan.</p></div></div><ol class="pipeline"><li><b>SSI FastConnect WebSocket</b><span>Xác thực bằng thông tin SSI rồi đăng ký kênh báo giá (quote).</span></li><li><b>Kiểm tra</b><span>Chuẩn hóa trường; dữ liệu thiếu được giữ là giá trị rỗng (null).</span></li><li><b>Cơ sở dữ liệu SQLite</b><span>Lưu ảnh chụp dữ liệu (snapshot), loại thông tin nhạy cảm.</span></li><li><b>Tính chỉ số</b><span>Tính chênh lệch giá (spread), độ sâu (depth) và mất cân bằng (imbalance).</span></li><li><b>Bảng tổng quan (dashboard)</b><span>Đọc dữ liệu đã lưu.</span></li></ol></article>
           <article class="panel panel-wide methodology-methods"><div class="panel-heading"><div><p class="eyebrow">GIẢI THÍCH CÁC CHỈ SỐ</p><h2>Công thức và cách diễn giải</h2><p>Xem ý nghĩa và giới hạn ngay dưới từng công thức.</p></div></div><div id="method-content"></div></article>
         </div>
@@ -158,7 +179,25 @@
     </main>
     <footer class="app-footer"><span>Stock Liquidity Intelligence (SLI)</span><span>Ảnh chụp sổ lệnh (snapshot) · Không phải khuyến nghị đầu tư</span></footer>
   </div>
-  <script src="/assets/app.js?v=10" defer></script>
-  <script src="/assets/enhancements.js?v=39" defer></script>
+  <dialog id="connection-dialog" class="connection-dialog" aria-labelledby="connection-dialog-title">
+    <form method="dialog" class="connection-dialog-card">
+      <p class="eyebrow">NGUỒN DỮ LIỆU THỊ TRƯỜNG</p>
+      <h2 id="connection-dialog-title">Kết nối SSI FastConnect?</h2>
+      <p id="connection-dialog-copy">Dữ liệu báo giá (quote) và khớp lệnh sẽ được thu thập bằng một tiến trình riêng. Kết nối chỉ bắt đầu khi bạn chọn nút bên dưới.</p>
+      <p id="connection-dialog-status" class="connection-dialog-status" aria-live="polite">Đang kiểm tra trạng thái kết nối…</p>
+      <div class="connection-dialog-actions">
+        <button id="connect-now" type="button" class="button button-primary">Kết nối dữ liệu</button>
+        <button id="disconnect-data" type="button" class="button button-secondary" hidden>Ngắt kết nối</button>
+        <button id="connection-dialog-skip" type="submit" class="button button-secondary">Tiếp tục không kết nối</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/assets/app.js?v=30" defer></script>
+  <script src="/assets/enhancements.js?v=86" defer></script>
 </body>
 </html>
+
+
+
+
+

@@ -1,0 +1,109 @@
+{
+  "generated_at_vn": "2026-11-06T09:27:31+07:00",
+  "database_read_only": true,
+  "source": "ssi",
+  "random_seed": 1106,
+  "method": "Independent formulas from persisted bid/ask fields; median by received minute; excludes invalid and flagged rows exactly as documented for bars. API queried through GET /api/bars using read-only SQLite connections.",
+  "tolerance": 1e-06,
+  "selected_symbols": [
+    "PET",
+    "NDN",
+    "KOS",
+    "BLI",
+    "PLP"
+  ],
+  "checks": [
+    {
+      "symbol": "PET",
+      "raw_snapshots": 656,
+      "eligible_minutes_recomputed": 148,
+      "bars_compared": 148,
+      "metric_value_comparisons": 592,
+      "missing_bar_minutes": 0,
+      "raw_vs_bars_max_abs_error": {
+        "spread_bps": 0.0,
+        "spread_ticks": 0.0,
+        "total_depth_value": 0.0,
+        "queue_imbalance": 0.0
+      },
+      "api_status": 200,
+      "api_bars_compared": 148,
+      "bars_vs_api_max_abs_error": 0.0
+    },
+    {
+      "symbol": "NDN",
+      "raw_snapshots": 179,
+      "eligible_minutes_recomputed": 62,
+      "bars_compared": 62,
+      "metric_value_comparisons": 248,
+      "missing_bar_minutes": 0,
+      "raw_vs_bars_max_abs_error": {
+        "spread_bps": 0.0,
+        "spread_ticks": 0.0,
+        "total_depth_value": 0.0,
+        "queue_imbalance": 0.0
+      },
+      "api_status": 200,
+      "api_bars_compared": 62,
+      "bars_vs_api_max_abs_error": 0.0
+    },
+    {
+      "symbol": "KOS",
+      "raw_snapshots": 3023,
+      "eligible_minutes_recomputed": 158,
+      "bars_compared": 158,
+      "metric_value_comparisons": 632,
+      "missing_bar_minutes": 0,
+      "raw_vs_bars_max_abs_error": {
+        "spread_bps": 0.0,
+        "spread_ticks": 0.0,
+        "total_depth_value": 0.0,
+        "queue_imbalance": 0.0
+      },
+      "api_status": 200,
+      "api_bars_compared": 158,
+      "bars_vs_api_max_abs_error": 0.0
+    },
+    {
+      "symbol": "BLI",
+      "raw_snapshots": 30,
+      "eligible_minutes_recomputed": 6,
+      "bars_compared": 6,
+      "metric_value_comparisons": 24,
+      "missing_bar_minutes": 0,
+      "raw_vs_bars_max_abs_error": {
+        "spread_bps": 0.0,
+        "spread_ticks": 0.0,
+        "total_depth_value": 0.0,
+        "queue_imbalance": 0.0
+      },
+      "api_status": 200,
+      "api_bars_compared": 6,
+      "bars_vs_api_max_abs_error": 0.0
+    },
+    {
+      "symbol": "PLP",
+      "raw_snapshots": 86,
+      "eligible_minutes_recomputed": 44,
+      "bars_compared": 44,
+      "metric_value_comparisons": 176,
+      "missing_bar_minutes": 0,
+      "raw_vs_bars_max_abs_error": {
+        "spread_bps": 0.0,
+        "spread_ticks": 0.0,
+        "total_depth_value": 0.0,
+        "queue_imbalance": 0.0
+      },
+      "api_status": 200,
+      "api_bars_compared": 44,
+      "bars_vs_api_max_abs_error": 0.0
+    }
+  ],
+  "summary": {
+    "raw_vs_bars_status": "PASS",
+    "api_status": "PASS",
+    "max_abs_error": 0.0,
+    "api_bar_comparisons": 418,
+    "api_errors": []
+  }
+}

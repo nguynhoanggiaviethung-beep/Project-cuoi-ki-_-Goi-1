@@ -7,3 +7,6 @@ database/*.sqlite3.*
 database/*.db
 __pycache__/
 *.py[cod]
+logs/
+*.sqlite3-wal
+*.sqlite3-shm

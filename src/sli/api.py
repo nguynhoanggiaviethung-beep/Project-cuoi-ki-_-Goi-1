@@ -1,16 +1,26 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from statistics import median
 from functools import lru_cache
+import asyncio
+import json
+import os
+import subprocess
+import sys
 import threading
 import time
 
-from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi.routing import APIRoute
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config, database
+from .detail_service import build_detail
+from .market_context_service import get_market_turnover
+from .depth_service import build_market_depth
 from .bookwalk import estimate as estimate_bookwalk
-from .market_rules import session_phase
+from .market_clock import get_clock_now, get_market_state
+from .ranking import calculate_symbol_row, is_rankable_stock, rank_rows
 from .collector import RuntimeState
 from .ssi_collector import SsiCollector
 
@@ -19,6 +29,14 @@ runtime = RuntimeState()
 ssi_collector = SsiCollector(runtime)
 _demo_thread = None
 _demo_stop = threading.Event()
+_worker_process = None
+
+@lru_cache(maxsize=2)
+def _security_directory(source):
+    metadata = database.fetch_security_metadata("ssi") if source == "ssi" else {}
+    return tuple((symbol, (metadata.get(symbol, {}).get("name_vi") or "").strip(),
+                  metadata.get(symbol, {}).get("board") or "")
+                 for symbol in (database.list_catalog_symbols("ssi") if source == "ssi" else database.list_symbols(source)))
 
 def _demo_loop():
     while not _demo_stop.wait(4):
@@ -34,18 +52,109 @@ def _start_demo_loop():
 
 def _stop_demo_loop():
     _demo_stop.set()
+class MarketMetaRoute(APIRoute):
+    def get_route_handler(self):
+        original=super().get_route_handler()
+        async def handler(request):
+            response=await original(request)
+            if "application/json" not in response.headers.get("content-type","") or not hasattr(response,"body"):
+                return response
+            try:
+                payload=json.loads(response.body)
+            except (ValueError,TypeError):
+                return response
+            if isinstance(payload,dict):
+                selected=request.query_params.get("source") or _source()
+                payload["meta"]=_market_meta(selected)
+                headers={k:v for k,v in response.headers.items() if k.lower() not in {"content-length","content-type"}}
+                return JSONResponse(payload,status_code=response.status_code,headers=headers,background=response.background)
+            return response
+        return handler
+
+
 app = FastAPI(
     title="Stock Liquidity Intelligence",
     description="Local dashboard for observing displayed stock order-book liquidity.",
     version="0.1.0",
 )
+app.router.route_class=MarketMetaRoute
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+
+def _market_meta(source=None):
+    source=source or _source()
+    now=get_clock_now()
+    latest_bar=database.latest_bar_minute(source) if source in {"ssi","live"} else None
+    latest_history=database.latest_historical_date("ssi")
+    latest_complete=latest_bar or (f"{latest_history.replace('/', '-')}T15:00:00+07:00" if latest_history else None)
+    try:
+        last_completed=datetime.fromisoformat(latest_complete) if latest_complete else None
+    except ValueError:
+        last_completed=None
+    calendar=database.session_calendar_overrides(now.date().isoformat(),(now.date()+timedelta(days=370)).isoformat())
+    clock=get_market_state(now,"ALL",last_completed_at=last_completed,calendar=calendar)
+    if clock["state"]=="CLOSED":
+        if clock["closed_reason"]=="after_close" and clock["is_trading_day"]:
+            clock["session_date"]=now.date().isoformat()
+        elif latest_history:
+            clock["session_date"]=latest_history.replace("/","-")
+        else:
+            clock["session_date"]=None
+    session_sync=database.get_session_record(clock["session_date"],"ssi") if clock.get("session_date") else None
+    if config.MARKET_CLOCK_OVERRIDE:
+        clock["clock_simulated"]=True
+    as_of=database.latest_data_as_of(source)
+    if not as_of and source=="ssi":
+        as_of=database.latest_data_as_of("live")
+    return {**clock,"data_as_of":as_of,
+            "refresh_seconds":config.MARKET_REFRESH_SECONDS if clock["state"]=="IN_SESSION" else None,
+            "clock_speed":config.MARKET_CLOCK_SPEED if config.MARKET_CLOCK_OVERRIDE else 1,
+            "source":source,"symbols_count":database.count_historical_symbols("ssi"),
+            "session_sync":session_sync or ({"status":"not_started"} if clock["state"]=="CLOSED" and clock.get("closed_reason")=="after_close" else None)}
+
+
+def _incomplete_session_date(meta=None):
+    meta=meta or _market_meta("ssi")
+    day=meta.get("session_date")
+    if not day:return None
+    record=database.get_session_record(day,"ssi")
+    if record and record.get("status")!="complete":return day.replace("-","/")
+    if meta.get("state")=="CLOSED" and meta.get("closed_reason")=="after_close" and not record:
+        return day.replace("-","/")
+    return None
+
+
+@app.get("/api/market-clock")
+def market_clock():
+    return {"meta":_market_meta()}
+
+
+@app.get("/api/stream")
+async def market_stream(request: Request):
+    async def events():
+        prior_state=None
+        while not await request.is_disconnected():
+            meta=_market_meta()
+            exchange_key=tuple((name,item["state"],item.get("phase")) for name,item in sorted(meta.get("exchange_states",{}).items()))
+            state_key=(meta["state"],meta.get("phase"),meta.get("session_date"),exchange_key)
+            if state_key!=prior_state:
+                yield "event: market_state\ndata: "+json.dumps(meta,ensure_ascii=False)+"\n\n"
+                prior_state=state_key
+            if meta["state"]=="IN_SESSION":
+                payload=overview(window_minutes=60)
+                yield "event: data_diff\ndata: "+json.dumps({"meta":meta,"data":payload},ensure_ascii=False,default=str)+"\n\n"
+                until_change=max(0.25,(datetime.fromisoformat(meta["next_change_at"])-get_clock_now()).total_seconds()/meta.get("clock_speed",1)) if meta.get("next_change_at") else 60
+                await asyncio.sleep(min(meta["refresh_seconds"] or 5,until_change))
+            else:
+                yield "event: heartbeat\ndata: "+json.dumps(meta,ensure_ascii=False)+"\n\n"
+                until_change=max(0.25,(datetime.fromisoformat(meta["next_change_at"])-get_clock_now()).total_seconds()/meta.get("clock_speed",1)) if meta.get("next_change_at") else 30
+                await asyncio.sleep(min(30,until_change))
+    return StreamingResponse(events(),media_type="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 
 @app.on_event("startup")
 def startup():
     database.initialize()
-    ssi_collector.start()
 
 
 @app.on_event("shutdown")
@@ -67,6 +176,25 @@ def _numeric(values):
     return [float(value) for value in values if value is not None]
 
 
+def _market_window(minutes, source="ssi"):
+    meta=_market_meta(source)
+    now=datetime.fromisoformat(meta["effective_now"]) if meta.get("effective_now") else get_clock_now()
+    end=now.replace(second=0,microsecond=0)
+    minutes=max(1,min(int(minutes),390))
+    latest=database.latest_bar_minute(source) if source in {"ssi","live"} else None
+    if latest:
+        latest_minute=datetime.fromisoformat(latest)
+        fresh_current=(meta["state"]=="IN_SESSION" and latest_minute.date()==now.date()
+                       and (end-latest_minute).total_seconds()<=60)
+        if not fresh_current:end=latest_minute.replace(second=0,microsecond=0)+timedelta(minutes=1)
+    start=end-timedelta(minutes=minutes)
+    if minutes>=390:
+        session_day=latest_minute.date() if latest else now.date()
+        start=datetime.combine(session_day,datetime.min.time(),tzinfo=config.TIMEZONE).replace(hour=9)
+    return (start.isoformat(timespec="minutes"),
+            end.isoformat(timespec="minutes"))
+
+
 def _serialize_row(row):
     result = dict(row)
     for key, value in list(result.items()):
@@ -78,19 +206,52 @@ def _serialize_row(row):
 @app.get("/api/status")
 def status():
     state = runtime.snapshot()
+    worker_run = database.latest_collector_run()
+    if worker_run and worker_run.get("heartbeat_at"):
+        try:
+            heartbeat = datetime.fromisoformat(worker_run["heartbeat_at"])
+            heartbeat_age = max(0.0, (datetime.now(config.TIMEZONE) - heartbeat).total_seconds())
+        except ValueError:
+            heartbeat_age = float("inf")
+        run_summary = {key: worker_run.get(key) for key in (
+            "messages_received", "rows_valid", "rows_invalid", "duplicate_messages",
+            "reconnect_count", "queue_dropped", "last_message_at", "last_error"
+        )}
+        state.update(run_summary)
+        if worker_run.get("ended_at") is None and heartbeat_age <= 15:
+            state.update(mode="ssi", connection_status=worker_run.get("connection_status") or "connecting",
+                         worker_status="running", worker_heartbeat_at=worker_run["heartbeat_at"],
+                         worker_heartbeat_age_seconds=round(heartbeat_age, 1), collector_run_id=worker_run["id"])
+        else:
+            worker_status = ("heartbeat_lost" if worker_run.get("ended_at") is None
+                             else worker_run.get("status"))
+            state.update(mode="ssi", connection_status="disconnected", worker_status=worker_status,
+                         worker_heartbeat_at=worker_run["heartbeat_at"],
+                         worker_heartbeat_age_seconds=round(heartbeat_age, 1))
     source = state["mode"]
-    rows = database.fetch_observations(source, limit=1)
-    latest = rows[0]["received_at_utc"] if rows else None
+    latest_received = state.get("last_message_at")
+    latest_persisted = state.get("last_persisted_at")
+    if not latest_persisted:
+        rows = database.fetch_observations(source, limit=1)
+        latest_persisted = rows[0]["received_at_utc"] if rows else None
+    freshness_timestamp = latest_received or latest_persisted
     is_stale = False
-    now = datetime.now(config.TIMEZONE)
-    markets = set(database.list_catalog_boards("ssi")) or {"HOSE", "HNX", "UPCOM"}
-    phases = {session_phase(now, market) for market in markets}
-    market_open = any(database.is_session_open(now.date().isoformat(), market) for market in markets)
-    expected_stream = market_open and bool(phases.intersection({"CONTINUOUS_AM", "CONTINUOUS_PM"}))
+    now = get_clock_now()
+    market_meta=_market_meta(source)
+    expected_stream = market_meta["state"]=="IN_SESSION" and market_meta.get("phase")=="CONTINUOUS"
+    quote_age = None
+    if latest_received:
+        try:
+            quote_stamp = datetime.fromisoformat(latest_received.replace("Z", "+00:00"))
+            if quote_stamp.tzinfo is None:
+                quote_stamp = quote_stamp.replace(tzinfo=timezone.utc)
+            quote_age = max(0.0, (datetime.now(timezone.utc) - quote_stamp).total_seconds())
+        except ValueError:
+            quote_age = None
     if source in {"live", "ssi"}:
-        if latest and expected_stream:
+        if freshness_timestamp and expected_stream:
             try:
-                stamp = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+                stamp = datetime.fromisoformat(freshness_timestamp.replace("Z", "+00:00"))
                 if stamp.tzinfo is None:
                     stamp = stamp.replace(tzinfo=timezone.utc)
                 is_stale = (
@@ -98,23 +259,65 @@ def status():
                 ).total_seconds() > config.STALE_AFTER_SECONDS
             except ValueError:
                 is_stale = True
-        elif not latest and expected_stream:
+        elif not freshness_timestamp and expected_stream:
             is_stale = True
+    persisted_lag = None
+    if latest_persisted:
+        try:
+            persisted_stamp = datetime.fromisoformat(latest_persisted.replace("Z", "+00:00"))
+            if persisted_stamp.tzinfo is None:
+                persisted_stamp = persisted_stamp.replace(tzinfo=timezone.utc)
+            persisted_lag = max(0.0, (datetime.now(timezone.utc) - persisted_stamp).total_seconds())
+        except ValueError:
+            persisted_lag = None
+    processing_delayed = bool(expected_stream and (persisted_lag is None or persisted_lag > 15 or state.get("queue_depth", 0) > 250))
+    worker_active = state.get("worker_status") == "running"
+    if not worker_active:
+        feed_state = "disconnected"
+    elif state.get("connection_status") in {"error", "disconnected"}:
+        feed_state = state["connection_status"]
+    elif state.get("connection_status") == "connecting":
+        feed_state = "connecting"
+    elif not expected_stream:
+        feed_state = "outside_session"
+    elif quote_age is None:
+        feed_state = "awaiting_quote"
+    elif quote_age <= 30:
+        feed_state = "live"
+    elif quote_age <= 120:
+        feed_state = "delayed"
+    else:
+        feed_state = "stale"
     state.update({
         "source": source,
-        "last_data_at": latest,
+        "last_data_at": latest_persisted,
+        "last_quote_received_at": latest_received,
+        "last_persisted_at": latest_persisted,
+        "persistence_lag_seconds": round(persisted_lag, 1) if persisted_lag is not None else None,
+        "processing_delayed": processing_delayed,
+        "quote_age_seconds": round(quote_age, 1) if quote_age is not None else None,
+        "feed_state": feed_state,
         "is_stale": is_stale,
         "stale_after_seconds": config.STALE_AFTER_SECONDS,
         "configured_watchlist": config.WATCHLIST,
-        "historical_symbols_with_data": len(database.list_historical_symbols("ssi")),
-        "market_phase": sorted(phases)[0] if len(phases) == 1 else sorted(phases),
+        "historical_symbols_with_data": database.count_historical_symbols("ssi"),
+        "market_phase": ("BREAK" if market_meta["state"]=="LUNCH_BREAK" else market_meta.get("phase")),
         "market_session_expected": expected_stream,
+        "market_state": market_meta["state"],
+        "phase": market_meta.get("phase"),
+        "session_date": market_meta.get("session_date"),
+        "effective_now": market_meta.get("effective_now"),
+        "data_as_of": market_meta.get("data_as_of"),
+        "next_change_at": market_meta.get("next_change_at"),
+        "next_open_at": market_meta.get("next_open_at"),
+        "refresh_seconds": market_meta.get("refresh_seconds"),
+        "clock_simulated": market_meta.get("clock_simulated",False),
     })
     if source == "demo":
         state["connection_status"] = "demo"
     elif is_stale and state["connection_status"] == "connected":
         state["connection_status"] = "stale"
-    database.update_stale_alert(source, is_stale, config.STALE_AFTER_SECONDS, latest)
+    database.update_stale_alert(source, is_stale, config.STALE_AFTER_SECONDS, freshness_timestamp)
     return state
 
 
@@ -124,38 +327,64 @@ def price_history(symbol: str | None = None, limit: int = Query(default=90, ge=1
                  search: str | None = None):
     selected = symbol.upper() if symbol and symbol.upper() not in ("ALL", "__ALL__") else None
     if selected:
-        rows=database.fetch_historical_prices(selected,limit=limit,source="ssi")
+        incomplete_date=_incomplete_session_date()
+        rows=database.fetch_historical_prices(selected,limit=limit,source="ssi",exclude_date=incomplete_date)
         return {"source":"ssi","timeframe":"1d","symbols_count":1 if rows else 0,
                 "symbols":[selected] if rows else [],"series_by_symbol":{selected:rows} if rows else {},
+                "pending_session_date":incomplete_date,
                 "note":"Giá OHLC ngày lịch sử từ SSI Market Data API; không phải quote realtime hoặc dữ liệu sổ lệnh."}
-    catalog=database.fetch_latest_historical_page(search=search,page=page,page_size=page_size,source="ssi")
+    incomplete_date=_incomplete_session_date()
+    catalog=database.fetch_latest_historical_page(search=search,page=page,page_size=page_size,source="ssi",exclude_date=incomplete_date)
     return {"source":"ssi","timeframe":"1d","symbols_count":catalog["total"],
             "page":catalog["page"],"page_size":catalog["page_size"],"total":catalog["total"],
-            "rows":catalog["rows"],"note":"Danh mục cổ phiếu thường và giá OHLC mới nhất lấy trực tiếp từ SSI; giá chưa đồng bộ được để trống."}
+            "rows":catalog["rows"],"pending_session_date":incomplete_date,
+            "note":"Danh mục cổ phiếu thường và OHLC phiên đã đồng bộ từ SSI; phiên đang chờ đồng bộ được giữ khỏi số liệu hiển thị."}
 
 
-@lru_cache(maxsize=8)
-def _cached_market_leaders(limit):
-    return database.fetch_market_leaders(limit=limit,source="ssi")
+@lru_cache(maxsize=32)
+def _cached_market_leaders(limit, cache_minute, as_of=None):
+    return database.fetch_market_leaders(limit=limit,source="ssi",as_of=as_of)
 
 
 @app.get("/api/market-leaders")
-def market_leaders(limit: int = Query(default=25, ge=5, le=100)):
-    rows=_cached_market_leaders(limit)
+def market_leaders(limit: int = Query(default=25, ge=5, le=100), as_of: str | None = None):
+    cache_minute=int(datetime.now(config.TIMEZONE).timestamp()//60)
+    selected_date=as_of or _incomplete_session_date()
+    if selected_date and not as_of:
+        previous=database.fetch_market_breadth(limit=1000,source="ssi")
+        available=[row["trading_date"] for row in previous if str(row["trading_date"]).replace("/","-")<selected_date.replace("/","-")]
+        selected_date=available[-1] if available else None
+    rows=_cached_market_leaders(limit,cache_minute,selected_date)
     return {"source":"ssi","rows":rows,"count":len(rows),
+            "as_of_date":selected_date,
             "note":"OHLC ngày SSI; giá trị giao dịch lấy từ SSI hoặc giá đóng cửa × khối lượng nếu SSI không có trường giá trị. Mức đổi giá so với phiên trước."}
 
 
-@lru_cache(maxsize=8)
-def _cached_market_breadth(limit):
+@lru_cache(maxsize=16)
+def _cached_market_breadth(limit, cache_minute):
     return database.fetch_market_breadth(limit=limit,source="ssi")
 
 
 @app.get("/api/market-breadth")
 def market_breadth(limit: int = Query(default=90, ge=2, le=1000)):
-    rows=_cached_market_breadth(limit)
+    cache_minute=int(datetime.now(config.TIMEZONE).timestamp()//60)
+    rows=_cached_market_breadth(limit,cache_minute)
+    incomplete_date=_incomplete_session_date()
+    if incomplete_date:
+        rows=[row for row in rows if str(row["trading_date"]).replace("-","/")!=incomplete_date]
+    latest_date=rows[-1]["trading_date"] if rows else None
+    coverage=database.historical_session_coverage(latest_date,"ssi") if latest_date else {"present":0,"expected":0}
+    synced=(coverage["expected"]>0 and coverage["present"]>=coverage["expected"])
     return {"source":"ssi","rows":rows,"count":len(rows),
+            "latest_trading_date":latest_date,"pending_session_date":incomplete_date,"session_sync_complete":synced,
+            "session_coverage":coverage,
             "note":"Độ rộng thị trường được tổng hợp từ OHLC ngày SSI của cổ phiếu thường: số mã tăng/giảm/đứng giá so với phiên trước. Không phải dữ liệu sổ lệnh."}
+
+
+@app.get("/api/market-turnover")
+def market_turnover(limit: int = Query(default=60, ge=20, le=250),
+                    metric: str = Query(default="value", pattern="^(value|volume)$")):
+    return get_market_turnover(limit=limit, metric=metric, market_meta=_market_meta("ssi"))
 
 
 @app.get("/api/symbols")
@@ -163,21 +392,41 @@ def symbols():
     source = _source()
     available = database.list_catalog_symbols("ssi") if source == "ssi" else database.list_symbols(source)
     if source == "live" and not available: available=config.WATCHLIST
-    return {"source":source,"symbols":available,"count":len(available)}
+    directory = _security_directory(source)
+    securities = [{"symbol": symbol, "name_vi": name, "board": board}
+                  for symbol, name, board in directory]
+    return {"source":source,"symbols":available,"securities":securities,"count":len(available),
+            "detail_default":database.fetch_detail_default_symbol(source)}
 
 @app.get("/api/overview")
 def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le=2000),
+             window_minutes: int = Query(default=60, ge=5, le=390),
              start_at: str | None = None, end_at: str | None = None,
              phase: str | None = Query(default=None, pattern="^(ATO|CONTINUOUS_AM|BREAK|CONTINUOUS_PM|ATC|CLOSED)$")):
     source = _source()
-    available = database.list_symbols(source)
     selected = symbol.upper() if symbol and symbol.upper() not in ("__ALL__", "ALL") else None
-    groups = {}
-    for ticker in ([selected] if selected else available):
-        rows = list(reversed(database.fetch_observations(source, symbol=ticker, limit=limit,
-                                                         start_at=start_at, end_at=end_at, phase=phase)))
-        if rows:
-            groups[ticker] = [_serialize_row(row) for row in rows]
+    window_start,window_end=_market_window(window_minutes,source)
+    start_at=start_at or window_start
+    end_at=end_at or window_end
+    if selected:
+        recent = database.fetch_observations(source, symbol=selected, limit=1,
+            start_at=start_at, end_at=end_at, phase=phase)
+        groups = {selected: [_serialize_row(row) for row in reversed(recent)]} if recent else {}
+    else:
+        # One latest quote per ticker within a shared clock window keeps KPI scope comparable.
+        effective_limit = 1
+        raw_groups = database.fetch_recent_observations_by_symbol(source, effective_limit, start_at, end_at, phase)
+        display_fields = {"symbol", "received_at_utc", "received_at_vn", "source_ts_vn", "market",
+            "session_phase", "validation_status", "validation_reason", "last_price", "spread_bps",
+            "spread_ticks", "mid_price", "bid_depth_value", "ask_depth_value", "total_depth_value",
+            "queue_imbalance", "bid_price_1", "bid_volume_1", "ask_price_1", "ask_volume_1"}
+        groups = {}
+        for ticker, rows in raw_groups.items():
+            series=[]
+            for row in rows:
+                clean=_serialize_row(row)
+                series.append({key: clean.get(key) for key in display_fields})
+            groups[ticker]=series
     flattened = [row for series in groups.values() for row in series]
     valid = [row for row in flattened if row["validation_status"] == "valid"]
     spreads = _numeric([row["spread_bps"] for row in valid])
@@ -186,11 +435,32 @@ def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le
     count = len(flattened)
     return {"source": source, "symbol": selected, "symbols_count": len(groups),
         "observation_count": count, "valid_observation_count": len(valid),
+        "window_limit_per_symbol": 1,
+        "window_minutes":window_minutes,"window_start":start_at,"window_end_exclusive":window_end,
+        "window_basis":"shared_clock_window; chart bars exclude the unfinished minute",
         "valid_snapshot_rate": len(valid) / count if count else None,
         "median_spread_bps": median(spreads) if spreads else None,
         "median_total_depth_value": median(depths) if depths else None,
         "median_queue_imbalance": median(imbalances) if imbalances else None,
         "series": groups.get(selected, []) if selected else [], "series_by_symbol": groups}
+
+
+@app.get("/api/trades")
+def trades(symbol: str | None = None, limit: int = Query(default=50, ge=1, le=500)):
+    selected=symbol.upper() if symbol else None
+    rows=database.fetch_recent_trades(_source(),selected,limit)
+    rows.reverse()
+    return {"source":_source(),"symbol":selected,"trades":rows,"count":len(rows),
+            "note":"Public TradeMessage từ SSI FastConnect; quantity là khối lượng lần khớp, total_volume là tổng khối lượng SSI gửi trong message. Không đồng nhất với khối lượng chờ bid/ask."}
+
+
+@app.get("/api/detail/{symbol}")
+def detail_page(symbol: str, window_sessions: int = Query(default=5, ge=1, le=20)):
+    """Single-clock payload for every widget on the stock detail page."""
+    result = build_detail(symbol, source=_source(), window_sessions=window_sessions)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 @app.get("/api/symbol/{symbol}")
@@ -220,71 +490,73 @@ def company(symbol: str):
         "VPB": {"name": "Ngân hàng TMCP Việt Nam Thịnh Vượng", "sector": "Ngân hàng", "description": "Ngân hàng thương mại cổ phần; mã VPB được dùng làm ví dụ trong bộ dữ liệu DEMO."},
     }
     ticker = symbol.upper()
-    profile = profiles.get(ticker, {"name": ticker, "sector": "Chưa xác định", "description": "Tên doanh nghiệp chưa có trong danh mục cục bộ; hãy bổ sung vào danh mục doanh nghiệp của hệ thống."})
+    metadata = database.fetch_company_metadata("ssi", ticker)
+    catalog_name = (metadata.get("name_vi") or "").strip()
+    if catalog_name:
+        board = metadata.get("board") or "Chưa xác định"
+        profile = {"name": catalog_name, "sector": board, "board": board,
+                   "description": f"Tên doanh nghiệp lấy từ danh mục mã SSI; mã {ticker} giao dịch trên sàn {board}."}
+    else:
+        profile = profiles.get(ticker, {"name": ticker, "sector": "Chưa xác định", "description": "Mã này chưa có tên doanh nghiệp trong danh mục SSI."})
     return {"symbol": ticker, **profile}
 
 
 @app.get("/api/rankings")
-def rankings(limit: int = Query(default=500, ge=1, le=2000), start_at: str | None = None,
-              end_at: str | None = None, phase: str | None = Query(default=None, pattern="^(OPEN|MID|CLOSE)$")):
+def rankings(limit: int = Query(default=500, ge=1, le=2000), window_minutes: int = Query(default=60,ge=15,le=390),start_at: str | None = None,
+              end_at: str | None = None, phase: str | None = Query(default=None, pattern="^(OPEN|MID|CLOSE)$"),
+              board: str | None = Query(default=None, pattern="^(HOSE|HNX|UPCOM)$")):
     source = _source()
-    results = []
-    for symbol in database.list_symbols(source):
-        bars_for_symbol = database.fetch_bars(source, symbol=symbol, limit=limit,
-                                              start_at=start_at, end_at=end_at, bucket=phase)
-        if source in {"live", "ssi"} and bars_for_symbol:
-            points = bars_for_symbol
-            spreads = _numeric([row["spread_bps"] for row in points])
-            depths = _numeric([row["total_depth_value"] for row in points])
-            valid_count = len(points)
-            sample_kind = "bars_1m"
-            latest_spread = points[-1]["spread_bps"]
-            latest_depth = points[-1]["total_depth_value"]
-            snapshot_count = len(database.fetch_observations(source, symbol=symbol, limit=limit,
-                                                             start_at=start_at, end_at=end_at))
-        else:
-            rows = database.fetch_observations(source, symbol=symbol, limit=limit,
-                                               start_at=start_at, end_at=end_at)
-            valid = [row for row in rows if row["validation_status"] == "valid"]
-            spreads = _numeric([row["spread_bps"] for row in valid])
-            depths = _numeric([row["total_depth_value"] for row in valid])
-            valid_count = len(valid)
-            snapshot_count = len(rows)
-            sample_kind = "synthetic_demo_snapshots" if source == "demo" else "snapshots"
-            latest_spread = valid[0]["spread_bps"] if valid else None
-            latest_depth = valid[0]["total_depth_value"] if valid else None
-        if valid_count == 0:
-            continue
-        results.append({
-            "symbol": symbol,
-            "snapshot_count": snapshot_count,
-            "sample_count": valid_count,
-            "bar_count": valid_count if sample_kind == "bars_1m" else 0,
-            "sample_kind": sample_kind,
-            "median_spread_bps": median(spreads) if spreads else None,
-            "median_total_depth_value": median(depths) if depths else None,
-            "latest_spread_bps": latest_spread,
-            "latest_total_depth_value": latest_depth,
-            "spread_expansion_bps": (latest_spread - median(spreads)) if spreads and latest_spread is not None else None,
-            "depth_change_pct": ((latest_depth / median(depths) - 1) * 100) if depths and median(depths) and latest_depth is not None else None,
-        })
+    window_start,window_end=_market_window(window_minutes,source)
+    start_at=start_at or window_start
+    end_at=end_at or window_end
+    if source in {"live", "ssi"}:
+        grouped = database.fetch_bars_window_by_symbol(source,start_at,end_at,window_minutes)
+        metadata=database.fetch_security_metadata("ssi")
+        results = []
+        stock_catalog = {ticker: profile for ticker, profile in metadata.items()
+                         if is_rankable_stock(ticker, profile.get("stock_type"))
+                         and (not board or profile.get("board") == board)}
+        catalog_count = len(stock_catalog)
+        bar_symbols = 0
+        for ticker, points in grouped.items():
+            profile = stock_catalog.get(ticker)
+            if profile is None:
+                continue
+            if phase:
+                points = [row for row in points if row.get("baseline_bucket") == phase]
+            if points:
+                bar_symbols += 1
+            row = calculate_symbol_row(ticker, points, metadata)
+            if row:
+                results.append(row)
+    else:
+        grouped = database.fetch_recent_observations_by_symbol(source, limit, start_at, end_at)
+        results=[]
+        for ticker, rows in grouped.items():
+            valid=[row for row in rows if row["validation_status"]=="valid"]
+            spreads=_numeric([row["spread_bps"] for row in valid]); depths=_numeric([row["total_depth_value"] for row in valid])
+            if not valid: continue
+            latest_spread,latest_depth=valid[-1]["spread_bps"],valid[-1]["total_depth_value"]
+            results.append({"symbol":ticker,"snapshot_count":len(rows),"sample_count":len(valid),"bar_count":0,
+                "sample_kind":"synthetic_demo_snapshots","median_spread_bps":median(spreads) if spreads else None,
+                "median_total_depth_value":median(depths) if depths else None,"latest_spread_bps":latest_spread,
+                "latest_total_depth_value":latest_depth,"spread_expansion_bps":latest_spread-median(spreads) if spreads and latest_spread is not None else None,
+                "depth_change_pct":((latest_depth/median(depths)-1)*100) if depths and median(depths) and latest_depth is not None else None})
+        catalog_count = len(database.list_symbols(source))
+        bar_symbols = len(grouped)
     minimum_samples = config.RANKING_MIN_BARS if source in {"live", "ssi"} else config.RANKING_MIN_SNAPSHOTS
-    eligible = [row for row in results if row["sample_count"] >= minimum_samples]
-    low_spread = sorted(eligible, key=lambda row: row["median_spread_bps"] if row["median_spread_bps"] is not None else float("inf"))
-    high_depth = sorted(eligible, key=lambda row: row["median_total_depth_value"] if row["median_total_depth_value"] is not None else float("-inf"), reverse=True)
-    depth_falling = sorted((row for row in eligible if row["depth_change_pct"] is not None), key=lambda row: row["depth_change_pct"])
-    spread_widening = sorted((row for row in eligible if row["spread_expansion_bps"] is not None), key=lambda row: row["spread_expansion_bps"], reverse=True)
-    return {
-        "source": source,
-        "sample_window": limit,
-        "minimum_eligible_samples": minimum_samples,
-        "filter": {"start_at": start_at, "end_at": end_at, "phase": phase},
-        "lowest_spread": low_spread,
-        "highest_depth": high_depth,
-        "depth_falling": depth_falling,
-        "spread_widening": spread_widening,
-        "symbols": results,
-    }
+    ranked = rank_rows(results, minimum_samples)
+    eligible = ranked["eligible"]
+    quote_valid_symbols = len(results)
+    return {"source":source,"sample_window_minutes":window_minutes,"window_start":start_at,"window_end_exclusive":end_at,
+        "minimum_eligible_samples":minimum_samples,"minimum_snapshots":0,
+        "candidate_symbols":len(results),"catalog_symbols":catalog_count,"symbols_with_window_bars":bar_symbols,
+        "symbols_with_valid_quotes":quote_valid_symbols,"eligible_symbols":len(eligible),
+        "displayed_symbols":min(len(eligible),limit),"one_tick_count":ranked["one_tick_count"],
+        "one_tick_share":ranked["one_tick_share"],"filter":{"start_at":start_at,"end_at":end_at,"phase":phase,"board":board},
+        "lowest_spread":ranked["lowest_spread"][:limit],"highest_depth":ranked["highest_depth"][:limit],
+        "depth_falling":ranked["depth_falling"][:limit],"spread_widening":ranked["spread_widening"][:limit],
+        "symbols":eligible[:limit],"note":"Xếp hạng dùng bar 1 phút hợp lệ trong cửa sổ chung; chỉ lấy bar của phiên khớp liên tục (loại ATO/ATC và giờ nghỉ trưa). Baseline nhiều phiên chỉ áp dụng cho cảnh báo, không chặn xếp hạng."}
 
 
 @app.get("/api/bars")
@@ -296,15 +568,22 @@ def bars(symbol: str | None = None, limit: int = Query(default=1000, ge=1, le=10
 
 
 @app.get("/api/intraday-profile")
-def intraday_profile(symbol: str | None = None, start_at: str | None = None,
+def intraday_profile(symbol: str | None = None, window_minutes: int = Query(default=60,ge=5,le=390),start_at: str | None = None,
                      end_at: str | None = None, source: str | None = None):
     selected_source = source or _source()
-    bars_data = database.fetch_bars(selected_source, symbol, 10000, start_at, end_at)
+    window_start,window_end=_market_window(window_minutes,selected_source)
+    start_at=start_at or window_start
+    end_exclusive=end_at or window_end
+    if selected_source in {"live","ssi"}:
+        grouped_bars=database.fetch_bars_window_by_symbol(selected_source,start_at,end_exclusive,window_minutes)
+        bars_data=[row for ticker,rows in grouped_bars.items() if not symbol or ticker==symbol.upper() for row in rows]
+    else:
+        bars_data=database.fetch_bars(selected_source,symbol,10000,start_at,end_exclusive)
     grouped = {}
     for row in bars_data:
         minute = datetime.fromisoformat(row["minute_vn"]).strftime("%H:%M")
-        slot = grouped.setdefault(minute, {"spread": [], "ticks": [], "depth": [], "snapshots": 0, "symbols": set()})
-        for key, target in (("spread_bps", "spread"), ("spread_ticks", "ticks"), ("total_depth_value", "depth")):
+        slot = grouped.setdefault(minute, {"spread": [], "ticks": [], "depth": [], "imbalance":[],"snapshots": 0, "symbols": set()})
+        for key, target in (("spread_bps", "spread"), ("spread_ticks", "ticks"), ("total_depth_value", "depth"),("queue_imbalance","imbalance")):
             if row.get(key) is not None:
                 slot[target].append(row[key])
         slot["snapshots"] += row["n_snapshots"]
@@ -312,53 +591,87 @@ def intraday_profile(symbol: str | None = None, start_at: str | None = None,
     profile = [{"minute": minute, "median_spread_bps": median(v["spread"]) if v["spread"] else None,
                 "median_spread_ticks": median(v["ticks"]) if v["ticks"] else None,
                 "median_total_depth_value": median(v["depth"]) if v["depth"] else None,
+                "median_queue_imbalance":median(v["imbalance"]) if v["imbalance"] else None,
                 "bar_count": len(v["spread"]) or len(v["depth"]), "snapshot_count": v["snapshots"],
                 "symbols_count": len(v["symbols"])} for minute, v in sorted(grouped.items())]
     return {"source": selected_source, "symbol": symbol.upper() if symbol else None,
-            "profile": profile, "basis": "bars_1m", "note": "Chỉ tổng hợp bar đã lưu trong phiên liên tục."}
+            "profile": profile, "basis": "completed_bars_1m", "window_minutes":window_minutes,
+            "window_start":start_at,"completed_through_exclusive":end_exclusive,
+            "note": "Chỉ dùng bar một phút đã hoàn tất; mỗi phút lấy trung vị bar của từng mã, sau đó lấy trung vị giữa các mã. Số mã tham gia được ghi tại từng điểm."}
+
+
+@app.get("/api/market-depth")
+def market_depth(window_minutes: int = Query(default=60, ge=5, le=390)):
+    """Single-service, latest-session depth payload for the overview widget."""
+    meta = _market_meta("ssi")
+    payload = build_market_depth(window_minutes=window_minutes, source="ssi", market_meta=meta)
+    payload["meta"] = meta
+    return payload
 
 
 @app.get("/api/liquidity-map")
-def liquidity_map(limit: int = Query(default=2000, ge=1, le=10000),
+def liquidity_map(window_minutes:int=Query(default=120,ge=15,le=390),
                   start_at: str | None = None, end_at: str | None = None,
                   source: str | None = None):
     selected_source = source or _source()
-    points = []
-    for symbol in database.list_symbols(selected_source):
-        bars_data = database.fetch_bars(selected_source, symbol, limit, start_at, end_at)
-        if selected_source in {"live", "ssi"} and bars_data:
-            spreads = _numeric([row["spread_bps"] for row in bars_data])
-            depths = _numeric([row["total_depth_value"] for row in bars_data])
-            count, basis = len(bars_data), "bars_1m"
-        else:
-            rows = database.fetch_observations(selected_source, symbol, limit, start_at, end_at)
-            valid = [row for row in rows if row["validation_status"] == "valid"]
-            spreads = _numeric([row["spread_bps"] for row in valid])
-            depths = _numeric([row["total_depth_value"] for row in valid])
-            count, basis = len(valid), "synthetic_demo_snapshots" if selected_source == "demo" else "snapshots"
-        minimum = config.RANKING_MIN_BARS if basis == "bars_1m" else config.RANKING_MIN_SNAPSHOTS
-        if count >= minimum and spreads and depths:
-            points.append({"symbol": symbol, "median_spread_bps": median(spreads),
-                           "median_total_depth_value": median(depths), "sample_count": count,
-                           "sample_kind": basis})
-    spread_mid = median([p["median_spread_bps"] for p in points]) if points else None
-    depth_mid = median([p["median_total_depth_value"] for p in points]) if points else None
+    points=[]
+    if selected_source in {"live","ssi"}:
+        window_start,window_end=_market_window(window_minutes,selected_source)
+        grouped=database.fetch_bars_window_by_symbol(selected_source,start_at or window_start,end_at or window_end,window_minutes)
+        minimum=config.RANKING_MIN_BARS
+        for ticker,rows in grouped.items():
+            spreads=_numeric([r["spread_bps"] for r in rows]); depths=_numeric([r["total_depth_value"] for r in rows])
+            snapshot_count=sum(int(row.get("n_snapshots") or 0) for row in rows)
+            if len(rows)>=minimum and snapshot_count>=config.RANKING_MIN_SNAPSHOTS and spreads and depths:
+                points.append({"symbol":ticker,"median_spread_bps":median(spreads),"median_spread_ticks":median(_numeric([r.get("spread_ticks") for r in rows])),"median_total_depth_value":median(depths),"sample_count":len(rows),"snapshot_count":snapshot_count,"sample_kind":"bars_1m"})
+    else:
+        grouped=database.fetch_recent_observations_by_symbol(selected_source,limit,start_at,end_at)
+        minimum=config.RANKING_MIN_SNAPSHOTS
+        for ticker,rows in grouped.items():
+            valid=[r for r in rows if r["validation_status"]=="valid"]
+            spreads=_numeric([r["spread_bps"] for r in valid]); depths=_numeric([r["total_depth_value"] for r in valid])
+            if len(valid)>=minimum and spreads and depths:
+                points.append({"symbol":ticker,"median_spread_bps":median(spreads),"median_total_depth_value":median(depths),"sample_count":len(valid),"sample_kind":"synthetic_demo_snapshots"})
+    security_metadata=database.fetch_security_metadata('ssi')
+    quote_metadata=database.fetch_latest_quote_details(selected_source,[point['symbol'] for point in points])
     for point in points:
-        point["quadrant"] = ("spread_wide_depth_thin" if point["median_spread_bps"] > spread_mid and point["median_total_depth_value"] < depth_mid
-                             else "spread_narrow_depth_thick" if point["median_spread_bps"] <= spread_mid and point["median_total_depth_value"] >= depth_mid
-                             else "spread_wide_depth_thick" if point["median_spread_bps"] > spread_mid
-                             else "spread_narrow_depth_thin")
-    return {"source": selected_source, "points": points, "spread_median": spread_mid,
-            "depth_median": depth_mid, "minimum_samples": config.RANKING_MIN_BARS if selected_source in {"live", "ssi"} else config.RANKING_MIN_SNAPSHOTS,
-            "depth_axis": "log", "note": "Bản đồ mô tả tương đối trong watchlist, không đại diện toàn thị trường."}
+        profile=security_metadata.get(point['symbol'],{})
+        quote=quote_metadata.get(point['symbol'],{})
+        point.update({
+            'name':profile.get('name_vi') or None,
+            'exchange':profile.get('board') or None,
+            'price':quote.get('last_price'),
+            'price_as_of':quote.get('price_as_of'),
+            'price_source':quote.get('price_source'),
+            'tick_size':quote.get('tick_size'),
+            'n_bars':point.get('sample_count',0),
+        })
+    spread_mid=median([p["median_spread_bps"] for p in points]) if points else None
+    depth_mid=median([p["median_total_depth_value"] for p in points]) if points else None
+    for point in points:
+        point["quadrant"]=("spread_wide_depth_thin" if point["median_spread_bps"]>spread_mid and point["median_total_depth_value"]<depth_mid
+            else "spread_narrow_depth_thick" if point["median_spread_bps"]<=spread_mid and point["median_total_depth_value"]>=depth_mid
+            else "spread_wide_depth_thick" if point["median_spread_bps"]>spread_mid else "spread_narrow_depth_thin")
+    candidate_symbols=len(grouped)
+    eligible_symbols=len(points)
+    points=sorted(points,key=lambda p:(p["snapshot_count"],p["sample_count"]),reverse=True)[:250]
+    return {"source":selected_source,"points":points,"spread_median":spread_mid,"depth_median":depth_mid,"window_minutes":window_minutes,
+        "minimum_samples":minimum,"minimum_snapshots":config.RANKING_MIN_SNAPSHOTS if selected_source in {"live","ssi"} else minimum,
+        "candidate_symbols":candidate_symbols,"eligible_symbols":eligible_symbols,"shown_symbols":len(points),"depth_axis":"log",
+        "note":"Bản đồ mô tả tương đối trong watchlist, không đại diện toàn thị trường."}
 
 
 @app.post("/api/bookwalk/{symbol}")
 def bookwalk(symbol: str, side: str = Query(..., pattern="^(buy|sell)$"),
              quantity: int | None = Query(default=None, ge=1),
              notional: float | None = Query(default=None, gt=0),
-             max_slippage_bps: float | None = Query(default=None, ge=0)):
-    rows = database.fetch_observations(_source(), symbol=symbol, limit=1)
+             max_slippage_bps: float | None = Query(default=None, ge=0),
+             snapshot_at: str | None = Query(default=None)):
+    selected_source = "ssi"
+    rows = database.fetch_observations(selected_source, symbol=symbol, limit=2000)
+    rows = [row for row in rows if row.get("validation_status") == "valid"]
+    if snapshot_at:
+        rows = [row for row in rows if (row.get("source_ts_vn") or row.get("received_at_vn") or row.get("received_at_utc")) == snapshot_at]
     if not rows:
         return {"status": "unavailable", "reason": "no snapshot for symbol", "symbol": symbol.upper()}
     row = rows[0]
@@ -369,19 +682,25 @@ def bookwalk(symbol: str, side: str = Query(..., pattern="^(buy|sell)$"),
         result = estimate_bookwalk(observation, side, quantity, notional, max_slippage_bps)
     except ValueError as exc:
         return {"status": "invalid_input", "reason": str(exc)}
-    return {"symbol": symbol.upper(), "snapshot_at": row.get("received_at_vn", row.get("received_at_utc")), **result}
+    market_meta = _market_meta(selected_source)
+    return {"symbol": symbol.upper(), "source": selected_source,
+            "snapshot_at": row.get("source_ts_vn") or row.get("received_at_vn", row.get("received_at_utc")),
+            "market_state": market_meta.get("state"), "session_date": market_meta.get("session_date"), **result}
 
 
 @app.get("/api/alerts")
 def alerts(limit: int = Query(default=100, ge=1, le=500)):
-    state = status()
     items = database.fetch_alerts(_source(), limit)
     return {
         "source": _source(),
         "baseline_min_observations": config.BASELINE_MIN_BARS,
         "baseline_min_bars": config.BASELINE_MIN_BARS,
         "baseline_sessions": config.BASELINE_SESSIONS,
+        "baseline_qualified_symbols":database.count_baseline_qualified_symbols(_source()) if _source() in {"live","ssi"} else 0,
         "alerts": items[:limit],
+        "alert_count": len(items),
+        "active_count": sum(1 for item in items if item.get("status") == "active"),
+        "resolved_count": sum(1 for item in items if item.get("status") == "resolved"),
     }
 
 
@@ -392,7 +711,21 @@ def collector_runs(limit: int = Query(default=20, ge=1, le=100)):
 
 @app.get("/api/quality")
 def data_quality():
-    return database.data_quality_summary(_source())
+    report=database.data_quality_summary(_source())
+    state=runtime.snapshot()
+    report["as_of_vn"]=datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
+    report["scope_note"]="Toàn bộ snapshot đã lưu của nguồn đang chọn; không giới hạn theo cửa sổ biểu đồ."
+    report["baseline_min_bars"]=config.BASELINE_MIN_BARS
+    report["baseline_sessions"]=config.BASELINE_SESSIONS
+    report["baseline_qualified_symbols"]=database.count_baseline_qualified_symbols(_source()) if _source() in {"live","ssi"} else 0
+    report["current_collector"]={key:state.get(key) for key in (
+        "connection_status","subscription_status","messages_received","rows_valid",
+        "rows_invalid","duplicate_messages","queue_dropped","queue_depth","queue_coalesced",
+        "reconnect_count","last_message_at","last_persisted_at","last_error",
+        "trade_messages_received","trade_messages_saved","trade_messages_dropped",
+        "last_trade_received_at","last_trade_persisted_at","trade_queue_depth"
+    )}
+    return report
 
 
 @app.get("/api/calendar/{session_date}")
@@ -479,11 +812,40 @@ def methodology():
 
 @app.post("/api/collector/start")
 def start_collector():
-    _stop_demo_loop()
-    started = ssi_collector.start()
-    return {"ok": True,
-            "message": "Đã yêu cầu kết nối SSI FastConnect WebSocket." if started else "Collector SSI WebSocket đang chạy.",
-            "status": runtime.snapshot()}
+    global _worker_process
+    current = database.latest_collector_run()
+    if current and current.get("ended_at") is None and current.get("heartbeat_at"):
+        try:
+            age = (datetime.now(config.TIMEZONE) - datetime.fromisoformat(current["heartbeat_at"])).total_seconds()
+        except ValueError:
+            age = float("inf")
+        if age <= 15:
+            return {"ok": True, "message": "Tiến trình thu thập SSI đang chạy.", "status": status()}
+    script = config.ROOT_DIR / "scripts" / "ssi_worker.py"
+    log_dir = config.ROOT_DIR / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = (log_dir / "ssi_worker.log").open("a", encoding="utf-8")
+    except OSError:
+        return {"ok": False, "message": "Không thể tạo nhật ký kết nối. Kiểm tra quyền ghi thư mục dự án.",
+                "status": status()}
+    options = {"cwd": str(config.ROOT_DIR), "stdin": subprocess.DEVNULL,
+               "stdout": log_file, "stderr": subprocess.STDOUT, "close_fds": True}
+    if os.name == "nt":
+        # Keep a hidden, redirected child process. DETACHED_PROCESS can sever
+        # inherited handles in some Windows launch contexts and hide its errors.
+        options["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        options["start_new_session"] = True
+    try:
+        _worker_process = subprocess.Popen([sys.executable, "-u", str(script)], **options)
+    except OSError as exc:
+        log_file.close()
+        return {"ok": False, "message": "Không thể khởi chạy tiến trình thu thập dữ liệu. Hãy kiểm tra cấu hình ứng dụng.",
+                "status": status()}
+    log_file.close()
+    return {"ok": True, "message": "Đã yêu cầu kết nối SSI; trạng thái sẽ tự cập nhật.",
+            "worker_process_id": _worker_process.pid, "status": status()}
 
 
 @app.post("/api/collector/ssi/start")
@@ -493,8 +855,11 @@ def start_ssi_collector():
 
 @app.post("/api/collector/stop")
 def stop_collector():
-    ssi_collector.stop()
-    return {"ok": True, "status": runtime.snapshot()}
+    current = database.latest_collector_run()
+    if not current or current.get("ended_at") is not None:
+        return {"ok": True, "message": "Không có tiến trình thu thập đang chạy.", "status": status()}
+    database.request_collector_stop(current.get("worker_id"))
+    return {"ok": True, "message": "Đã yêu cầu ngắt kết nối SSI.", "status": status()}
 
 
 @app.post("/api/collector/demo")
@@ -503,3 +868,7 @@ def use_demo():
     runtime.update(mode="demo", connection_status="demo", last_error=None)
     _start_demo_loop()
     return {"ok": True, "status": runtime.snapshot()}
+
+
+
+
