@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#008A45">
   <title>Stock Liquidity Intelligence</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=38">
+  <link rel="stylesheet" href="/assets/styles.css?v=41">
 </head>
 <body>
   <div id="onboarding" class="onboarding">
@@ -62,6 +62,7 @@
     </header>
     <nav class="main-nav" aria-label="Điều hướng chính">
       <button data-route="overview" class="nav-item active">Tổng quan</button>
+      <button data-route="watchlist" class="nav-item">Danh mục của tôi</button>
       <button data-route="detail" class="nav-item">Chi tiết cổ phiếu</button>
       <button data-route="rankings" class="nav-item">Xếp hạng</button>
       <button data-route="alerts" class="nav-item">Cảnh báo</button>
@@ -90,10 +91,23 @@
         </div>
         <div class="content-grid">
           <article class="panel panel-wide"><div class="panel-heading"><div><h2>Spread trung vị theo thời gian</h2><p>Dùng chung bar một phút đã hoàn tất với biểu đồ diễn biến phiên; chọn mã để lọc riêng</p></div><span id="overview-symbol-label" class="chip">—</span></div><div id="spread-chart" class="chart-box"></div></article>
-          <article class="panel depth-overview-panel"><div class="panel-heading"><div><h2>Độ sâu hai phía sổ lệnh</h2><p>Trung vị giá trị top 3 của nhóm cổ phiếu đủ dữ liệu · đơn vị tự động</p></div><div class="depth-header-badges"><span id="depth-session-label" class="chip"></span><span id="depth-panel-count" class="chip"></span></div></div><div class="depth-legend"><span><i class="legend-bid"></i>Độ sâu mua · phía trên 0</span><span><i class="legend-ask"></i>Độ sâu bán · phía dưới 0</span></div><div id="depth-chart" class="depth-butterfly-chart" aria-label="Biểu đồ độ sâu mua và bán theo phút"></div><p class="depth-method-note">Độ sâu lớn hơn nghĩa là giá trị đang niêm yết nhiều hơn, không bảo đảm sẽ khớp. Lệnh lớn có thể tiêu thụ nhiều mức giá, làm giá bình quân khác giá tốt nhất; cơ sở nghiên cứu: <a href="https://arxiv.org/abs/1011.6402" target="_blank" rel="noreferrer">Cont, Kukanov &amp; Stoikov (2014)</a> và <a href="https://par.nsf.gov/servlets/purl/10424646" target="_blank" rel="noreferrer">Papanicolaou và cộng sự (2023)</a>. Mô phỏng ứng dụng là phép tính tĩnh theo mức giá SSI đang hiển thị.</p><div id="depth-tooltip" class="depth-tooltip" hidden></div></article>
+          <article class="panel depth-overview-panel"><div class="panel-heading"><div><h2>Độ sâu hai phía sổ lệnh</h2><p>Trung vị giá trị top 3 của nhóm cổ phiếu đủ dữ liệu · đơn vị tự động</p></div><div class="depth-header-badges"><span id="depth-session-label" class="chip"></span><span id="depth-panel-count" class="chip"></span></div></div><div class="depth-legend"><span><i class="legend-bid"></i>Độ sâu mua (+) · phía trên 0</span><span><i class="legend-ask"></i>Độ sâu bán (−) · phía dưới 0</span></div><div id="depth-chart" class="depth-butterfly-chart" aria-label="Độ sâu mua dương phía trên số không và độ sâu bán âm phía dưới số không"></div><p class="depth-method-note">Độ sâu lớn hơn nghĩa là giá trị đang niêm yết nhiều hơn, không bảo đảm sẽ khớp. Lệnh lớn có thể tiêu thụ nhiều mức giá, làm giá bình quân khác giá tốt nhất; cơ sở nghiên cứu: <a href="https://arxiv.org/abs/1011.6402" target="_blank" rel="noreferrer">Cont, Kukanov &amp; Stoikov (2014)</a> và <a href="https://par.nsf.gov/servlets/purl/10424646" target="_blank" rel="noreferrer">Papanicolaou và cộng sự (2023)</a>. Mô phỏng ứng dụng là phép tính tĩnh theo mức giá SSI đang hiển thị.</p><div id="depth-tooltip" class="depth-tooltip" hidden></div></article>
           <article class="panel"><div class="panel-heading"><div><h2>Xếp hạng chênh lệch giá (spread)</h2><p>Top 5 mã có spread trung vị thấp nhất trong cửa sổ đủ mẫu</p></div><button class="text-button" data-route="rankings">Xem tất cả →</button></div><div id="overview-ranking"></div></article>
         </div>
         <p class="footnote">Độ sâu ba mức giá đầu (top 3 depth) là lượng đang niêm yết, không phải toàn bộ sổ lệnh hay thanh khoản đảm bảo khớp.</p>
+      </section>
+
+      <section id="view-watchlist" class="view hidden">
+        <div class="page-heading"><div><p class="eyebrow">HỒ SƠ CỤC BỘ</p><h1>Danh mục của tôi</h1><p>Theo dõi giá và điều kiện thanh khoản từ SSI. Danh sách chỉ lưu trên máy này; hệ thống không kết nối tài khoản và không đặt lệnh.</p></div></div>
+        <article class="panel investor-watch-panel">
+          <div class="watchlist-toolbar"><label>Danh sách<select id="watchlist-select"></select></label><button id="watchlist-create" class="button button-secondary" type="button">＋ Danh sách</button><button id="watchlist-rename" class="button button-secondary" type="button">Đổi tên</button><button id="watchlist-delete" class="button button-secondary" type="button">Xóa danh sách</button><button id="watchlist-fullscreen" class="button button-secondary" type="button">Toàn màn hình</button></div>
+          <div class="watchlist-add-row"><label for="watchlist-symbol">Thêm mã cổ phiếu<input id="watchlist-symbol" list="watchlist-symbol-options" placeholder="Gõ mã, ví dụ FPT" autocomplete="off"><datalist id="watchlist-symbol-options"></datalist></label><label>Ghi chú<input id="watchlist-item-note" maxlength="200" placeholder="Ghi chú ngắn (không bắt buộc)"></label><button id="watchlist-add" class="button button-primary" type="button">Thêm mã</button><button id="watchlist-export" class="button button-secondary" type="button">Xuất hồ sơ JSON</button><label class="watchlist-import-label">Nhập hồ sơ JSON<input id="watchlist-import" type="file" accept="application/json,.json"></label></div>
+          <div id="watchlist-market-status" class="data-context">Đang tải trạng thái thị trường…</div>
+          <div class="watchlist-table-wrap"><table class="watchlist-table"><thead><tr><th>Mã / doanh nghiệp</th><th>Giá gần nhất</th><th>Thay đổi</th><th>Spread</th><th>Độ sâu top 3</th><th>Spread 60 phút</th><th>Điều kiện</th><th>Cảnh báo</th><th>Ghi chú / thứ tự</th></tr></thead><tbody id="watchlist-rows"><tr><td colspan="9">Đang tải danh mục cục bộ…</td></tr></tbody></table></div>
+          <p class="analysis-note">Giá là OHLC gần nhất từ SSI; spread và độ sâu cần quote đã lưu. Nhãn điều kiện so sánh với lịch sử của chính mã, không phải khuyến nghị đầu tư.</p>
+        </article>
+        <details class="panel watch-settings-panel"><summary>Cài đặt hồ sơ cục bộ</summary><div class="watch-settings-grid"><label>Quy mô lệnh chuẩn (cổ phiếu)<input id="watch-standard-shares" type="number" min="100" step="100"></label><label>Spread thuận lợi tối đa (phân vị)<input id="watch-spread-good" type="number" min="0" max="100" step="1"></label><label>Spread căng thẳng từ (phân vị)<input id="watch-spread-stress" type="number" min="0" max="100" step="1"></label><label>Độ sâu thuận lợi từ (phân vị)<input id="watch-depth-good" type="number" min="0" max="100" step="1"></label><label>Độ sâu căng thẳng đến (phân vị)<input id="watch-depth-stress" type="number" min="0" max="100" step="1"></label><label>Giờ bắt đầu yên lặng<input id="watch-quiet-start" type="time"></label><label>Giờ kết thúc yên lặng<input id="watch-quiet-end" type="time"></label><label>Kênh thông báo<select id="watch-channel"><option value="in_app">Trong ứng dụng</option><option value="browser">Trình duyệt</option></select></label><button id="watch-settings-save" class="button button-primary" type="button">Lưu cài đặt</button></div></details>
+        <p id="watchlist-feedback" class="analysis-note" role="status"></p>
       </section>
 
       <section id="view-detail" class="view hidden">
@@ -109,7 +123,7 @@
         <div class="content-grid">
           <article class="panel panel-wide"><div class="panel-heading"><div><h2>Chênh lệch giá (spread) theo thời gian</h2><p>Ảnh chụp dữ liệu (snapshot) được lưu trong cơ sở dữ liệu</p></div></div><div id="detail-spread-chart" class="chart-box"></div></article>
           <article class="panel detail-book-panel"><div class="panel-heading"><div><h2>Sổ lệnh gần nhất</h2><p id="book-time">Chưa có dữ liệu</p></div><span id="book-validity" class="chip">—</span></div><div id="orderbook"></div></article>
-          <article class="panel detail-depth-panel"><div class="panel-heading"><div><h2>Độ sâu theo thời gian</h2><p>Giá trị sổ lệnh ba mức giá đầu của mã đang chọn</p></div></div><div id="detail-depth-chart" class="chart-box chart-short"></div><div class="legend"><span><i class="legend-bid"></i>Bên mua (bid)</span><span><i class="legend-ask"></i>Bên bán (ask)</span></div></article>
+          <article class="panel detail-depth-panel"><div class="panel-heading"><div><h2>Độ sâu theo thời gian</h2><p>Giá trị sổ lệnh ba mức giá đầu của mã đang chọn</p></div></div><div id="detail-depth-chart" class="chart-box chart-short"></div><div class="legend"><span><i class="legend-bid"></i>Bên mua (bid)</span><span><i class="legend-ask"></i>Bên bán (ask)</span></div><p class="analysis-note">Lịch sử độ sâu hữu ích để theo dõi lượng chờ mua/bán, nhưng chỉ có khi SSI quote đã được lưu trong bars. OHLC ngày không chứa sổ lệnh nên không thể dùng để dựng đường độ sâu.</p></article>
           <article class="panel panel-wide"><div class="panel-heading"><div><h2>Cảnh báo đang hoạt động</h2><p>Cảnh báo của mã đang chọn tại cùng mốc dữ liệu</p></div><a class="text-link" href="#alerts" data-route="alerts">Mở trang Cảnh báo →</a></div><div id="detail-alerts" class="empty-state">Đang tải cảnh báo…</div></article>
           <details class="panel panel-wide detail-history"><summary><span><b>Lịch sử giá giao dịch</b><small>OHLC ngày từ SSI · khối lượng khớp theo ngày</small></span><span id="detail-history-summary">Mở để xem</span></summary><div id="detail-history-table" class="table-wrap"></div></details>
         </div>
@@ -192,8 +206,9 @@
       </div>
     </form>
   </dialog>
-  <script src="/assets/app.js?v=30" defer></script>
-  <script src="/assets/enhancements.js?v=86" defer></script>
+  <script src="/assets/app.js?v=32" defer></script>
+  <script src="/assets/enhancements.js?v=93" defer></script>
+  <script src="/assets/watchlist.js?v=1" defer></script>
 </body>
 </html>
 

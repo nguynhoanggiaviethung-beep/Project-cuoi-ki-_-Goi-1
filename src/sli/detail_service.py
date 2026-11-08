@@ -93,7 +93,7 @@ def _independent(fn):
         return {"status": "unavailable", "data": None, "message": "Khối dữ liệu hiện chưa khả dụng."}
 
 
-def build_detail(symbol, source="ssi", as_of=None, window_sessions=5):
+def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=None, to_date=None):
     """Build all detail widgets from persisted metrics/bars using one snapshot clock."""
     as_of = as_of or datetime.now(config.TIMEZONE)
     if as_of.tzinfo is None:
@@ -133,20 +133,29 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5):
     history_load = _independent(lambda: database.fetch_historical_prices(ticker, limit=1000, source="ssi"))
     alert_load = _independent(lambda: [item for item in database.fetch_alerts(source, limit=500)
                                       if item.get("symbol") == ticker and item.get("status") == "active"])
-    bars_load = _independent(lambda: database.fetch_bars(source, symbol=ticker, limit=10000))
+    bar_start=f"{from_date}T00:00:00" if from_date else None
+    bar_end=f"{to_date}T23:59:59" if to_date else None
+    bars_load = _independent(lambda: database.fetch_bars(source, symbol=ticker, limit=10000,
+                                                         start_at=bar_start,end_at=bar_end))
     price_rows = history_load["data"] or []
     bars = bars_load["data"] or []
     # Keep completed bars only; timestamps and window boundaries share the page clock.
     current_minute = as_of.replace(second=0, microsecond=0)
     bars = [bar for bar in bars if (stamp := _stamp(bar.get("minute_vn"))) and stamp < current_minute]
     sessions = sorted({str(bar.get("session_date")) for bar in bars if bar.get("session_date")}, reverse=True)
-    selected_sessions = set(sessions[:max(1, min(int(window_sessions), 20))])
+    if from_date or to_date:
+        selected_sessions={day for day in sessions if (not from_date or day>=from_date) and (not to_date or day<=to_date)}
+    else:
+        selected_sessions = set(sessions[:max(1, min(int(window_sessions), 20))])
     window_bars = [bar for bar in bars if str(bar.get("session_date")) in selected_sessions]
     chart_bars = [bar for bar in window_bars if bar.get("coverage_status") == "ok"]
     current_bucket = None
     if chart_bars:
         current_bucket = chart_bars[-1].get("baseline_bucket")
-    baseline_sessions = set(sessions[max(1, min(int(window_sessions), 20)):][:config.BASELINE_SESSIONS])
+    if from_date:
+        baseline_sessions=set([day for day in sessions if day<from_date][:config.BASELINE_SESSIONS])
+    else:
+        baseline_sessions = set(sessions[max(1, min(int(window_sessions), 20)):][:config.BASELINE_SESSIONS])
     baseline = [bar for bar in bars if str(bar.get("session_date")) in baseline_sessions
                 and bar.get("coverage_status") == "ok"
                 and bar.get("baseline_bucket") == current_bucket]

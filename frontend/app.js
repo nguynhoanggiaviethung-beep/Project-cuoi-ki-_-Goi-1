@@ -1,4 +1,5 @@
 const state = { route: "overview", symbols: [], source: "ssi", status: null };
+let connectionStatusTimer = null;
 window.MarketClock = (() => {
   let meta=null,timer=null,lastAsOf=null,lastSyncState=null;const listeners=new Set();
   const notify=()=>listeners.forEach(fn=>{try{fn(meta);}catch(_){}});
@@ -93,9 +94,11 @@ async function api(path, options = {}) {
 window.attachChartTooltip = attachChartTooltip;
 function setRoute(route) {
   state.route = route;
+  window.sliRoute = route;
   $$(".view").forEach((view) => view.classList.toggle("hidden", view.id !== "view-" + route));
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.route === route));
   if (route === "overview") (window.loadOverview || loadOverview)();
+  if (route === "watchlist") (window.loadWatchlist || (()=>{}))();
   if (route === "detail") (window.loadDetail || loadDetail)();
   if (route === "rankings") (window.loadRankings || loadRankings)();
   if (route === "alerts") (window.loadAlerts || loadAlerts)();
@@ -143,9 +146,14 @@ function updateConnectionDialog(data = state.status) {
   button.disabled = active;
   button.textContent = active ? "Tiến trình đang hoạt động" : "Kết nối dữ liệu";
   if (disconnect) disconnect.hidden = !active;
-  if (title) title.textContent = active ? "SSI đang kết nối" : "Kết nối SSI FastConnect?";
+  const connectionStatus = String(data.connection_status || "").toLowerCase();
+  if (title) title.textContent = !active ? "Kết nối SSI FastConnect?" : connectionStatus === "connected"
+    ? "SSI đã kết nối" : ["error", "disconnected"].includes(connectionStatus)
+      ? "SSI mất kết nối" : "SSI đang kết nối";
   if (copy) copy.textContent = active
-    ? "Tiến trình SSI đang hoạt động. Bạn có thể vào bảng điều khiển để xem dữ liệu và trạng thái kết nối."
+    ? connectionStatus === "connected"
+      ? "WebSocket SSI đã kết nối. Ngoài giờ giao dịch, hệ thống giữ dữ liệu gần nhất và chờ quote khi phiên mở lại."
+      : "Tiến trình SSI đang hoạt động; hệ thống đang cập nhật trạng thái kết nối."
     : "Dữ liệu báo giá (quote) và khớp lệnh sẽ được thu thập bằng một tiến trình riêng. Kết nối chỉ bắt đầu khi bạn chọn nút bên dưới.";
   if (skipButton) skipButton.textContent = active ? "Vào trang web" : "Tiếp tục không kết nối";
 }
@@ -212,6 +220,7 @@ async function refreshStatus() {
   try {
     const data = await api("/api/status");
     state.status = data;
+    clearTimeout(connectionStatusTimer);
     window.MarketClock.update(data.meta||data);
     state.source = data.source;
     const live = ["live", "ssi"].includes(data.source);
@@ -244,12 +253,19 @@ async function refreshStatus() {
     $("#notice-text").textContent = message;
     updateConnectionDialog(data);
     if (state.route === "methodology") renderCollectorStatus(data);
+    // A worker may take a few seconds to move from connecting to connected.
+    // Keep the badge/dialog fresh while it is negotiating the SSI stream.
+    if (data.worker_status === "running" && !document.hidden) {
+      const interval = ["connecting", "reconnecting"].includes(data.connection_status) ? 2000 : 5000;
+      connectionStatusTimer = window.setTimeout(refreshStatus, interval);
+    }
   } catch (error) {
     $("#connection-label").textContent = "Backend không phản hồi";
     $("#notice-text").textContent = "Không lấy được trạng thái kết nối dữ liệu. Hãy kiểm tra web backend.";
     const dialogStatus = $("#connection-dialog-status");
     if (dialogStatus) dialogStatus.textContent = "Chưa liên hệ được web backend nên chưa thể yêu cầu kết nối SSI.";
     $("#global-notice").className = "notice notice-error";
+    if (!document.hidden) connectionStatusTimer = window.setTimeout(refreshStatus, 5000);
   }
 }
 function renderCollectorStatus(data) {
@@ -481,7 +497,8 @@ window.setTimeout(() => {
 }, 0);
 refreshStatus();
 const marketEvents=new EventSource('/api/stream');
+window.sliMarketStream=marketEvents;
 for(const eventName of ['market_state','data_diff','heartbeat'])marketEvents.addEventListener(eventName,event=>{
-  try{const payload=JSON.parse(event.data),meta=payload.meta||payload;window.MarketClock.update(meta);if(!document.hidden&&eventName==='data_diff')window.enhancedRefresh?.();}catch(_){ }
+  try{const payload=JSON.parse(event.data),meta=payload.meta||payload;window.MarketClock.update(meta);if(!document.hidden&&(eventName==='heartbeat'||eventName==='market_state'))refreshStatus();if(!document.hidden&&eventName==='data_diff')window.enhancedRefresh?.();}catch(_){ }
 });
-document.addEventListener('visibilitychange',()=>window.MarketClock.visibilityChanged());
+document.addEventListener('visibilitychange',()=>{window.MarketClock.visibilityChanged();if(!document.hidden){clearTimeout(connectionStatusTimer);refreshStatus();}});

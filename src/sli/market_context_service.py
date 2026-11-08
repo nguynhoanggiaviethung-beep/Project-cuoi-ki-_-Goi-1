@@ -50,9 +50,10 @@ def build_turnover_series(rows: Iterable[dict], metric: str = "value", *,
     }
 
 
-def get_market_turnover(*, limit: int = 60, metric: str = "value", market_meta: dict | None = None) -> dict:
+def get_market_turnover(*, limit: int = 60, metric: str = "value", market_meta: dict | None = None,
+                        start_date: str | None = None, end_date: str | None = None) -> dict:
     """Return SSI-only market context and mark any unsynced current session."""
-    rows = database.fetch_market_ohlc_sessions(limit=limit, source="ssi")
+    rows = database.fetch_market_ohlc_sessions(limit=limit, source="ssi", start_date=start_date, end_date=end_date)
     meta = market_meta or {}
     sync_status = (meta.get("session_sync") or {}).get("status")
     pending_date = meta.get("session_date") if (

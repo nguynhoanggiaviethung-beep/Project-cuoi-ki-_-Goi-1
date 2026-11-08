@@ -44,7 +44,8 @@ Không chia sẻ hoặc commit file `.env`; file này chứa thông tin đăng n
 ## Thu thập và kiểm chứng dữ liệu
 
 - Worker dùng SSI FastConnect WebSocket cho quote; snapshot, chỉ số và trạng thái lần chạy được lưu trong SQLite.
-- Đồng bộ OHLC ngày dùng REST SSI theo từng mã, tối thiểu cách nhau `HISTORY_REST_MIN_INTERVAL_SECONDS`; lỗi giới hạn/tạm thời được retry theo backoff.
+- Đồng bộ OHLC ngày dùng REST SSI theo từng mã từ `HISTORY_START_DATE` (mặc định 01/01/2000), phân trang tối đa 10 trang × 1.000 dòng theo giới hạn tài liệu SSI; mỗi yêu cầu được giãn theo `HISTORY_REST_MIN_INTERVAL_SECONDS` và lỗi tạm thời được retry. Mã chỉ được đánh dấu backfill hoàn tất khi API trả trang cuối ngắn hơn page size; chạm giới hạn trang sẽ được báo là chưa xác nhận hết lịch sử.
+- Lịch sử OHLC đầy đủ hơn được tải nền cùng worker; lần đầu có thể mất nhiều thời gian và chưa chạy cho tới khi collector được khởi chạy. Các lần sau chỉ cập nhật cửa sổ gần đây cho mã đã backfill.
 - Để phân tích spread/depth theo phiên, giữ backend chạy trong ít nhất 5 phiên giao dịch có quote thật. OHLC ngày có thể có nhiều phiên nhưng không thay thế lịch sử sổ lệnh.
 - Kiểm tra `/api/status`, `/api/quality` và `/api/collector/runs` để xem heartbeat, quote đã nhận, message trễ/trùng/bị rơi, lỗi và lịch sử phiên chạy. Trạng thái `connected` chỉ phản ánh kết nối; cần kiểm tra thời điểm quote mới nhất để xác nhận dữ liệu.
 - Mọi mốc nhận/tính toán hiển thị theo `Asia/Ho_Chi_Minh`; cột UTC được lưu kèm để xử lý kỹ thuật. Dữ liệu gốc nhạy cảm được lọc trước khi lưu.

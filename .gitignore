@@ -5,8 +5,11 @@ __pycache__/
 database/*.sqlite3
 database/*.sqlite3.*
 database/*.db
+database/local-profile-backup-*.json
 __pycache__/
 *.py[cod]
 logs/
 *.sqlite3-wal
 *.sqlite3-shm
+sli-local-profile.json
+*.local-profile.json

@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, database
 from .detail_service import build_detail
+from .investor_service import build_watchlist_live
 from .market_context_service import get_market_turnover
 from .depth_service import build_market_depth
 from .bookwalk import estimate as estimate_bookwalk
@@ -322,13 +323,14 @@ def status():
 
 
 @app.get("/api/price-history")
-def price_history(symbol: str | None = None, limit: int = Query(default=90, ge=1, le=1000),
+def price_history(symbol: str | None = None, limit: int = Query(default=10000, ge=1, le=10000),
                  page: int = Query(default=1, ge=1), page_size: int = Query(default=50, ge=1, le=200),
-                 search: str | None = None):
+                 search: str | None = None, from_date: str | None = None, to_date: str | None = None):
     selected = symbol.upper() if symbol and symbol.upper() not in ("ALL", "__ALL__") else None
     if selected:
         incomplete_date=_incomplete_session_date()
-        rows=database.fetch_historical_prices(selected,limit=limit,source="ssi",exclude_date=incomplete_date)
+        rows=database.fetch_historical_prices(selected,limit=limit,source="ssi",exclude_date=incomplete_date,
+                                              start_date=from_date,end_date=to_date)
         return {"source":"ssi","timeframe":"1d","symbols_count":1 if rows else 0,
                 "symbols":[selected] if rows else [],"series_by_symbol":{selected:rows} if rows else {},
                 "pending_session_date":incomplete_date,
@@ -361,14 +363,14 @@ def market_leaders(limit: int = Query(default=25, ge=5, le=100), as_of: str | No
 
 
 @lru_cache(maxsize=16)
-def _cached_market_breadth(limit, cache_minute):
-    return database.fetch_market_breadth(limit=limit,source="ssi")
+def _cached_market_breadth(limit, start_date, end_date, cache_minute):
+    return database.fetch_market_breadth(limit=limit,source="ssi",start_date=start_date,end_date=end_date)
 
 
 @app.get("/api/market-breadth")
-def market_breadth(limit: int = Query(default=90, ge=2, le=1000)):
+def market_breadth(limit: int = Query(default=10000, ge=2, le=10000), from_date: str | None = None, to_date: str | None = None):
     cache_minute=int(datetime.now(config.TIMEZONE).timestamp()//60)
-    rows=_cached_market_breadth(limit,cache_minute)
+    rows=_cached_market_breadth(limit,from_date,to_date,cache_minute)
     incomplete_date=_incomplete_session_date()
     if incomplete_date:
         rows=[row for row in rows if str(row["trading_date"]).replace("-","/")!=incomplete_date]
@@ -382,9 +384,11 @@ def market_breadth(limit: int = Query(default=90, ge=2, le=1000)):
 
 
 @app.get("/api/market-turnover")
-def market_turnover(limit: int = Query(default=60, ge=20, le=250),
-                    metric: str = Query(default="value", pattern="^(value|volume)$")):
-    return get_market_turnover(limit=limit, metric=metric, market_meta=_market_meta("ssi"))
+def market_turnover(limit: int = Query(default=10000, ge=20, le=10000),
+                    metric: str = Query(default="value", pattern="^(value|volume)$"),
+                    from_date: str | None = None, to_date: str | None = None):
+    return get_market_turnover(limit=limit, metric=metric, market_meta=_market_meta("ssi"),
+                               start_date=from_date,end_date=to_date)
 
 
 @app.get("/api/symbols")
@@ -397,6 +401,188 @@ def symbols():
                   for symbol, name, board in directory]
     return {"source":source,"symbols":available,"securities":securities,"count":len(available),
             "detail_default":database.fetch_detail_default_symbol(source)}
+
+
+def _local_watchlist(watchlist_id):
+    item=next((entry for entry in database.fetch_local_watchlists() if entry["id"]==watchlist_id),None)
+    if not item:raise HTTPException(status_code=404,detail="Không tìm thấy danh sách theo dõi.")
+    return item
+
+
+def _clean_watchlist_name(value):
+    name=" ".join(str(value or "").split())
+    if not 1<=len(name)<=60:raise HTTPException(status_code=422,detail="Tên danh sách cần từ 1 đến 60 ký tự.")
+    return name
+
+
+def _validate_local_symbol(symbol):
+    ticker=str(symbol or "").strip().upper()
+    metadata=database.fetch_company_metadata("ssi",ticker)
+    if not metadata or str(metadata.get("stock_type") or "").strip().lower()!="stock":
+        raise HTTPException(status_code=422,detail="Chỉ thêm mã cổ phiếu có trong danh mục SSI.")
+    return ticker
+
+
+@app.get("/api/me/watchlists")
+def local_watchlists():
+    return {"profile":"local","watchlists":database.fetch_local_watchlists(),"max_watchlists":5,"max_symbols_per_list":50}
+
+
+@app.post("/api/me/watchlists")
+def create_local_watchlist(payload: dict=Body(...)):
+    lists=database.fetch_local_watchlists()
+    if len(lists)>=5:raise HTTPException(status_code=409,detail="Tối đa 5 danh sách theo dõi trên hồ sơ cục bộ.")
+    name=_clean_watchlist_name(payload.get("name"))
+    if any(item["name"].casefold()==name.casefold() for item in lists):raise HTTPException(status_code=409,detail="Tên danh sách đã tồn tại.")
+    watchlist_id=database.create_local_watchlist(name)
+    return _local_watchlist(watchlist_id)
+
+
+@app.patch("/api/me/watchlists/{watchlist_id}")
+def rename_local_watchlist(watchlist_id:int,payload:dict=Body(...)):
+    _local_watchlist(watchlist_id)
+    name=_clean_watchlist_name(payload.get("name"))
+    if any(item["id"]!=watchlist_id and item["name"].casefold()==name.casefold() for item in database.fetch_local_watchlists()):
+        raise HTTPException(status_code=409,detail="Tên danh sách đã tồn tại.")
+    database.rename_local_watchlist(watchlist_id,name)
+    return _local_watchlist(watchlist_id)
+
+
+@app.delete("/api/me/watchlists/{watchlist_id}")
+def delete_local_watchlist(watchlist_id:int):
+    _local_watchlist(watchlist_id)
+    database.delete_local_watchlist(watchlist_id)
+    return {"ok":True,"watchlists":database.fetch_local_watchlists()}
+
+
+@app.post("/api/me/watchlists/{watchlist_id}/items")
+def add_local_watchlist_item(watchlist_id:int,payload:dict=Body(...)):
+    watchlist=_local_watchlist(watchlist_id)
+    symbol=_validate_local_symbol(payload.get("symbol"))
+    note=str(payload.get("note") or "").strip()
+    if len(note)>200:raise HTTPException(status_code=422,detail="Ghi chú tối đa 200 ký tự.")
+    if any(item["symbol"]==symbol for item in watchlist["items"]):raise HTTPException(status_code=409,detail="Mã đã có trong danh sách.")
+    if len(watchlist["items"])>=50:raise HTTPException(status_code=409,detail="Mỗi danh sách tối đa 50 mã.")
+    try:database.add_local_watchlist_item(watchlist_id,symbol,note)
+    except ValueError as exc:raise HTTPException(status_code=409,detail=str(exc)) from exc
+    except Exception as exc:
+        if "UNIQUE constraint" in str(exc):raise HTTPException(status_code=409,detail="Mã đã có trong danh sách.") from exc
+        raise
+    return _local_watchlist(watchlist_id)
+
+
+@app.delete("/api/me/watchlists/{watchlist_id}/items/{symbol}")
+def remove_local_watchlist_item(watchlist_id:int,symbol:str):
+    _local_watchlist(watchlist_id)
+    if not database.remove_local_watchlist_item(watchlist_id,symbol.upper()):raise HTTPException(status_code=404,detail="Mã không có trong danh sách.")
+    return _local_watchlist(watchlist_id)
+
+
+@app.patch("/api/me/watchlists/{watchlist_id}/items/{symbol}")
+def update_local_watchlist_note(watchlist_id:int,symbol:str,payload:dict=Body(...)):
+    _local_watchlist(watchlist_id)
+    note=str(payload.get("note") or "").strip()
+    if len(note)>200:raise HTTPException(status_code=422,detail="Ghi chú tối đa 200 ký tự.")
+    if not database.update_local_watchlist_item_note(watchlist_id,symbol.upper(),note):raise HTTPException(status_code=404,detail="Mã không có trong danh sách.")
+    return _local_watchlist(watchlist_id)
+
+
+@app.put("/api/me/watchlists/{watchlist_id}/order")
+def reorder_local_watchlist(watchlist_id:int,payload:dict=Body(...)):
+    _local_watchlist(watchlist_id)
+    symbols=payload.get("symbols")
+    if not isinstance(symbols,list) or len(symbols)>50 or any(not isinstance(item,str) for item in symbols):
+        raise HTTPException(status_code=422,detail="Thứ tự mã không hợp lệ.")
+    try:database.reorder_local_watchlist(watchlist_id,[item.upper() for item in symbols])
+    except ValueError as exc:raise HTTPException(status_code=422,detail=str(exc)) from exc
+    return _local_watchlist(watchlist_id)
+
+
+@app.get("/api/me/watchlists/{watchlist_id}/live")
+def local_watchlist_live(watchlist_id:int):
+    watchlist=_local_watchlist(watchlist_id)
+    meta=_market_meta("ssi")
+    return build_watchlist_live(watchlist,meta,get_clock_now())
+
+
+@app.get("/api/me/settings")
+def local_user_settings():
+    return {"profile":"local","settings":database.get_local_settings()}
+
+
+def _validate_local_settings(payload,base=None):
+    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
+             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+    unknown=set(payload)-allowed
+    if unknown:raise HTTPException(status_code=422,detail="Có trường cài đặt không được hỗ trợ.")
+    merged={**(base or database.get_local_settings()),**payload}
+    shares=merged.get("standard_order_shares")
+    if isinstance(shares,bool) or not isinstance(shares,int) or not 100<=shares<=10000000 or shares%100:
+        raise HTTPException(status_code=422,detail="Quy mô lệnh chuẩn phải là bội số 100, từ 100 đến 10.000.000 cổ phiếu.")
+    for key in ("favorable_spread_pctl","stress_spread_pctl","favorable_depth_pctl","stress_depth_pctl"):
+        try:merged[key]=float(merged[key])
+        except (TypeError,ValueError):raise HTTPException(status_code=422,detail="Ngưỡng phân vị phải là số từ 0 đến 100.")
+        if not 0<=merged[key]<=100:raise HTTPException(status_code=422,detail="Ngưỡng phân vị phải từ 0 đến 100.")
+    if merged["favorable_spread_pctl"]>=merged["stress_spread_pctl"] or merged["stress_depth_pctl"]>=merged["favorable_depth_pctl"]:
+        raise HTTPException(status_code=422,detail="Ngưỡng thuận lợi và căng thẳng phải tách biệt.")
+    for key in ("quiet_start","quiet_end"):
+        value=merged.get(key)
+        if value is not None and value!="":
+            try:datetime.strptime(value,"%H:%M")
+            except (TypeError,ValueError):raise HTTPException(status_code=422,detail="Giờ yên lặng cần theo định dạng HH:MM.")
+        else:merged[key]=None
+    if merged.get("notification_channel") not in {"in_app","browser"}:
+        raise HTTPException(status_code=422,detail="Kênh thông báo chỉ hỗ trợ trong ứng dụng hoặc trình duyệt.")
+    return {key:merged[key] for key in allowed}
+
+
+@app.put("/api/me/settings")
+def update_local_user_settings(payload:dict=Body(...)):
+    validated=_validate_local_settings(payload)
+    return {"profile":"local","settings":database.update_local_settings(validated)}
+
+
+def _validate_profile_document(payload):
+    if not isinstance(payload,dict) or payload.get("format")!="sli-local-profile-v1":
+        raise HTTPException(status_code=422,detail="Tệp không đúng định dạng hồ sơ SLI.")
+    lists=payload.get("watchlists")
+    if not isinstance(lists,list) or len(lists)>5:raise HTTPException(status_code=422,detail="Tệp chứa tối đa 5 danh sách.")
+    validated=[];seen_names=set()
+    for entry in lists:
+        if not isinstance(entry,dict):raise HTTPException(status_code=422,detail="Danh sách trong tệp không hợp lệ.")
+        name=_clean_watchlist_name(entry.get("name"))
+        if name.casefold() in seen_names:raise HTTPException(status_code=422,detail="Tên danh sách bị trùng trong tệp.")
+        seen_names.add(name.casefold());items=entry.get("items")
+        if not isinstance(items,list) or len(items)>50:raise HTTPException(status_code=422,detail="Mỗi danh sách tối đa 50 mã.")
+        clean=[];seen=set()
+        for item in items:
+            if not isinstance(item,dict):raise HTTPException(status_code=422,detail="Mã trong tệp không hợp lệ.")
+            symbol=_validate_local_symbol(item.get("symbol"));note=str(item.get("note") or "").strip()
+            if symbol in seen or len(note)>200:raise HTTPException(status_code=422,detail="Mã bị trùng hoặc ghi chú vượt 200 ký tự.")
+            seen.add(symbol);clean.append({"symbol":symbol,"note":note})
+        validated.append({"name":name,"items":clean})
+    settings=payload.get("settings") or {}
+    if not isinstance(settings,dict):raise HTTPException(status_code=422,detail="Cài đặt trong tệp không hợp lệ.")
+    return settings,validated
+
+
+@app.get("/api/me/export")
+def export_local_profile():
+    settings=database.get_local_settings()
+    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
+             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+    return {"format":"sli-local-profile-v1","settings":{key:settings[key] for key in allowed},
+            "watchlists":[{"name":row["name"],"items":[{"symbol":item["symbol"],"note":item["note"]} for item in row["items"]]}
+                          for row in database.fetch_local_watchlists()]}
+
+
+@app.post("/api/me/import")
+def import_local_profile(payload:dict=Body(...)):
+    settings,lists=_validate_profile_document(payload)
+    validated_settings=_validate_local_settings(settings)
+    backup_file=database.backup_local_profile_json()
+    database.replace_local_profile(validated_settings,lists)
+    return {"ok":True,"backup_file":backup_file,"watchlists":database.fetch_local_watchlists(),"settings":database.get_local_settings()}
 
 @app.get("/api/overview")
 def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le=2000),
@@ -455,9 +641,11 @@ def trades(symbol: str | None = None, limit: int = Query(default=50, ge=1, le=50
 
 
 @app.get("/api/detail/{symbol}")
-def detail_page(symbol: str, window_sessions: int = Query(default=5, ge=1, le=20)):
+def detail_page(symbol: str, window_sessions: int = Query(default=5, ge=1, le=20),
+                from_date: str | None = None, to_date: str | None = None):
     """Single-clock payload for every widget on the stock detail page."""
-    result = build_detail(symbol, source=_source(), window_sessions=window_sessions)
+    result = build_detail(symbol, source=_source(), window_sessions=window_sessions,
+                          from_date=from_date,to_date=to_date)
     if result.get("error"):
         raise HTTPException(status_code=404, detail=result["error"])
     return result

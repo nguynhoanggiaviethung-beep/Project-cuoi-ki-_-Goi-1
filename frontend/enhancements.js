@@ -5,7 +5,7 @@
     VPB: { name: 'Ngân hàng TMCP Việt Nam Thịnh Vượng', sector: 'Ngân hàng' }
   };
   const colors = ['#008A45', '#E2231A', '#68A92E', '#A7BF36', '#00592E'];
-  const routeOrder = ['overview','detail','rankings','alerts','methodology','guide','intro','project'];
+  const routeOrder = ['overview','watchlist','detail','rankings','alerts','methodology','guide','intro','project'];
   const prevRanks = { spread: new Map(), depth: new Map(), widen: new Map(), fall: new Map() };
   let marketHistoryCache=null,marketHistoryFetchedAt=0;
   let turnoverMetric='value',turnoverPayload=null,turnoverResizeObserver=null,turnoverSignature='';
@@ -39,8 +39,8 @@
     const area=(segments,base,cls)=>segments.map(seg=>`<path class="${cls}" d="M${seg[0].x},${base} ${seg.map(p=>`L${p.x},${p.y}`).join(' ')} L${seg.at(-1).x},${base} Z"/>`).join('');
     const paths=(segments,cls)=>segments.map(seg=>`<path class="${cls}" d="${seg.map((p,i)=>`${i?'L':'M'}${p.x},${p.y}`).join(' ')}"/>`).join('');
     const bid=splitSegments('bid_depth_value',1),ask=splitSegments('ask_depth_value',-1),labelCount=Math.min(7,rows.length),labelIndices=labelCount===1?[0]:Array.from({length:labelCount},(_,i)=>Math.round(i*(rows.length-1)/(labelCount-1)));
-    host.innerHTML=`<svg class="depth-svg" width="${width}" height="${height}" style="width:${width}px;height:${height}px" aria-label="Độ sâu mua phía trên và độ sâu bán phía dưới trục không"><g>${axis.join('')}<line x1="${pad.l}" y1="${midY}" x2="${width-pad.r}" y2="${midY}" class="depth-zero"/>${area(bid,midY,'depth-bid-area')}${area(ask,midY,'depth-ask-area')}${paths(bid,'depth-bid-line')}${paths(ask,'depth-ask-line')}${labelIndices.map(i=>`<text x="${x(i)}" y="${height-12}" text-anchor="${i===0?'start':i===rows.length-1?'end':'middle'}">${esc(String(rows[i].minute).slice(11,16))}</text>`).join('')}<text x="${pad.l}" y="18" class="depth-unit">${esc(unit)} · mua ↑ / bán ↓</text>${rows.flatMap((r,i)=>[r.bid_depth_value!=null&&Number.isFinite(Number(r.bid_depth_value))?`<circle class="depth-hit" data-i="${i}" cx="${x(i)}" cy="${y(Number(r.bid_depth_value))}" r="7"/>`:'' ,r.ask_depth_value!=null&&Number.isFinite(Number(r.ask_depth_value))?`<circle class="depth-hit" data-i="${i}" cx="${x(i)}" cy="${y(-Number(r.ask_depth_value))}" r="7"/>`:'' ]).join('')}</g></svg>`;
-    host.querySelectorAll('.depth-hit').forEach(dot=>{const show=e=>{const i=Number(dot.dataset.i),r=rows[i],rect=host.getBoundingClientRect();if(tip){tip.hidden=false;tip.innerHTML=`<b>${esc(String(r.minute).replace('T',' ').slice(0,16))}</b><span>Mua: ${num(Number(r.bid_depth_value)/divisor,3)} ${esc(unit)}</span><span>Bán: ${num(Number(r.ask_depth_value)/divisor,3)} ${esc(unit)}</span><span>Tỷ trọng mua: ${num(100*Number(r.bid_depth_value)/(Number(r.bid_depth_value)+Number(r.ask_depth_value)||1),1)}%</span><span>${num(r.symbols_count,0)} mã tham gia</span>`;const cx=e.clientX??rect.left+x(i),cy=e.clientY??rect.top+midY;tip.style.left=`${Math.min(window.innerWidth-270,cx+12)}px`;tip.style.top=`${Math.max(8,cy-110)}px`;}};dot.addEventListener('pointerenter',show);dot.addEventListener('pointermove',show);dot.addEventListener('pointerleave',()=>{if(tip)tip.hidden=true;});});
+    host.innerHTML=`<svg class="depth-svg" width="${width}" height="${height}" style="width:${width}px;height:${height}px" aria-label="Độ sâu mua dương phía trên và độ sâu bán âm phía dưới trục không; số trên trục là độ lớn tuyệt đối"><g>${axis.join('')}<line x1="${pad.l}" y1="${midY}" x2="${width-pad.r}" y2="${midY}" class="depth-zero"/>${area(bid,midY,'depth-bid-area')}${area(ask,midY,'depth-ask-area')}${paths(bid,'depth-bid-line')}${paths(ask,'depth-ask-line')}${labelIndices.map(i=>`<text x="${x(i)}" y="${height-12}" text-anchor="${i===0?'start':i===rows.length-1?'end':'middle'}">${esc(String(rows[i].minute).slice(11,16))}</text>`).join('')}<text x="${pad.l}" y="18" class="depth-unit">${esc(unit)} · phía trên: mua (+) · phía dưới: bán (−)</text>${rows.flatMap((r,i)=>[r.bid_depth_value!=null&&Number.isFinite(Number(r.bid_depth_value))?`<circle class="depth-hit" data-i="${i}" data-side="bid" cx="${x(i)}" cy="${y(Number(r.bid_depth_value))}" r="7"/>`:'' ,r.ask_depth_value!=null&&Number.isFinite(Number(r.ask_depth_value))?`<circle class="depth-hit" data-i="${i}" data-side="ask" cx="${x(i)}" cy="${y(-Number(r.ask_depth_value))}" r="7"/>`:'' ]).join('')}</g></svg>`;
+    host.querySelectorAll('.depth-hit').forEach(dot=>{const show=e=>{const i=Number(dot.dataset.i),r=rows[i],side=dot.dataset.side,rect=host.getBoundingClientRect();if(tip){tip.hidden=false;const sideLabel=side==='bid'?'Độ sâu mua (bid)':'Độ sâu bán (ask)',value=side==='bid'?r.bid_depth_value:r.ask_depth_value;tip.innerHTML=`<b>${esc(String(r.minute).replace('T',' ').slice(0,16))}</b><span>${sideLabel}: ${num(Number(value)/divisor,3)} ${esc(unit)}</span><span>${num(r.symbols_count,0)} mã tham gia</span>`;const cx=e.clientX??rect.left+x(i),cy=e.clientY??rect.top+(side==='bid'?y(Number(value)):y(-Number(value)));tip.style.left=`${Math.min(window.innerWidth-270,cx+12)}px`;tip.style.top=`${Math.max(8,cy-80)}px`;}};dot.addEventListener('pointerenter',show);dot.addEventListener('pointermove',show);dot.addEventListener('pointerleave',()=>{if(tip)tip.hidden=true;});});
   }
   async function loadOverviewDepth(windowMinutes){
     const host=document.querySelector('#depth-chart');if(!host)return;
@@ -67,7 +67,8 @@
     host.innerHTML=`<svg class="depth-svg cumulative-depth-svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="Độ sâu tích lũy theo giá; ${curve.levels_used} mức giá được dùng">${grids}<path d="${stepPath(bid)}" class="depth-bid-line"/><path d="${stepPath(ask)}" class="depth-ask-line"/><line x1="${x(mid)}" x2="${x(mid)}" y1="${p.t}" y2="${h-p.b}" class="depth-zero" stroke-dasharray="4 4"/><text x="${p.l}" y="13" class="depth-unit">Khối lượng tích lũy · cổ phiếu · ${curve.levels_used} mức</text><text x="${p.l}" y="${h-9}" text-anchor="start">${num(minPrice,0)}</text><text x="${x(mid)}" y="${h-9}" text-anchor="middle">${num(mid,0)} · giá giữa</text><text x="${w-p.r}" y="${h-9}" text-anchor="end">${num(maxPrice,0)}</text></svg>`;
   }
   const baseRankings=window.loadRankings,baseAlerts=window.loadAlerts,baseMethodology=window.loadMethodology;
-  const enhancedRankings=()=>baseRankings?.(),enhancedAlerts=()=>baseAlerts?.(),enhancedMethodology=()=>baseMethodology?.();
+  const enhanceWatchButtons=()=>window.watchAddQuickButtons?.();
+  const enhancedRankings=async()=>{await baseRankings?.();enhanceWatchButtons();},enhancedAlerts=async()=>{await baseAlerts?.();enhanceWatchButtons();},enhancedMethodology=()=>baseMethodology?.();
 
   function setupMarketBackground() {
     if (document.querySelector('#market-background')) return;
@@ -196,10 +197,14 @@
     const nav=document.querySelector('.main-nav');
     if(nav && !document.querySelector('.swipe-hint')) nav.insertAdjacentHTML('afterend','<div class="swipe-hint">Vuốt ngang hoặc dùng phím Alt + ← / → để chuyển tab</div>');
     const overview=document.querySelector('#view-overview .content-grid');
+    const overviewFilters=document.querySelector('#view-overview .filter-bar');
+    if(overviewFilters&&!document.querySelector('#overview-history-controls')){overviewFilters.insertAdjacentHTML('afterend','<div id="overview-history-controls" class="history-range-controls overview-history-controls"><strong>Khoảng lịch sử OHLC SSI</strong><div class="history-range-presets" role="group" aria-label="Khoảng lịch sử tổng quan"><button type="button" data-overview-range="1y">1 năm</button><button type="button" data-overview-range="3y">3 năm</button><button type="button" data-overview-range="5y">5 năm</button><button type="button" data-overview-range="all">Tất cả</button></div><label>Từ ngày<input id="overview-history-from" type="date"></label><label>Đến ngày<input id="overview-history-to" type="date"></label><button id="overview-history-apply" class="button button-secondary" type="button">Áp dụng</button></div>');setOverviewRange('1y');}
     if(overview && !document.querySelector('#market-turnover-chart')) overview.insertAdjacentHTML('afterbegin',
       '<article class="panel panel-wide market-turnover-panel"><div class="panel-heading"><div><h2>Bối cảnh thị trường · OHLC ngày SSI</h2><p>Dữ liệu giá theo ngày, không phải thanh khoản sổ lệnh.</p></div><div class="turnover-metric-switch" role="group" aria-label="Chỉ số hiển thị"><button type="button" class="active" data-turnover-metric="value">Giá trị khớp</button><button type="button" data-turnover-metric="volume">Khối lượng</button></div></div><div id="market-turnover-kpis" class="turnover-kpis"></div><div class="turnover-legend"><span><i class="normal"></i>Phiên thường</span><span><i class="spike"></i>Phiên đột biến (từ 1,4 lần trung bình 20 phiên)</span><span><i class="average"></i>Trung bình 20 phiên</span></div><div id="market-turnover-chart" class="market-turnover-chart" role="img" aria-label="Biểu đồ giá trị giao dịch toàn thị trường theo phiên"></div><p id="market-turnover-note" class="analysis-note"></p></article>');
     if(overview && !document.querySelector('#historical-price-chart')) overview.insertAdjacentHTML('afterbegin',
       '<article class="panel panel-wide"><div class="panel-heading"><div><h2>Danh mục cổ phiếu và giá lịch sử (SSI)</h2><p>Cổ phiếu thường trên HOSE, HNX và UPCoM · lịch sử đồng bộ dần từ SSI</p></div><span class="chip">SSI · DỮ LIỆU THẬT</span></div><div class="history-controls"><label>Tìm mã hoặc tên doanh nghiệp<input id="history-symbol-search" type="search" placeholder="Ví dụ: FPT hoặc ABB"></label><span id="history-progress" class="chip">Đang tải danh mục SSI…</span></div><div id="historical-price-summary" class="historical-price-summary"></div><section class="live-trades-section"><div class="panel-heading"><div><h3>Khớp lệnh mới nhất từ SSI FastConnect</h3><p>Giá và khối lượng giao dịch đã khớp (TradeMessage), tách biệt với lượng đang chờ mua/bán trong sổ lệnh.</p></div><span id="live-trades-updated" class="chip">Đang chờ dữ liệu khớp lệnh…</span></div><div id="live-trade-tape"></div><p class="analysis-note">“KL khớp” là khối lượng của message giao dịch; “Tổng KL SSI báo” là trường total_volume của SSI. Dữ liệu cập nhật theo message, không phải OHLC lịch sử.</p></section><h3 id="history-chart-heading" class="history-chart-heading">Độ rộng thị trường SSI · số mã tăng / giảm theo phiên</h3><div id="historical-price-chart" class="chart-box"></div><div class="history-pagination"><button id="history-prev" class="button button-secondary" type="button">← Trang trước</button><span id="history-page-status"></span><button id="history-next" class="button button-secondary" type="button">Trang sau →</button></div><p id="historical-price-note" class="analysis-note">Giá đóng cửa là giá lịch sử SSI, không phải báo giá realtime hay dữ liệu sổ lệnh.</p></article>');
+    const historyHeading=document.querySelector('#history-chart-heading');
+    if(historyHeading&&!document.querySelector('#history-range-controls'))historyHeading.insertAdjacentHTML('afterend','<div id="history-range-controls" class="history-range-controls" hidden><div class="history-range-presets" role="group" aria-label="Khoảng thời gian lịch sử"><button type="button" data-history-range="1y">1 năm</button><button type="button" data-history-range="3y">3 năm</button><button type="button" data-history-range="5y">5 năm</button><button type="button" data-history-range="all">Tất cả</button></div><label>Từ ngày<input id="history-from-date" type="date"></label><label>Đến ngày<input id="history-to-date" type="date"></label><button id="history-apply-dates" class="button button-secondary" type="button">Áp dụng</button></div>');
     const overviewKpis=document.querySelector('#view-overview .kpi-grid');if(overviewKpis&&!document.querySelector('#overview-data-context'))overviewKpis.insertAdjacentHTML('afterend','<div id="overview-data-context" class="data-context" role="status"></div>');
     if(overview && !document.querySelector('#imbalance-chart')) overview.insertAdjacentHTML('beforeend',
       '<article class="panel"><div class="panel-heading"><div><h2>Cân bằng khối lượng mua / bán (bid / ask)</h2><p>Mất cân bằng khối lượng chờ (queue imbalance) từ −1 đến +1</p></div></div><div id="imbalance-chart" class="chart-box chart-short"></div><p id="imbalance-reading" class="analysis-note"></p></article>'+
@@ -213,12 +218,14 @@
       const content=details.querySelector('.overview-market-data-content');
       const panels=['#historical-price-chart','#spread-compare','#coverage-chart'].map(id=>document.querySelector(id)?.closest('.panel')).filter(Boolean);
       if(panels.length){overview.after(details);for(const panel of panels)content.appendChild(panel);}
-      details.addEventListener('toggle',()=>{if(details.open)historicalPriceChart(document.querySelector('#overview-symbol')?.value||'__all__',90);});
+      details.addEventListener('toggle',()=>{if(details.open)historicalPriceChart(document.querySelector('#overview-symbol')?.value||'__all__',10000);});
     }
     const detail=document.querySelector('#view-detail .kpi-grid');
-    if(detail && !document.querySelector('#company-profile')) detail.insertAdjacentHTML('beforebegin','<article id="company-profile" class="company-profile"><div><span class="eyebrow">DOANH NGHIỆP ĐANG CHỌN</span><h2>—</h2><p></p></div><span class="company-sector"></span></article><article id="detail-analysis" class="analysis-panel"></article>');
+    if(detail && !document.querySelector('#company-profile')) detail.insertAdjacentHTML('beforebegin','<article id="company-profile" class="company-profile"><div><span class="eyebrow">DOANH NGHIỆP ĐANG CHỌN</span><h2>—</h2><p></p></div><span class="company-sector"></span><button type="button" class="button button-secondary" data-quick-watch-current>＋ Thêm vào danh mục</button></article><article id="detail-analysis" class="analysis-panel"></article>');
     const detailGrid=document.querySelector('#view-detail .content-grid');
     if(detailGrid && !document.querySelector('#bookwalk-panel')) detailGrid.insertAdjacentHTML('beforeend','<article id="bookwalk-panel" class="panel detail-bookwalk-panel"><div class="panel-heading"><div><h2>Mô phỏng đi bộ sổ lệnh</h2><p>Ước lượng tĩnh trên cùng ảnh chụp dữ liệu (snapshot), không gửi lệnh</p></div></div><div class="bookwalk-layout"><div><div class="filter-bar bookwalk-controls"><label>Chiều<select id="bookwalk-side"><option value="buy">Mua theo giá bán (ask)</option><option value="sell">Bán theo giá mua (bid)</option></select></label><label>Khối lượng (cổ phiếu)<input id="bookwalk-quantity" type="number" min="100" step="100" value="10000"></label><label>Trượt giá tối đa (điểm cơ bản, bps)<input id="bookwalk-slippage" type="number" min="0" step="1" value="10"></label><button id="bookwalk-run" class="button button-primary" type="button">Mô phỏng</button></div><div id="bookwalk-result" class="analysis-note">Nhập khối lượng rồi chọn Mô phỏng. Tỷ lệ chỉ đo phần lượng được sổ lệnh ba mức giá đầu đáp ứng trong ảnh chụp dữ liệu (snapshot), không phải xác suất khớp lệnh thực tế.</div></div><aside class="bookwalk-formula"><h3>Cách tính trên sổ lệnh đang hiển thị</h3><p><b>Giá giữa</b> = (giá mua mức 1 + giá bán mức 1) ÷ 2</p><p><b>VWAP</b> = tổng (giá × lượng lấy ở từng mức) ÷ tổng lượng khớp</p><p><b>Trượt giá</b> = chênh VWAP với giá giữa ÷ giá giữa × 10.000 bps</p><p><b>Tỷ lệ khớp mô phỏng</b> = lượng đáp ứng ÷ lượng yêu cầu</p><small>Mua đi qua ask mức 1→3; bán đi qua bid mức 1→3. Phương pháp dùng sổ lệnh hiển thị để ước lượng tác động giá; xem <a href="https://arxiv.org/abs/1011.6402" target="_blank" rel="noreferrer">Cont, Kukanov &amp; Stoikov (2014)</a>. Đây là phép tính tĩnh, không bao gồm lệnh ẩn, hủy lệnh, ưu tiên hàng đợi hay phản ứng thị trường.</small></aside></div></article>');
+    const detailSpreadPanel=document.querySelector('#detail-spread-chart')?.closest('.panel');
+    if(detailSpreadPanel&&!document.querySelector('#detail-history-range-controls')){detailSpreadPanel.querySelector('.panel-heading')?.insertAdjacentHTML('afterend','<div id="detail-history-range-controls" class="history-range-controls"><div class="history-range-presets" role="group" aria-label="Khoảng lịch sử spread"><button type="button" data-detail-range="1y">1 năm</button><button type="button" data-detail-range="3y">3 năm</button><button type="button" data-detail-range="5y">5 năm</button><button type="button" data-detail-range="all">Tất cả</button></div><label>Từ ngày<input id="detail-history-from" type="date"></label><label>Đến ngày<input id="detail-history-to" type="date"></label><button id="detail-history-apply" class="button button-secondary" type="button">Áp dụng</button><small>Spread chỉ có trong giai đoạn SSI đã lưu quote; không suy ra từ OHLC ngày.</small></div>');setDetailRange('1y');}
     const methodology=document.querySelector('#view-methodology .content-grid');
     if(methodology && !document.querySelector('#quality-summary')){const quality=document.createElement('article');quality.className='panel panel-wide methodology-quality';quality.innerHTML='<div class="panel-heading"><div><p class="eyebrow">KIỂM TRA DỮ LIỆU</p><h2>Chất lượng và lịch sử bộ thu thập dữ liệu (collector)</h2><p>Đếm ảnh chụp dữ liệu (snapshot) đã lưu và các lần chạy nhận dữ liệu.</p></div><span class="method-icon" aria-hidden="true">◉</span></div><div id="quality-summary" class="kpi-grid"></div><div id="collector-runs"></div>';const methodPanel=methodology.querySelector('#method-content')?.closest('.panel');if(methodPanel)methodPanel.before(quality);else methodology.appendChild(quality);}
     const methodHeading=document.querySelector('#view-methodology .page-heading');
@@ -425,18 +432,34 @@
     if(!event.target?.closest?.('.detail-symbol-picker')){const box=document.querySelector('#detail-symbol-options'),input=document.querySelector('#detail-symbol-search');box?.classList.add('hidden');input?.setAttribute('aria-expanded','false');}
   });
   document.addEventListener('change',event=>{if(event.target?.id==='detail-symbol')updateDetailCompanyName();});
-  let historyPage=1, historySearch="", historyTotal=0, historyTimer=null;
+  let historyPage=1, historySearch="", historyTotal=0, historyTimer=null,historyRange='1y';
+  function historyDateString(date){return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;}
+  function applyRangeToInputs(range,fromSelector,toSelector){
+    const end=new Date(),start=new Date(end);if(range==='1y')start.setFullYear(start.getFullYear()-1);else if(range==='3y')start.setFullYear(start.getFullYear()-3);else if(range==='5y')start.setFullYear(start.getFullYear()-5);else if(range==='all')start.setFullYear(2000,0,1);
+    const from=document.querySelector(fromSelector),to=document.querySelector(toSelector);if(from)from.value=range==='all'?'':historyDateString(start);if(to)to.value=historyDateString(end);
+  }
+  function overviewDateParams(){const from=document.querySelector('#overview-history-from')?.value,to=document.querySelector('#overview-history-to')?.value;return {from,to,query:`${from?'&from_date='+encodeURIComponent(from):''}${to?'&to_date='+encodeURIComponent(to):''}`};}
+  function setOverviewRange(range){applyRangeToInputs(range,'#overview-history-from','#overview-history-to');applyRangeToInputs(range,'#history-from-date','#history-to-date');historyRange=range;document.querySelectorAll('[data-overview-range]').forEach(button=>button.classList.toggle('active',button.dataset.overviewRange===range));document.querySelectorAll('[data-history-range]').forEach(button=>button.classList.toggle('active',button.dataset.historyRange===range));}
+  function setDetailRange(range){applyRangeToInputs(range,'#detail-history-from','#detail-history-to');document.querySelectorAll('[data-detail-range]').forEach(button=>button.classList.toggle('active',button.dataset.detailRange===range));}
+  function setHistoryRange(range){
+    historyRange=range;applyRangeToInputs(range,'#history-from-date','#history-to-date');
+    document.querySelectorAll('[data-history-range]').forEach(button=>button.classList.toggle('active',button.dataset.historyRange===range));
+  }
   async function historicalPriceChart(chosen, limit) {
     const node=document.querySelector('#historical-price-chart'), summary=document.querySelector('#historical-price-summary');if(!node)return;
     try {
       if(chosen!=='__all__'){
+        const controls=document.querySelector('#history-range-controls');if(controls)controls.hidden=false;
+        if(!document.querySelector('#history-to-date')?.value)setHistoryRange(historyRange);
         node.classList.remove('history-all-mode');const chartHeading=document.querySelector('#history-chart-heading');if(chartHeading)chartHeading.textContent=`Giá đóng cửa lịch sử SSI · ${chosen}`;
-        const data=await call(`/api/price-history?limit=${limit}&symbol=${encodeURIComponent(chosen)}`),rows=(data.series_by_symbol||{})[chosen]||[];
+        const params=new URLSearchParams({limit:String(limit),symbol:chosen}),from=document.querySelector('#history-from-date')?.value,to=document.querySelector('#history-to-date')?.value;if(from)params.set('from_date',from);if(to)params.set('to_date',to);
+        const data=await call(`/api/price-history?${params}`),rows=(data.series_by_symbol||{})[chosen]||[];
         lineChart(node,[{name:chosen,rows,color:'#008A45'}],'close_price',`Giá đóng cửa lịch sử SSI · ${chosen}`);
         if(summary)summary.innerHTML=rows.length?`<div class="historical-price-table"><b>Mã</b><b>Ngày</b><b>Giá đóng cửa</b><b>Khối lượng</b>${rows.slice(-1).map(r=>`<span>${esc(chosen)}</span><span>${esc(r.trading_date)}</span><strong>${num(r.close_price,0)} đ</strong><span>${num(r.volume,0)}</span>`).join('')}</div>`:'<div class="empty-state">SSI chưa trả về giá lịch sử cho mã này.</div>';
       }else{
+        const controls=document.querySelector('#history-range-controls');if(controls)controls.hidden=true;
         node.classList.add('history-all-mode');const chartHeading=document.querySelector('#history-chart-heading');if(chartHeading)chartHeading.textContent='Độ rộng thị trường SSI · số mã tăng / giảm theo phiên';
-        const [data,breadth]=await Promise.all([call(`/api/price-history?page=${historyPage}&page_size=50&search=${encodeURIComponent(historySearch)}`),call('/api/market-breadth?limit=90')]);historyTotal=data.total||0;
+        const range=overviewDateParams();const [data,breadth]=await Promise.all([call(`/api/price-history?page=${historyPage}&page_size=50&search=${encodeURIComponent(historySearch)}`),call(`/api/market-breadth?limit=10000${range.query}`)]);historyTotal=data.total||0;
         const marketRows=breadth.rows||[];lineChart(node,[{name:'Mã tăng giá · xanh lá',rows:marketRows.map(r=>({...r,count:r.advancing})),color:'#008A45'},{name:'Mã giảm giá · đỏ',rows:marketRows.map(r=>({...r,count:r.declining})),color:'#E2231A'}],'count','Số mã tăng / giảm theo phiên');
         if(summary){const rows=data.rows||[];summary.innerHTML=rows.length?`<div class="historical-price-table"><b>Mã</b><b>Doanh nghiệp / sàn</b><b>Ngày · giá đóng cửa</b><b>Khối lượng</b>${rows.map(r=>`<span><button type="button" class="history-symbol-link" data-history-symbol="${esc(r.symbol)}">${esc(r.symbol)}</button></span><span>${esc(r.name_vi||'—')} · ${esc(r.board||'—')}</span><strong>${r.close_price==null?'<i class="history-missing">SSI không trả OHLC lịch sử</i>':`${esc(r.trading_date)} · ${num(r.close_price,0)} đ`}</strong><span>${r.volume==null?'—':num(r.volume,0)}</span>`).join('')}</div>`:'<div class="empty-state">Không có mã phù hợp trong catalog SSI.</div>';}
         const pages=Math.max(1,Math.ceil(historyTotal/50));const status=document.querySelector('#history-page-status');if(status)status.textContent=`Trang ${historyPage} / ${pages} · ${num(historyTotal,0)} mã cổ phiếu`;
@@ -468,7 +491,7 @@
       const rank=index+1,previous=prevRanks.spread.get(r.symbol),delta=previous==null?null:previous-rank;
       const move=delta==null?(hadPrevious?'<span class="rank-change new">Mới</span>':''):delta>0?`<span class="rank-change up">↑ ${delta} hạng</span>`:delta<0?`<span class="rank-change down">↓ ${Math.abs(delta)} hạng</span>`:'<span class="rank-change same">—</span>';
       const bars=Number(r.sample_count??r.bar_count??0),snapshots=Number(r.snapshot_count??0);
-      return `<tr class="ranking-row${delta>0?' moved-up':delta<0?' moved-down':''}"><td><span class="rank-number">${rank}</span>${move}</td><td><button type="button" class="rank-symbol" aria-controls="overview-ranking-tooltip" aria-expanded="false" aria-label="Xem phân tích ${esc(r.symbol)}" data-symbol="${esc(r.symbol)}" data-board="${esc(r.board||'—')}" data-rank="${rank}" data-total="${eligible}" data-ticks="${num(r.median_spread_ticks,2)}" data-bps="${num(r.median_spread_bps,2)}" data-depth="${num(r.median_total_depth_value,0)}" data-bars="${num(bars,0)}" data-snapshots="${num(snapshots,0)}" data-window="${windowMinutes}">${esc(r.symbol)}</button><small class="rank-exchange">${esc(r.board||'—')}</small></td></tr>`;
+      return `<tr class="ranking-row${delta>0?' moved-up':delta<0?' moved-down':''}"><td><span class="rank-number">${rank}</span>${move}</td><td><button type="button" class="rank-symbol" aria-controls="overview-ranking-tooltip" aria-expanded="false" aria-label="Xem phân tích ${esc(r.symbol)}" data-symbol="${esc(r.symbol)}" data-board="${esc(r.board||'—')}" data-rank="${rank}" data-total="${eligible}" data-ticks="${num(r.median_spread_ticks,2)}" data-bps="${num(r.median_spread_bps,2)}" data-depth="${num(r.median_total_depth_value,0)}" data-bars="${num(bars,0)}" data-snapshots="${num(snapshots,0)}" data-window="${windowMinutes}">${esc(r.symbol)}</button><small class="rank-exchange">${esc(r.board||'—')}</small><button type="button" class="quick-watch-button" data-quick-watch-symbol="${esc(r.symbol)}">＋ Danh mục</button></td></tr>`;
     }).join('');
     prevRanks.spread.clear();items.forEach((r,index)=>prevRanks.spread.set(r.symbol,index+1));hideRankingPopover();
     panel.innerHTML=`<div class="ranking-board"><div class="ranking-board-meta"><span class="ranking-live-dot${isLive?' live':''}"></span><b>${num(eligible,0)} mã đủ điều kiện</b><span>${isLive?'Thứ hạng thay đổi theo dữ liệu SSI mới':'Thứ hạng theo bar SSI đã lưu gần nhất'}</span></div><div class="ranking-table-scroll"><table class="ranking-table ranking-preview-table"><thead><tr><th>HẠNG</th><th>MÃ / SÀN</th></tr></thead><tbody>${tableRows}</tbody></table></div><div class="ranking-board-note">Rê hoặc bấm vào mã để xem spread, độ sâu và số mẫu. Chọn “Xem tất cả” để mở bảng chỉ số đầy đủ.</div></div>`;
@@ -502,7 +525,7 @@
   async function loadMarketTurnover(){
     const host=document.querySelector('#market-turnover-chart');if(!host)return;
     const priorTip=document.querySelector('#turnover-tooltip');if(priorTip)priorTip.hidden=true;
-    try{turnoverPayload=await call(`/api/market-turnover?limit=60&metric=${turnoverMetric}`);const k=turnoverPayload.kpis||{},unit=turnoverPayload.unit;
+    try{const range=overviewDateParams();turnoverPayload=await call(`/api/market-turnover?limit=10000&metric=${turnoverMetric}${range.query}`);const k=turnoverPayload.kpis||{},unit=turnoverPayload.unit;
       document.querySelectorAll('[data-turnover-metric]').forEach(b=>b.classList.toggle('active',b.dataset.turnoverMetric===turnoverMetric));
       const cards=document.querySelector('#market-turnover-kpis');if(cards)cards.innerHTML=`<article><span>Phiên có dữ liệu SSI gần nhất · ${esc(k.latest_date||'—')}</span><strong>${num(k.latest_value,2)} ${esc(unit)}</strong><small>Tổng hợp dữ liệu ${esc(turnoverPayload.source||'SSI')}</small></article><article><span>Bằng bao nhiêu % trung bình 20 phiên</span><strong>${k.ratio_to_average20_pct==null?'Chưa đủ dữ liệu':num(k.ratio_to_average20_pct,0)+'%'}</strong><small>100% = bằng trung bình · ${k.average20==null?'—':num(k.average20,2)+' '+esc(unit)}</small></article><article><span>Vị trí trong ${num(k.sessions_in_window,0)} phiên</span><strong>${k.higher_than_pct==null?'—':'Cao hơn '+num(k.higher_than_pct,0)+'%'}</strong><small>Số phiên có giá trị thấp hơn</small></article>`;
       const note=document.querySelector('#market-turnover-note');if(note)note.textContent=turnoverPayload.pending_ohlc_missing?`${turnoverPayload.note} Cột viền đậm là phiên có dữ liệu gần nhất; viền đứt là phiên chưa kết thúc.`:`Nguồn: OHLC ngày SSI · ${turnoverPayload.as_of?'lưu lúc '+turnoverPayload.as_of:'chưa rõ thời điểm lưu'}. Cột viền đậm là phiên có dữ liệu gần nhất; viền đứt là phiên chưa kết thúc. ${turnoverPayload.note||''}`;
@@ -513,7 +536,7 @@
   async function showHistoricalInOverview(chosen,status){
     const all=chosen==='__all__';
     if(all){
-      const d=await call('/api/market-breadth?limit=90'),rawRows=d.rows||[],rawLatest=rawRows[rawRows.length-1];
+      const range=overviewDateParams(),d=await call(`/api/market-breadth?limit=10000${range.query}`),rawRows=d.rows||[],rawLatest=d.rows?.[d.rows.length-1];
       const expectedDate=String(status.session_date||'').replaceAll('-','/'),actualDate=String(rawLatest?.trading_date||'').replaceAll('-','/');
       const syncState=status.meta?.session_sync?.status;
       const pendingSync=!!expectedDate&&(expectedDate!==actualDate||['not_started','closed_ohlc_pending','ohlc_incomplete'].includes(syncState));
@@ -534,7 +557,7 @@
       document.querySelector('#imbalance-reading').textContent=`Phiên ${latest?.trading_date||'—'}: ${num(latest?.advancing,0)} mã tăng, ${num(latest?.declining,0)} mã giảm, ${num(latest?.unchanged,0)} mã đứng giá.`;
       document.querySelector('#overview-analysis').textContent=pendingSync?`Ngoài giờ giao dịch · Dữ liệu OHLC ngày ${expectedDate} chưa được đồng bộ đầy đủ từ SSI. Các biểu đồ lịch sử đang giữ phiên gần nhất có dữ liệu (${latest?.trading_date||'—'}); không gắn nhãn phiên đó là dữ liệu ngày ${expectedDate}. Tiến độ đồng bộ: ${num(status.historical_symbols_processed||0,0)} / ${num(status.historical_symbols_total||0,0)} mã.`:`Ngoài giờ giao dịch · dữ liệu OHLC lịch sử SSI cho ${num(status.historical_symbols_with_data||0,0)} mã. Các thẻ và biểu đồ trên đang tóm tắt giá/khối lượng phiên ${latest?.trading_date||'—'}; đây không phải chỉ số spread/depth của sổ lệnh.`;
     }else{
-      const d=await call(`/api/price-history?symbol=${encodeURIComponent(chosen)}&limit=90`),rawRows=(d.series_by_symbol||{})[chosen]||[];
+      const range=overviewDateParams(),d=await call(`/api/price-history?symbol=${encodeURIComponent(chosen)}&limit=10000${range.query}`),rawRows=(d.series_by_symbol||{})[chosen]||[];
       const expectedDate=String(status.session_date||'').replaceAll('-','/'),rawLatest=rawRows[rawRows.length-1],actualDate=String(rawLatest?.trading_date||'').replaceAll('-','/'),syncState=status.meta?.session_sync?.status;
       const pendingSync=!!expectedDate&&(expectedDate!==actualDate||['not_started','closed_ohlc_pending','ohlc_incomplete'].includes(syncState));
       const rows=pendingSync&&actualDate===expectedDate?rawRows.slice(0,-1):rawRows,latest=rows[rows.length-1],prior=rows[rows.length-2];
@@ -555,6 +578,7 @@
       document.querySelector('#overview-ranking').innerHTML=latest?window.table(['Mã','Ngày','Cao nhất','Thấp nhất','Biên độ','Giá trị giao dịch'],[[`<b>${esc(chosen)}</b>`,esc(latest.trading_date),num(latest.high_price,0)+' đ',num(latest.low_price,0)+' đ',num(Number(latest.high_price)-Number(latest.low_price),0)+' đ',num(Number(latest.value||0)/1e9,2)+' tỷ']]):'<div class="empty-state">SSI chưa có OHLC cho mã đã chọn.</div>';
       document.querySelector('#imbalance-reading').textContent=latest?`${chosen} đóng cửa ${num(latest.close_price,0)} đ ngày ${latest.trading_date}; thay đổi phiên ${change==null?'—':num(change,2)+'%'}.`:'Chưa có OHLC lịch sử cho mã này.';
       document.querySelector('#overview-analysis').textContent=pendingSync?`Ngoài giờ giao dịch · Dữ liệu OHLC ngày ${expectedDate} chưa được đồng bộ từ SSI. Đang giữ dữ liệu gần nhất của ${chosen} ở phiên ${latest?.trading_date||'—'} và đánh dấu rõ là dữ liệu cũ.`:`Ngoài giờ giao dịch · OHLC SSI của ${chosen}: đóng cửa ${num(latest?.close_price,0)} đ, khối lượng ${num(latest?.volume,0)} cổ phiếu, phiên ${latest?.trading_date||'—'}. Các số liệu này là lịch sử, không phải quote sổ lệnh.`;
+      void historicalPriceChart(chosen,10000);
     }
     const statusText=document.querySelector('#overview-data-context');if(statusText)statusText.textContent=`WebSocket SSI ${status.connection_status==='connected'?'đã kết nối':'chưa kết nối'} · đăng ký quote ${status.subscription_status==='confirmed'?'đã xác nhận cho '+(status.subscribed_boards||[]).join(', '):status.subscription_status||'đang kiểm tra'}. Ngoài phiên: đang hiển thị giá/khối lượng lịch sử ở cùng các thẻ và biểu đồ tổng quan.`;
   }
@@ -628,7 +652,9 @@
     const ticker=document.querySelector('#detail-symbol')?.value;
     if(!ticker)return;
     try{
-      const d=await call('/api/detail/'+encodeURIComponent(ticker)+'?window_sessions=5');
+      const detailFrom=document.querySelector('#detail-history-from')?.value,detailTo=document.querySelector('#detail-history-to')?.value;
+      const detailRange=`${detailFrom?'&from_date='+encodeURIComponent(detailFrom):''}${detailTo?'&to_date='+encodeURIComponent(detailTo):''}`;
+      const d=await call('/api/detail/'+encodeURIComponent(ticker)+'?window_sessions=5'+detailRange);
       const widget=name=>d.widgets?.[name]?.status==='ready'?d.widgets[name].data:null;
       const company=widget('company'),book=widget('orderbook'),k=widget('kpis'),charts=widget('charts'),history=widget('history');
       const profile=document.querySelector('#company-profile');
@@ -654,7 +680,7 @@
       if(depthHeading)depthHeading.textContent=showCumulative?`Đường tích lũy dùng ${num(charts?.levels_used??d.widgets?.charts?.data?.levels_used??3,0)} mức SSI đã lưu · tối đa 10 nếu nguồn cung cấp`:'Giá trị niêm yết ba mức giá đầu theo từng phút';
       if(charts){
         const spreadRows=charts.spread||[];
-        overviewChartHeading('detail-spread-chart',`Spread theo thời gian · ${ticker}`,`Cửa sổ ${charts.window_sessions} phiên · cùng mốc dữ liệu ${window.fmtTime(d.as_of)} · ${charts.baseline_eligible?'dải P10–P90 dùng bar cùng pha của các phiên trước':'chưa đủ bar nền, không dựng dải giả'}`);
+        overviewChartHeading('detail-spread-chart',`Spread theo thời gian · ${ticker}`,`${charts.session_dates?.length||0} phiên có bar trong khoảng chọn · mốc ${window.fmtTime(d.as_of)} · ${charts.baseline_eligible?'mốc tham chiếu dùng phiên trước':'chưa đủ dữ liệu tham chiếu'}`);
         const lines=[{name:'Spread mã '+ticker,rows:spreadRows,color:'#008A45'}];
         if(charts.baseline_eligible){lines.push({name:'P10 baseline',rows:spreadRows.map(r=>({...r,spread_bps:r.baseline_p10})),color:'#8aa897'},{name:'P90 baseline',rows:spreadRows.map(r=>({...r,spread_bps:r.baseline_p90})),color:'#b6c8bd'});}
         lineChart(document.querySelector('#detail-spread-chart'),lines,'spread_bps',`Spread ${ticker} · điểm cơ bản (bps)`);
@@ -705,6 +731,37 @@
     document.querySelector('#ranking-limit')?.addEventListener('change',()=>baseRankings?.());
     document.querySelector('#ranking-board')?.addEventListener('change',()=>baseRankings?.());
     document.addEventListener('click',event=>{const button=event.target?.closest?.('[data-turnover-metric]');if(!button)return;const metric=button.dataset.turnoverMetric;if(!['value','volume'].includes(metric)||metric===turnoverMetric)return;turnoverMetric=metric;turnoverSignature='';loadMarketTurnover();});
+    document.addEventListener('click',event=>{
+      const overviewPreset=event.target?.closest?.('[data-overview-range]');
+      if(overviewPreset){setOverviewRange(overviewPreset.dataset.overviewRange);void enhancedOverview();return;}
+      if(event.target?.id==='overview-history-apply'){
+        const from=document.querySelector('#overview-history-from')?.value,to=document.querySelector('#overview-history-to')?.value;
+        if(from&&to&&from>to){const node=document.querySelector('#overview-analysis');if(node)node.textContent='Ngày bắt đầu phải trước hoặc bằng ngày kết thúc.';return;}
+        const historyFrom=document.querySelector('#history-from-date'),historyTo=document.querySelector('#history-to-date');if(historyFrom)historyFrom.value=from||'';if(historyTo)historyTo.value=to||'';
+        document.querySelectorAll('[data-overview-range]').forEach(button=>button.classList.remove('active'));void enhancedOverview();return;
+      }
+      const detailPreset=event.target?.closest?.('[data-detail-range]');
+      if(detailPreset){setDetailRange(detailPreset.dataset.detailRange);void enhancedDetail();return;}
+      if(event.target?.id==='detail-history-apply'){
+        const from=document.querySelector('#detail-history-from')?.value,to=document.querySelector('#detail-history-to')?.value;
+        if(from&&to&&from>to){const node=document.querySelector('#detail-spread-chart');if(node)node.innerHTML='<div class="empty-state">Ngày bắt đầu phải trước hoặc bằng ngày kết thúc.</div>';return;}
+        document.querySelectorAll('[data-detail-range]').forEach(button=>button.classList.remove('active'));void enhancedDetail();return;
+      }
+    });
+    ['#overview-history-from','#overview-history-to'].forEach(selector=>document.querySelector(selector)?.addEventListener('change',()=>document.querySelectorAll('[data-overview-range]').forEach(button=>button.classList.remove('active'))));
+    ['#detail-history-from','#detail-history-to'].forEach(selector=>document.querySelector(selector)?.addEventListener('change',()=>document.querySelectorAll('[data-detail-range]').forEach(button=>button.classList.remove('active'))));
+    document.addEventListener('click',event=>{
+      const preset=event.target?.closest?.('[data-history-range]');
+      if(preset){setHistoryRange(preset.dataset.historyRange);const chosen=document.querySelector('#overview-symbol')?.value||'__all__';if(chosen!=='__all__')historicalPriceChart(chosen,10000);return;}
+      if(event.target?.id==='history-apply-dates'){
+        const from=document.querySelector('#history-from-date')?.value,to=document.querySelector('#history-to-date')?.value,note=document.querySelector('#historical-price-note'),chosen=document.querySelector('#overview-symbol')?.value||'__all__';
+        if(from&&to&&from>to){if(note)note.textContent='Ngày bắt đầu phải trước hoặc bằng ngày kết thúc.';return;}
+        historyRange='custom';document.querySelectorAll('[data-history-range]').forEach(button=>button.classList.remove('active'));if(chosen!=='__all__')historicalPriceChart(chosen,10000);
+      }
+    });
+    ['#history-from-date','#history-to-date'].forEach(selector=>document.querySelector(selector)?.addEventListener('change',()=>{
+      historyRange='custom';document.querySelectorAll('[data-history-range]').forEach(button=>button.classList.remove('active'));
+    }));
     document.addEventListener('click',e=>{if(e.target?.closest?.('[data-retry-liquidity-map]')){liquidityMapCache=null;loadResearchPanels(null,Number(document.querySelector('#overview-limit')?.value||60));}});
   }
   function init(){
@@ -716,7 +773,7 @@
     window.loadOverview=enhancedOverview;window.loadDetail=enhancedDetail;window.loadRankings=enhancedRankings;
     window.loadAlerts=enhancedAlerts;window.loadMethodology=enhancedMethodology;
     let refreshing=false;
-    window.enhancedRefresh=async()=>{if(refreshing)return;refreshing=true;try{if(state.route==='overview')await enhancedOverview();if(state.route==='detail')await enhancedDetail();if(state.route==='rankings')await enhancedRankings();if(state.route==='alerts')await enhancedAlerts();}finally{refreshing=false;}};
+    window.enhancedRefresh=async()=>{if(refreshing)return;refreshing=true;try{if(state.route==='overview')await enhancedOverview();if(state.route==='detail')await enhancedDetail();if(state.route==='rankings')await enhancedRankings();if(state.route==='alerts')await enhancedAlerts();if(state.route==='watchlist')await window.loadWatchlist?.(true,true);}finally{refreshing=false;}};
     window.MarketClock?.subscribe(()=>window.enhancedRefresh());
     if(!document.querySelector('#application').classList.contains('hidden'))window.setRoute(state.route||'overview');
     // Bootstrap the map after layout paint in case the restored overview route fires
@@ -735,8 +792,8 @@
     document.addEventListener('DOMContentLoaded',bootstrapLiquidityMap,{once:true});
   }else{init();bootstrapLiquidityMap();}
 
-  document.addEventListener('input',e=>{if(e.target?.id==='history-symbol-search'){clearTimeout(historyTimer);historyTimer=setTimeout(()=>{historySearch=e.target.value.trim();historyPage=1;const exact=state.symbols.find(symbol=>symbol.toUpperCase()===historySearch.toUpperCase());const selector=document.querySelector('#overview-symbol');if(exact&&selector){selector.value=exact;enhancedOverview();}else{if(selector)selector.value='__all__';historicalPriceChart('__all__',90);}},250);}});
-  document.addEventListener('click',e=>{const symbolButton=e.target?.closest?.('[data-history-symbol]');if(symbolButton){const symbol=symbolButton.dataset.historySymbol,selector=document.querySelector('#overview-symbol'),search=document.querySelector('#history-symbol-search');if(selector)selector.value=symbol;if(search)search.value=symbol;historySearch=symbol;enhancedOverview();return;}if(e.target?.id==='history-prev'){historyPage=Math.max(1,historyPage-1);historicalPriceChart('__all__',90);}if(e.target?.id==='history-next'){historyPage++;historicalPriceChart('__all__',90);}});
+  document.addEventListener('input',e=>{if(e.target?.id==='history-symbol-search'){clearTimeout(historyTimer);historyTimer=setTimeout(()=>{historySearch=e.target.value.trim();historyPage=1;const exact=state.symbols.find(symbol=>symbol.toUpperCase()===historySearch.toUpperCase());const selector=document.querySelector('#overview-symbol');if(exact&&selector){selector.value=exact;enhancedOverview();}else{if(selector)selector.value='__all__';historicalPriceChart('__all__',10000);}},250);}});
+  document.addEventListener('click',e=>{const symbolButton=e.target?.closest?.('[data-history-symbol]');if(symbolButton){const symbol=symbolButton.dataset.historySymbol,selector=document.querySelector('#overview-symbol'),search=document.querySelector('#history-symbol-search');if(selector)selector.value=symbol;if(search)search.value=symbol;historySearch=symbol;enhancedOverview();return;}if(e.target?.id==='history-prev'){historyPage=Math.max(1,historyPage-1);historicalPriceChart('__all__',10000);}if(e.target?.id==='history-next'){historyPage++;historicalPriceChart('__all__',10000);}});
 })();
 
 

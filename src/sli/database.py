@@ -419,6 +419,12 @@ def initialize():
         );
         CREATE INDEX IF NOT EXISTS ix_historical_prices_symbol_date
             ON historical_prices(source,symbol,timeframe,trading_date);
+        CREATE TABLE IF NOT EXISTS historical_backfill_state (
+            source TEXT NOT NULL, symbol TEXT NOT NULL, requested_from TEXT NOT NULL,
+            requested_to TEXT NOT NULL, status TEXT NOT NULL, pages_fetched INTEGER NOT NULL DEFAULT 0,
+            rows_fetched INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+            PRIMARY KEY(source,symbol)
+        );
         CREATE TABLE IF NOT EXISTS trade_ticks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT NOT NULL, symbol TEXT NOT NULL,
@@ -475,7 +481,32 @@ def initialize():
             threshold_value REAL, last_data_at TEXT, explanation TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS ix_system_alerts_status ON system_alerts(source,status,triggered_at);
+        -- Single local profile: no account or user data is written to the repo.
+        CREATE TABLE IF NOT EXISTS user_settings (
+            profile_id TEXT PRIMARY KEY CHECK(profile_id='local'),
+            standard_order_shares INTEGER NOT NULL DEFAULT 10000,
+            favorable_spread_pctl REAL NOT NULL DEFAULT 50,
+            stress_spread_pctl REAL NOT NULL DEFAULT 90,
+            favorable_depth_pctl REAL NOT NULL DEFAULT 50,
+            stress_depth_pctl REAL NOT NULL DEFAULT 10,
+            quiet_start TEXT, quiet_end TEXT,
+            notification_channel TEXT NOT NULL DEFAULT 'in_app',
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS watchlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS watchlist_items (
+            watchlist_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+            symbol TEXT NOT NULL, position INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '', added_at TEXT NOT NULL,
+            PRIMARY KEY(watchlist_id,symbol)
+        );
+        CREATE INDEX IF NOT EXISTS ix_watchlist_items_order ON watchlist_items(watchlist_id,position,symbol);
         """)
+        db.execute("INSERT OR IGNORE INTO user_settings(profile_id,updated_at) VALUES('local',?)",
+                   (datetime.now(config.TIMEZONE).isoformat(timespec='seconds'),))
         schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='observations'").fetchone()
         if schema and "'ssi'" not in (schema[0] or ""):
             db.execute("PRAGMA foreign_keys=OFF")
@@ -528,6 +559,131 @@ def _migrate_schema(db):
         for field, declaration in fields.items():
             if field not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {field} {declaration}")
+
+
+def get_local_settings():
+    with connect() as db:
+        row=db.execute("SELECT * FROM user_settings WHERE profile_id='local'").fetchone()
+    return dict(row) if row else {}
+
+
+def update_local_settings(values):
+    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
+             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+    updates={key:value for key,value in values.items() if key in allowed}
+    if not updates:return get_local_settings()
+    updates["updated_at"]=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
+    fields=",".join(f"{key}=?" for key in updates)
+    with connect() as db:
+        db.execute(f"UPDATE user_settings SET {fields} WHERE profile_id='local'",list(updates.values()))
+        row=db.execute("SELECT * FROM user_settings WHERE profile_id='local'").fetchone()
+    return dict(row) if row else {}
+
+
+def fetch_local_watchlists():
+    with connect() as db:
+        lists=db.execute("SELECT id,name,created_at,updated_at FROM watchlists ORDER BY id").fetchall()
+        items=db.execute("SELECT watchlist_id,symbol,position,note,added_at FROM watchlist_items ORDER BY watchlist_id,position,symbol").fetchall()
+    grouped={int(row["id"]):[] for row in lists}
+    for row in items:grouped[int(row["watchlist_id"])].append(dict(row))
+    return [{**dict(row),"items":grouped[int(row["id"])],"item_count":len(grouped[int(row["id"])])} for row in lists]
+
+
+def create_local_watchlist(name):
+    now=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
+    with connect() as db:
+        cursor=db.execute("INSERT INTO watchlists(name,created_at,updated_at) VALUES(?,?,?)",(name,now,now))
+        return int(cursor.lastrowid)
+
+
+def rename_local_watchlist(watchlist_id,name):
+    with connect() as db:
+        cursor=db.execute("UPDATE watchlists SET name=?,updated_at=? WHERE id=?",
+                          (name,datetime.now(config.TIMEZONE).isoformat(timespec='seconds'),watchlist_id))
+        return cursor.rowcount>0
+
+
+def delete_local_watchlist(watchlist_id):
+    with connect() as db:
+        cursor=db.execute("DELETE FROM watchlists WHERE id=?",(watchlist_id,))
+        return cursor.rowcount>0
+
+
+def add_local_watchlist_item(watchlist_id,symbol,note=''):
+    now=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
+    with connect() as db:
+        count=db.execute("SELECT COUNT(*) FROM watchlist_items WHERE watchlist_id=?",(watchlist_id,)).fetchone()[0]
+        if count>=50:raise ValueError("Mỗi danh sách tối đa 50 mã cổ phiếu.")
+        position=db.execute("SELECT COALESCE(MAX(position),-1)+1 FROM watchlist_items WHERE watchlist_id=?",(watchlist_id,)).fetchone()[0]
+        db.execute("INSERT INTO watchlist_items(watchlist_id,symbol,position,note,added_at) VALUES(?,?,?,?,?)",
+                   (watchlist_id,symbol,position,note,now))
+        db.execute("UPDATE watchlists SET updated_at=? WHERE id=?",(now,watchlist_id))
+
+
+def remove_local_watchlist_item(watchlist_id,symbol):
+    with connect() as db:
+        cursor=db.execute("DELETE FROM watchlist_items WHERE watchlist_id=? AND symbol=?",(watchlist_id,symbol.upper()))
+        return cursor.rowcount>0
+
+
+def update_local_watchlist_item_note(watchlist_id,symbol,note):
+    with connect() as db:
+        cursor=db.execute("UPDATE watchlist_items SET note=? WHERE watchlist_id=? AND symbol=?",
+                          (note,watchlist_id,symbol.upper()))
+        return cursor.rowcount>0
+
+
+def reorder_local_watchlist(watchlist_id,symbols):
+    now=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
+    with connect() as db:
+        current={row[0] for row in db.execute("SELECT symbol FROM watchlist_items WHERE watchlist_id=?",(watchlist_id,))}
+        if set(symbols)!=current or len(symbols)!=len(current):raise ValueError("Thứ tự phải chứa đúng các mã đang có trong danh sách.")
+        db.executemany("UPDATE watchlist_items SET position=? WHERE watchlist_id=? AND symbol=?",
+                       [(index,watchlist_id,symbol) for index,symbol in enumerate(symbols)])
+        db.execute("UPDATE watchlists SET updated_at=? WHERE id=?",(now,watchlist_id))
+
+
+def replace_local_profile(settings,watchlists):
+    now=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
+    with connect() as db:
+        db.execute("SAVEPOINT import_local_profile")
+        try:
+            allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
+                     "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+            clean={key:value for key,value in settings.items() if key in allowed}
+            if clean:
+                assignments=",".join(f"{key}=?" for key in clean)
+                db.execute(f"UPDATE user_settings SET {assignments},updated_at=? WHERE profile_id='local'",[*clean.values(),now])
+            db.execute("DELETE FROM watchlists")
+            for item in watchlists:
+                cursor=db.execute("INSERT INTO watchlists(name,created_at,updated_at) VALUES(?,?,?)",(item["name"],now,now))
+                list_id=cursor.lastrowid
+                for position,entry in enumerate(item["items"]):
+                    db.execute("INSERT INTO watchlist_items(watchlist_id,symbol,position,note,added_at) VALUES(?,?,?,?,?)",
+                               (list_id,entry["symbol"],position,entry.get("note",''),now))
+            db.execute("RELEASE SAVEPOINT import_local_profile")
+        except Exception:
+            db.execute("ROLLBACK TO SAVEPOINT import_local_profile")
+            db.execute("RELEASE SAVEPOINT import_local_profile")
+            raise
+
+
+def backup_local_profile_json():
+    """Save only the local user profile before an import replaces it."""
+    import json
+    from pathlib import Path
+    settings=get_local_settings()
+    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
+             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+    payload={"format":"sli-local-profile-v1","settings":{key:settings[key] for key in allowed},
+             "watchlists":[{"name":row["name"],"items":[{"symbol":item["symbol"],"note":item["note"]} for item in row["items"]]}
+                           for row in fetch_local_watchlists()]}
+    folder=Path(config.DB_PATH).parent
+    folder.mkdir(parents=True,exist_ok=True)
+    stamp=datetime.now(config.TIMEZONE).strftime("%Y%m%d-%H%M%S")
+    target=folder/f"local-profile-backup-{stamp}.json"
+    target.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+    return target.name
 
 
 def _insert(db, observation, source, refresh_bar=True):
@@ -844,6 +1000,22 @@ def count_historical_symbols(source='ssi'):
     with connect() as db:
         return db.execute("SELECT COUNT(DISTINCT symbol) FROM historical_prices WHERE source=? AND timeframe='1d'",(source,)).fetchone()[0]
 
+def historical_backfill_states(source="ssi", requested_from=None):
+    with connect() as db:
+        rows=db.execute("SELECT symbol,requested_to,status FROM historical_backfill_state WHERE source=? AND requested_from=?",
+                        (source,requested_from or config.HISTORY_START_DATE)).fetchall()
+    return {row["symbol"]:dict(row) for row in rows}
+
+def set_historical_backfill_state(symbol, requested_from, requested_to, status, pages_fetched, rows_fetched, source="ssi"):
+    with connect() as db:
+        db.execute("""INSERT INTO historical_backfill_state(
+            source,symbol,requested_from,requested_to,status,pages_fetched,rows_fetched,updated_at)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(source,symbol) DO UPDATE SET
+            requested_from=excluded.requested_from,requested_to=excluded.requested_to,status=excluded.status,
+            pages_fetched=excluded.pages_fetched,rows_fetched=excluded.rows_fetched,updated_at=excluded.updated_at""",
+            (source,symbol.upper(),requested_from,requested_to,status,int(pages_fetched),int(rows_fetched),
+             datetime.now(config.TIMEZONE).isoformat(timespec="seconds")))
+
 def upsert_historical_prices(symbol, bars, source="ssi"):
     fetched_at = datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
     saved = 0
@@ -867,17 +1039,23 @@ def upsert_historical_prices(symbol, bars, source="ssi"):
     return saved
 
 
-def fetch_historical_prices(symbol=None, limit=90, source="ssi", exclude_date=None):
+def fetch_historical_prices(symbol=None, limit=90, source="ssi", exclude_date=None, start_date=None, end_date=None):
     query="SELECT symbol,trading_date,timeframe,open_price,high_price,low_price,close_price,volume,value,fetched_at FROM historical_prices WHERE source=? AND timeframe='1d'"
     args=[source]
     if symbol:
         query += " AND symbol=?"
         args.append(symbol.upper())
+    if start_date:
+        query += " AND replace(trading_date,'/','-')>=?"
+        args.append(str(start_date).replace("/", "-")[:10])
+    if end_date:
+        query += " AND replace(trading_date,'/','-')<=?"
+        args.append(str(end_date).replace("/", "-")[:10])
     if exclude_date:
         query += " AND trading_date<>?"
         args.append(str(exclude_date).replace("-","/")[:10])
     query += " ORDER BY trading_date DESC LIMIT ?"
-    args.append(max(1,min(int(limit),1000)))
+    args.append(max(1,min(int(limit),10000)))
     with connect() as db:
         rows=db.execute(query,args).fetchall()
     return list(reversed([dict(row) for row in rows]))
@@ -911,6 +1089,16 @@ def fetch_alerts(source, limit=100):
             (source, max(1, min(int(limit), 500)))).fetchall()
     combined = [dict(row) for row in rows] + [dict(row) for row in system_rows]
     return sorted(combined, key=lambda row: row["triggered_at"], reverse=True)[:max(1, min(int(limit), 500))]
+
+
+def count_active_alerts_by_symbol(source, symbols):
+    clean=sorted({str(symbol).upper() for symbol in symbols if symbol})
+    if not clean:return {}
+    placeholders=",".join("?" for _ in clean)
+    with connect() as db:
+        rows=db.execute(f"SELECT symbol,COUNT(*) AS n FROM alerts WHERE source=? AND status='active' AND symbol IN ({placeholders}) GROUP BY symbol",
+                         [source,*clean]).fetchall()
+    return {row["symbol"]:int(row["n"]) for row in rows}
 def add_demo_tick():
     """Append one clearly synthetic snapshot per default demo symbol."""
     import random
@@ -1082,8 +1270,8 @@ def list_catalog_boards(source="ssi"):
     return [row["board"] for row in rows]
 
 
-def fetch_market_breadth(limit=90, source="ssi"):
-    limit=max(2,min(int(limit),1000))
+def fetch_market_breadth(limit=90, source="ssi", start_date=None, end_date=None):
+    limit=max(2,min(int(limit),10000))
     with connect() as db:
         rows=db.execute("""WITH daily AS (
             SELECT symbol,trading_date,close_price,volume,
@@ -1096,13 +1284,15 @@ def fetch_market_breadth(limit=90, source="ssi"):
               SUM(CASE WHEN close_price=prior_close THEN 1 ELSE 0 END) AS unchanged,
               SUM(COALESCE(volume,0)) AS total_volume
             FROM daily WHERE prior_close IS NOT NULL GROUP BY trading_date
-        ) SELECT * FROM breadth ORDER BY trading_date DESC LIMIT ?""",(source,limit)).fetchall()
+        ) SELECT * FROM breadth WHERE (? IS NULL OR replace(trading_date,'/','-')>=?)
+          AND (? IS NULL OR replace(trading_date,'/','-')<=?) ORDER BY trading_date DESC LIMIT ?""",
+          (source,start_date,start_date,end_date,end_date,limit)).fetchall()
     return list(reversed([dict(row) for row in rows]))
 
 
-def fetch_market_ohlc_sessions(limit=60, source="ssi"):
+def fetch_market_ohlc_sessions(limit=60, source="ssi", start_date=None, end_date=None):
     """Aggregate daily SSI OHLC for catalogued common stocks only."""
-    limit=max(1,min(int(limit),250))
+    limit=max(1,min(int(limit),10000))
     with connect() as db:
         rows=db.execute("""WITH common_daily AS (
             SELECT h.symbol,h.trading_date,h.value,h.volume,h.fetched_at,h.close_price,
@@ -1121,7 +1311,9 @@ def fetch_market_ohlc_sessions(limit=60, source="ssi"):
                 COUNT(DISTINCT symbol) AS symbol_count,
                 MAX(fetched_at) AS data_as_of
             FROM common_daily GROUP BY trading_date
-        ) SELECT * FROM sessions ORDER BY trading_date DESC LIMIT ?""",(source,limit)).fetchall()
+        ) SELECT * FROM sessions WHERE (? IS NULL OR replace(trading_date,'/','-')>=?)
+          AND (? IS NULL OR replace(trading_date,'/','-')<=?) ORDER BY trading_date DESC LIMIT ?""",
+          (source,start_date,start_date,end_date,end_date,limit)).fetchall()
     return list(reversed([dict(row) for row in rows]))
 
 

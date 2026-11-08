@@ -87,11 +87,12 @@ class SsiCollector:
         )
         return transient,response
 
-    def _fetch_history_with_retry(self, market_data, symbol, start, end):
+    def _fetch_history_with_retry(self, market_data, symbol, start, end, page=1, size=None):
+        size=size or config.HISTORY_REST_PAGE_SIZE
         for attempt in range(config.HISTORY_REST_MAX_RETRIES+1):
             try:
                 return market_data.get_ohlc_1day_historical(
-                    symbol,from_date=start,to_date=end,page=1,size=100
+                    symbol,from_date=start,to_date=end,page=page,size=size
                 )
             except Exception as exc:
                 retryable,response=self._retryable_history_error(exc)
@@ -110,7 +111,7 @@ class SsiCollector:
     def _sync_history(self, auth, symbols):
         md=Data(auth).market_data
         today=datetime.now(config.TIMEZONE).date()
-        start=(today-timedelta(days=90)).strftime("%Y/%m/%d 00:00:00")
+        full_history_start=config.HISTORY_START_DATE
         end=today.strftime("%Y/%m/%d 23:59:59")
         today_key=today.isoformat()
         today_data_key=today.strftime("%Y/%m/%d")
@@ -118,24 +119,68 @@ class SsiCollector:
         def sync_symbols(target_symbols, skip_fetched_today=False):
             already_fetched=(database.historical_symbols_fetched_on(today_key,source="ssi")
                              if skip_fetched_today else set())
+            backfill_states=database.historical_backfill_states("ssi",full_history_start)
+            full_history_done={symbol for symbol,item in backfill_states.items() if item["status"]=="complete"}
             self.runtime.update(historical_symbols_total=len(target_symbols),historical_symbols_processed=0,
-                                historical_prices_rows=database.count_historical_prices("ssi"))
+                                historical_prices_rows=database.count_historical_prices("ssi"),
+                                historical_backfill_start=full_history_start,
+                                historical_backfill_page_size=config.HISTORY_REST_PAGE_SIZE,
+                                historical_backfill_max_pages=config.HISTORY_REST_MAX_PAGES)
             last_request_at=None
             processed=0
             for index,symbol in enumerate(target_symbols,1):
                 if self._stop.is_set():break
-                if symbol not in already_fetched:
-                    if last_request_at is not None:
-                        remaining=config.HISTORY_REST_MIN_INTERVAL_SECONDS-(time.monotonic()-last_request_at)
-                        if remaining>0 and self._stop.wait(remaining):break
+                full_backfill=symbol not in full_history_done
+                if full_backfill or symbol not in already_fetched:
+                    # First pass starts at market inception. Later passes resume
+                    # from the last date that SSI history was requested through.
+                    request_start=full_history_start if full_backfill else backfill_states[symbol]["requested_to"]
+                    if len(request_start)==10 and request_start[4]=="/":
+                        request_start += " 00:00:00"
+                    request_end=end
+                    max_pages=config.HISTORY_REST_MAX_PAGES
+                    collected=[];pages_fetched=0;page_limit_reached=False
                     try:
-                        bars=self._fetch_history_with_retry(md,symbol,start,end)
-                        database.upsert_historical_prices(symbol,bars,source="ssi")
+                        for page in range(1,max_pages+1):
+                            if self._stop.is_set():break
+                            if last_request_at is not None:
+                                remaining=config.HISTORY_REST_MIN_INTERVAL_SECONDS-(time.monotonic()-last_request_at)
+                                if remaining>0 and self._stop.wait(remaining):break
+                            try:
+                                page_rows=self._fetch_history_with_retry(md,symbol,request_start,request_end,
+                                    page=page,size=config.HISTORY_REST_PAGE_SIZE)
+                            finally:
+                                last_request_at=time.monotonic()
+                            page_rows=list(page_rows or []);pages_fetched+=1;collected.extend(page_rows)
+                            if len(page_rows)<config.HISTORY_REST_PAGE_SIZE:
+                                break
+                            if page==max_pages:
+                                page_limit_reached=True
+                        if self._stop.is_set():
+                            break
+                        database.upsert_historical_prices(symbol,collected,source="ssi")
+                        if full_backfill:
+                            status="page_limit_reached" if page_limit_reached else "complete"
+                            database.set_historical_backfill_state(symbol,full_history_start,today_data_key,status,
+                                pages_fetched,len(collected),source="ssi")
+                            if page_limit_reached:
+                                database.log_ingestion_error(
+                                    f"ssi_history_page_limit_reached: SSI trả đủ {max_pages} trang; chưa thể xác nhận đã hết lịch sử.",
+                                    symbol=symbol,source="ssi")
+                            full_history_done.add(symbol) if not page_limit_reached else None
+                        elif not page_limit_reached:
+                            database.set_historical_backfill_state(symbol,full_history_start,today_data_key,"complete",
+                                pages_fetched,len(collected),source="ssi")
+                        else:
+                            database.log_ingestion_error(
+                                f"ssi_history_incremental_page_limit_reached: SSI trả đủ {max_pages} trang trong lần cập nhật tăng dần.",
+                                symbol=symbol,source="ssi")
                     except Exception as exc:
+                        if full_backfill:
+                            database.set_historical_backfill_state(symbol,full_history_start,today_data_key,"error",
+                                pages_fetched,len(collected),source="ssi")
                         if not self._stop.is_set():
                             database.log_ingestion_error(f"ssi_history_{type(exc).__name__}: {str(exc)[:180]}",symbol=symbol,source="ssi")
-                    finally:
-                        last_request_at=time.monotonic()
                 processed=index
                 if index%10==0 or index==len(target_symbols):
                     self.runtime.update(historical_symbols_processed=index,historical_prices_rows=database.count_historical_prices("ssi"),
