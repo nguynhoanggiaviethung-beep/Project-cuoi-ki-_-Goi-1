@@ -20,7 +20,43 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe app.py
 ```
 
-Khi Terminal hiện server đang chạy, mở <http://127.0.0.1:8000/>. Giữ Terminal mở khi sử dụng web; nhấn `Ctrl+C` trong Terminal để dừng. Nếu báo cổng `8000` đang được sử dụng, đóng Terminal đang chạy server cũ rồi chạy lại.
+Khi Terminal hiện `Application startup complete` và không có lỗi bind cổng, mở <http://127.0.0.1:8000/>. Giữ Terminal đó mở khi sử dụng web; nhấn `Ctrl+C` tại đúng Terminal này để dừng server.
+
+### Nếu gặp `WinError 10048` (cổng 8000 đang được sử dụng)
+
+Lỗi này có nghĩa là một chương trình khác — thường là một cửa sổ Terminal đang chạy `app.py` — đã chiếm `127.0.0.1:8000`. Lần chạy mới sẽ tự thoát; đây không phải lỗi môi trường Python. Thường bạn chỉ cần mở <http://127.0.0.1:8000/> vì server cũ vẫn đang chạy.
+
+Nếu muốn khởi động lại server:
+
+1. Tìm cửa sổ Terminal VS Code đang chạy web và nhấn `Ctrl+C` ở đó.
+2. Nếu không tìm thấy Terminal cũ, kiểm tra tiến trình đang giữ cổng:
+
+   ```powershell
+   netstat -ano | findstr :8000
+   ```
+
+   Lấy PID ở cột cuối của dòng `LISTENING`, rồi xác minh tiến trình:
+
+   ```powershell
+   tasklist /FI "PID eq <PID>"
+   ```
+
+3. Chỉ khi đã xác nhận PID đó là tiến trình Python của dự án, dừng đúng PID trong PowerShell:
+
+   ```powershell
+   Stop-Process -Id <PID>
+   ```
+
+4. Chạy lại `python.exe app.py` một lần. Không mở thêm server thứ hai trên cổng 8000.
+
+Muốn chạy song song để thử nghiệm, dùng một cổng khác trong cùng cửa sổ PowerShell:
+
+```powershell
+$env:SLI_PORT = "8001"
+.\.venv\Scripts\python.exe app.py
+```
+
+Sau đó mở <http://127.0.0.1:8001/>. Mỗi cửa sổ Terminal có thể giữ giá trị `SLI_PORT` riêng.
 
 ## Kết nối dữ liệu SSI
 
@@ -63,3 +99,4 @@ Không chia sẻ hoặc commit file `.env`; file này chứa thông tin đăng n
 - Có thể khai báo ngày nghỉ đã xác nhận bằng `MARKET_HOLIDAYS=YYYY-MM-DD,YYYY-MM-DD` hoặc bảng `session_calendar`.
 - `MARKET_CLOCK_OVERRIDE` và `MARKET_CLOCK_SPEED` chỉ dùng thử giao diện trạng thái; đồng hồ này không tạo dữ liệu thị trường. Để trống `MARKET_CLOCK_OVERRIDE` trong môi trường thật và bản nộp.
 - `/api/market-clock` trả trạng thái chung; `/api/stream` phát trạng thái, dữ liệu và heartbeat.
+
