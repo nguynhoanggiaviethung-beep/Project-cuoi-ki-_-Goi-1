@@ -21,7 +21,7 @@ from .market_context_service import get_market_turnover
 from .depth_service import build_market_depth
 from .bookwalk import estimate as estimate_bookwalk
 from .market_clock import get_clock_now, get_market_state
-from .ranking import calculate_symbol_row, is_rankable_stock, rank_rows
+from .ranking import attach_rank_movement, calculate_symbol_row, is_rankable_stock, rank_rows
 from .collector import RuntimeState
 from .ssi_collector import SsiCollector
 
@@ -64,7 +64,11 @@ class MarketMetaRoute(APIRoute):
                 payload=json.loads(response.body)
             except (ValueError,TypeError):
                 return response
-            if isinstance(payload,dict):
+            # These auxiliary lookup routes are not market-data widgets; avoid
+            # turning a tiny catalog/date-bound lookup into a full market scan.
+            if request.url.path in {"/api/market-history-range", "/api/symbols"}:
+                return response
+            if isinstance(payload,dict) and "meta" not in payload:
                 selected=request.query_params.get("source") or _source()
                 payload["meta"]=_market_meta(selected)
                 headers={k:v for k,v in response.headers.items() if k.lower() not in {"content-length","content-type"}}
@@ -83,6 +87,24 @@ app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
 
 def _market_meta(source=None):
+    source=source or _source()
+    now=time.monotonic()
+    with _market_meta_lock:
+        cached=_market_meta_cache.get(source)
+        if cached and now-cached[0] < 2:
+            return cached[1]
+        # Keep the lock during a cache miss so simultaneous dashboard requests
+        # share one metadata query instead of each scanning the large SSI DB.
+        result=_compute_market_meta(source)
+        _market_meta_cache[source]=(now,result)
+        return result
+
+
+_market_meta_lock=threading.Lock()
+_market_meta_cache={}
+
+
+def _compute_market_meta(source=None):
     source=source or _source()
     now=get_clock_now()
     latest_bar=database.latest_bar_minute(source) if source in {"ssi","live"} else None
@@ -107,7 +129,7 @@ def _market_meta(source=None):
     as_of=database.latest_data_as_of(source)
     if not as_of and source=="ssi":
         as_of=database.latest_data_as_of("live")
-    return {**clock,"data_as_of":as_of,
+    return {**clock,"data_as_of":as_of,"latest_historical_date":latest_history.replace("/","-") if latest_history else None,
             "refresh_seconds":config.MARKET_REFRESH_SECONDS if clock["state"]=="IN_SESSION" else None,
             "clock_speed":config.MARKET_CLOCK_SPEED if config.MARKET_CLOCK_OVERRIDE else 1,
             "source":source,"symbols_count":database.count_historical_symbols("ssi"),
@@ -351,7 +373,7 @@ def _cached_market_leaders(limit, cache_minute, as_of=None):
 @app.get("/api/market-leaders")
 def market_leaders(limit: int = Query(default=25, ge=5, le=100), as_of: str | None = None):
     cache_minute=int(datetime.now(config.TIMEZONE).timestamp()//60)
-    selected_date=as_of or _incomplete_session_date()
+    selected_date=(as_of.replace("-","/")[:10] if as_of else None) or _incomplete_session_date()
     if selected_date and not as_of:
         previous=database.fetch_market_breadth(limit=1000,source="ssi")
         available=[row["trading_date"] for row in previous if str(row["trading_date"]).replace("/","-")<selected_date.replace("/","-")]
@@ -372,15 +394,20 @@ def market_breadth(limit: int = Query(default=10000, ge=2, le=10000), from_date:
     cache_minute=int(datetime.now(config.TIMEZONE).timestamp()//60)
     rows=_cached_market_breadth(limit,from_date,to_date,cache_minute)
     incomplete_date=_incomplete_session_date()
-    if incomplete_date:
-        rows=[row for row in rows if str(row["trading_date"]).replace("-","/")!=incomplete_date]
+    pending_coverage=database.historical_session_coverage(incomplete_date,"ssi") if incomplete_date else {"present":0,"expected":0}
+    # Keep the current SSI session visible when coverage is partial. Missing
+    # symbols are not synthesized and are not counted as unchanged.
     latest_date=rows[-1]["trading_date"] if rows else None
     coverage=database.historical_session_coverage(latest_date,"ssi") if latest_date else {"present":0,"expected":0}
     synced=(coverage["expected"]>0 and coverage["present"]>=coverage["expected"])
     return {"source":"ssi","rows":rows,"count":len(rows),
-            "latest_trading_date":latest_date,"pending_session_date":incomplete_date,"session_sync_complete":synced,
+            "latest_trading_date":latest_date,"pending_session_date":incomplete_date,
+            "pending_session_coverage":pending_coverage,
+            "pending_session_has_data":pending_coverage["present"]>0,
+            "session_sync_complete":synced,
             "session_coverage":coverage,
-            "note":"Độ rộng thị trường được tổng hợp từ OHLC ngày SSI của cổ phiếu thường: số mã tăng/giảm/đứng giá so với phiên trước. Không phải dữ liệu sổ lệnh."}
+            "latest_session_partial":bool(latest_date and incomplete_date and latest_date.replace("-","/")==incomplete_date and coverage["expected"] and coverage["present"]<coverage["expected"]),
+            "note":"Độ rộng thị trường được tổng hợp từ OHLC ngày SSI của cổ phiếu thường: số mã tăng/giảm/đứng giá so với phiên trước. Phiên thiếu độ phủ vẫn tính từ bản ghi SSI có sẵn; mã không có bản ghi không được tính là đứng giá. Không phải dữ liệu sổ lệnh."}
 
 
 @app.get("/api/market-turnover")
@@ -389,6 +416,12 @@ def market_turnover(limit: int = Query(default=10000, ge=20, le=10000),
                     from_date: str | None = None, to_date: str | None = None):
     return get_market_turnover(limit=limit, metric=metric, market_meta=_market_meta("ssi"),
                                start_date=from_date,end_date=to_date)
+
+
+@app.get("/api/market-history-range")
+def market_history_range():
+    """Small SSI-only date-bound query for the historical range controls."""
+    return {"source":"ssi",**database.historical_date_bounds("ssi")}
 
 
 @app.get("/api/symbols")
@@ -697,28 +730,55 @@ def rankings(limit: int = Query(default=500, ge=1, le=2000), window_minutes: int
     window_start,window_end=_market_window(window_minutes,source)
     start_at=start_at or window_start
     end_at=end_at or window_end
+    minimum_samples = config.RANKING_MIN_BARS if source in {"live", "ssi"} else config.RANKING_MIN_SNAPSHOTS
+    comparison_date=None
+    comparison_start=None
+    comparison_end=None
     if source in {"live", "ssi"}:
-        grouped = database.fetch_bars_window_by_symbol(source,start_at,end_at,window_minutes)
         metadata=database.fetch_security_metadata("ssi")
-        results = []
         stock_catalog = {ticker: profile for ticker, profile in metadata.items()
                          if is_rankable_stock(ticker, profile.get("stock_type"))
                          and (not board or profile.get("board") == board)}
         catalog_count = len(stock_catalog)
-        bar_symbols = 0
-        for ticker, points in grouped.items():
-            profile = stock_catalog.get(ticker)
-            if profile is None:
-                continue
-            if phase:
-                points = [row for row in points if row.get("baseline_bucket") == phase]
-            if points:
-                bar_symbols += 1
-            row = calculate_symbol_row(ticker, points, metadata)
-            if row:
-                results.append(row)
+
+        def summarize_bar_window(start, end):
+            grouped = database.fetch_bars_window_by_symbol(source,start,end,window_minutes)
+            results=[]
+            for ticker, points in grouped.items():
+                if ticker not in stock_catalog:
+                    continue
+                selected=[row for row in points if not phase or row.get("baseline_bucket") == phase]
+                row=calculate_symbol_row(ticker,selected,metadata)
+                if row:
+                    results.append(row)
+            return results,len(grouped)
+
+        results,bar_symbols=summarize_bar_window(start_at,end_at)
+        ranked=rank_rows(results,minimum_samples)
+        eligible=ranked["eligible"]
+        current_start=datetime.fromisoformat(start_at)
+        current_end=datetime.fromisoformat(end_at)
+        session_date=current_end.date().isoformat()
+        comparison_date=database.previous_bar_session(source,session_date)
+        comparison_rows=[]
+        if comparison_date:
+            if window_minutes>=390:
+                previous_start=datetime.fromisoformat(comparison_date+"T00:00:00+07:00")
+                previous_end=previous_start+timedelta(days=1)
+            else:
+                start_clock=current_start.strftime("%H:%M")
+                end_clock=current_end.strftime("%H:%M")
+                previous_start=datetime.fromisoformat(comparison_date+"T"+start_clock+":00+07:00")
+                previous_end=datetime.fromisoformat(comparison_date+"T"+end_clock+":00+07:00")
+            comparison_start=previous_start.isoformat(timespec="minutes")
+            comparison_end=previous_end.isoformat(timespec="minutes")
+            previous_results,_=summarize_bar_window(comparison_start,comparison_end)
+            comparison_rows=rank_rows(previous_results,minimum_samples)["lowest_spread"]
+        ranked["lowest_spread"]=attach_rank_movement(ranked["lowest_spread"],comparison_rows)
+        comparison_eligible_symbols=len(comparison_rows)
+        quote_valid_symbols=len(results)
     else:
-        grouped = database.fetch_recent_observations_by_symbol(source, limit, start_at, end_at)
+        grouped=database.fetch_recent_observations_by_symbol(source,limit,start_at,end_at)
         results=[]
         for ticker, rows in grouped.items():
             valid=[row for row in rows if row["validation_status"]=="valid"]
@@ -730,21 +790,24 @@ def rankings(limit: int = Query(default=500, ge=1, le=2000), window_minutes: int
                 "median_total_depth_value":median(depths) if depths else None,"latest_spread_bps":latest_spread,
                 "latest_total_depth_value":latest_depth,"spread_expansion_bps":latest_spread-median(spreads) if spreads and latest_spread is not None else None,
                 "depth_change_pct":((latest_depth/median(depths)-1)*100) if depths and median(depths) and latest_depth is not None else None})
-        catalog_count = len(database.list_symbols(source))
-        bar_symbols = len(grouped)
-    minimum_samples = config.RANKING_MIN_BARS if source in {"live", "ssi"} else config.RANKING_MIN_SNAPSHOTS
-    ranked = rank_rows(results, minimum_samples)
-    eligible = ranked["eligible"]
-    quote_valid_symbols = len(results)
+        catalog_count=len(database.list_symbols(source))
+        bar_symbols=len(grouped)
+        ranked=rank_rows(results,minimum_samples)
+        eligible=ranked["eligible"]
+        comparison_eligible_symbols=0
+        quote_valid_symbols=len(results)
     return {"source":source,"sample_window_minutes":window_minutes,"window_start":start_at,"window_end_exclusive":end_at,
         "minimum_eligible_samples":minimum_samples,"minimum_snapshots":0,
         "candidate_symbols":len(results),"catalog_symbols":catalog_count,"symbols_with_window_bars":bar_symbols,
         "symbols_with_valid_quotes":quote_valid_symbols,"eligible_symbols":len(eligible),
         "displayed_symbols":min(len(eligible),limit),"one_tick_count":ranked["one_tick_count"],
         "one_tick_share":ranked["one_tick_share"],"filter":{"start_at":start_at,"end_at":end_at,"phase":phase,"board":board},
+        "rank_change_basis":"Cùng khung giờ của phiên giao dịch trước, xếp hạng riêng từ bar SSI đã lưu" if comparison_date else "Chưa có bar phiên trước để so sánh",
+        "comparison_session_date":comparison_date,"comparison_eligible_symbols":comparison_eligible_symbols,
+        "comparison_window_start":comparison_start,"comparison_window_end_exclusive":comparison_end,
         "lowest_spread":ranked["lowest_spread"][:limit],"highest_depth":ranked["highest_depth"][:limit],
         "depth_falling":ranked["depth_falling"][:limit],"spread_widening":ranked["spread_widening"][:limit],
-        "symbols":eligible[:limit],"note":"Xếp hạng dùng bar 1 phút hợp lệ trong cửa sổ chung; chỉ lấy bar của phiên khớp liên tục (loại ATO/ATC và giờ nghỉ trưa). Baseline nhiều phiên chỉ áp dụng cho cảnh báo, không chặn xếp hạng."}
+        "symbols":eligible[:limit],"note":"Xếp hạng dùng bar 1 phút hợp lệ trong cửa sổ chung; chỉ lấy bar của phiên khớp liên tục (loại ATO/ATC và giờ nghỉ trưa). Mức đổi hạng đối chiếu cùng khung giờ phiên giao dịch trước; thiếu bar thì ghi chưa đủ dữ liệu."}
 
 
 @app.get("/api/bars")
@@ -776,7 +839,9 @@ def intraday_profile(symbol: str | None = None, window_minutes: int = Query(defa
                 slot[target].append(row[key])
         slot["snapshots"] += row["n_snapshots"]
         slot["symbols"].add(row["symbol"])
-    profile = [{"minute": minute, "median_spread_bps": median(v["spread"]) if v["spread"] else None,
+    session_date = max((str(row.get("minute_vn") or "")[:10] for row in bars_data), default=None) or None
+    latest_bar = max((str(row.get("minute_vn") or "") for row in bars_data), default=None) or None
+    profile = [{"minute": f"{session_date}T{minute}:00+07:00" if session_date else minute, "median_spread_bps": median(v["spread"]) if v["spread"] else None,
                 "median_spread_ticks": median(v["ticks"]) if v["ticks"] else None,
                 "median_total_depth_value": median(v["depth"]) if v["depth"] else None,
                 "median_queue_imbalance":median(v["imbalance"]) if v["imbalance"] else None,
@@ -785,6 +850,7 @@ def intraday_profile(symbol: str | None = None, window_minutes: int = Query(defa
     return {"source": selected_source, "symbol": symbol.upper() if symbol else None,
             "profile": profile, "basis": "completed_bars_1m", "window_minutes":window_minutes,
             "window_start":start_at,"completed_through_exclusive":end_exclusive,
+            "session_date":session_date,"as_of":latest_bar,"data_as_of":latest_bar,
             "note": "Chỉ dùng bar một phút đã hoàn tất; mỗi phút lấy trung vị bar của từng mã, sau đó lấy trung vị giữa các mã. Số mã tham gia được ghi tại từng điểm."}
 
 

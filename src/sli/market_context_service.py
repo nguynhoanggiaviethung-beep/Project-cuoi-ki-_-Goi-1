@@ -2,9 +2,35 @@
 from __future__ import annotations
 
 from datetime import datetime
+import threading
+import time
 from typing import Iterable
 
 from . import config, database
+
+_closed_ohlc_lock = threading.Lock()
+_closed_ohlc_cache: dict[tuple, tuple[float, list[dict]]] = {}
+
+
+def _fetch_market_ohlc(limit: int, start_date: str | None, end_date: str | None,
+                       market_meta: dict) -> list[dict]:
+    key = (limit, "ssi", start_date, end_date, market_meta.get("session_date"))
+    if market_meta.get("state") != "CLOSED":
+        return database.fetch_market_ohlc_sessions(
+            limit=limit, source="ssi", start_date=start_date, end_date=end_date
+        )
+    # Closed-session OHLC does not change tick by tick. Reuse the aggregate for
+    # the value/volume toggle and concurrent widgets; cache age starts after the
+    # expensive query finishes, so full-history queries do not expire mid-scan.
+    with _closed_ohlc_lock:
+        cached = _closed_ohlc_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 60:
+            return [dict(row) for row in cached[1]]
+        rows = database.fetch_market_ohlc_sessions(
+            limit=limit, source="ssi", start_date=start_date, end_date=end_date
+        )
+        _closed_ohlc_cache[key] = (time.monotonic(), [dict(row) for row in rows])
+        return rows
 
 
 def build_turnover_series(rows: Iterable[dict], metric: str = "value", *,
@@ -53,29 +79,40 @@ def build_turnover_series(rows: Iterable[dict], metric: str = "value", *,
 def get_market_turnover(*, limit: int = 60, metric: str = "value", market_meta: dict | None = None,
                         start_date: str | None = None, end_date: str | None = None) -> dict:
     """Return SSI-only market context and mark any unsynced current session."""
-    rows = database.fetch_market_ohlc_sessions(limit=limit, source="ssi", start_date=start_date, end_date=end_date)
     meta = market_meta or {}
+    all_rows = _fetch_market_ohlc(limit, start_date, end_date, meta)
+    rows = list(all_rows)
     sync_status = (meta.get("session_sync") or {}).get("status")
     pending_date = meta.get("session_date") if (
         meta.get("state") in {"IN_SESSION", "LUNCH_BREAK"}
         or (meta.get("state") == "CLOSED" and meta.get("closed_reason") == "after_close")
         or (meta.get("state") == "CLOSED" and sync_status not in {None, "complete", "not_started"})
     ) else None
-    if meta.get("state") == "CLOSED" and pending_date and sync_status != "complete":
-        rows = [row for row in rows
-                if str(row.get("trading_date", "")).replace("/", "-") != pending_date.replace("/", "-")]
+    pending_coverage = (database.historical_session_coverage(pending_date, "ssi")
+                        if pending_date else {"present": 0, "expected": 0})
+    pending_has_data = bool(pending_date and pending_coverage["present"] > 0)
+    # Include available SSI rows for the current session even if some catalog
+    # symbols have no OHLC row. Report coverage explicitly; never synthesize prices.
     result = build_turnover_series(rows, metric)
     metric_key = "total_value" if metric == "value" else "total_volume"
     has_current = bool(pending_date and any(
         str(row.get("trading_date", "")).replace("-", "/") == pending_date.replace("-", "/")
-        and row.get(metric_key) is not None for row in rows
+        and row.get(metric_key) is not None for row in all_rows
     ))
     in_progress = meta.get("state") in {"IN_SESSION", "LUNCH_BREAK"}
-    # An in-session OHLC row is provisional only while the shared clock says open.
+    # Distinguish a still-forming session from a closed session with partial SSI coverage.
     for row in result["rows"]:
-        row["is_incomplete"] = bool(in_progress and has_current and str(row.get("trading_date", "")).replace("-", "/") == pending_date.replace("-", "/"))
+        is_pending = bool(pending_date and str(row.get("trading_date", "")).replace("-", "/") == pending_date.replace("-", "/"))
+        row["is_incomplete"] = bool(in_progress and has_current and is_pending)
+        row["is_partial_coverage"] = bool(is_pending and pending_coverage["expected"]
+                                           and pending_coverage["present"] < pending_coverage["expected"])
+        if row["is_partial_coverage"]:
+            row["coverage_present"] = pending_coverage["present"]
+            row["coverage_expected"] = pending_coverage["expected"]
     latest = result["latest"]
-    as_of_values = [row.get("data_as_of") for row in rows if row.get("data_as_of")]
+    as_of_values = [row.get("data_as_of") for row in all_rows if row.get("data_as_of")]
+    if meta.get("data_as_of"):
+        as_of_values.append(meta["data_as_of"])
     try:
         as_of = max(as_of_values, key=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))) if as_of_values else None
     except (ValueError, TypeError):
@@ -85,9 +122,18 @@ def get_market_turnover(*, limit: int = 60, metric: str = "value", market_meta: 
         **result,
         "source": "ssi",
         "as_of": as_of,
-        "session_date": latest.get("trading_date") if latest else None,
+        "session_date": meta.get("session_date") or (latest.get("trading_date") if latest else None),
+        "series_latest_date": latest.get("trading_date") if latest else None,
         "pending_session_date": pending_date,
-        "pending_ohlc_missing": expected_missing,
-        "note": (f"Dữ liệu OHLC ngày {pending_date} chưa được đồng bộ từ SSI." if expected_missing
-                 else "Dữ liệu giá theo ngày từ OHLC SSI, không phải thanh khoản sổ lệnh."),
+        "pending_coverage": {**pending_coverage, "ratio": (pending_coverage["present"] / pending_coverage["expected"]
+                              if pending_coverage["expected"] else None)},
+        "pending_ohlc_missing": bool(pending_date and not pending_has_data),
+        "pending_ohlc_partial": bool(pending_date and pending_has_data and pending_coverage["present"] < pending_coverage["expected"]),
+        "note": (
+            f"SSI đã lưu OHLC ngày {pending_date} cho {pending_coverage['present']}/{pending_coverage['expected']} mã; "
+            "phiên được đưa vào biểu đồ theo các bản ghi SSI có sẵn; mã thiếu OHLC không được tự suy ra."
+            if pending_date and pending_has_data and pending_coverage["present"] < pending_coverage["expected"] else
+            f"SSI chưa có bản ghi OHLC ngày {pending_date}." if expected_missing else
+            "Dữ liệu giá theo ngày từ OHLC SSI, không phải thanh khoản sổ lệnh."
+        ),
     }

@@ -234,9 +234,26 @@ body.video-background-active #market-background{display:none}
 .overview-market-data[open]>summary:after{content:"Thu gọn"}
 .overview-market-data-content{display:grid;gap:12px;padding:0 12px 12px}
 .overview-market-data-content>.panel{margin:0}
+.overview-market-data{scroll-margin-top:110px}
+.overview-market-data-content{grid-template-columns:repeat(2,minmax(0,1fr));align-items:stretch}
+.overview-market-data-content>.panel:has(#historical-price-chart){grid-column:1/-1}
+.overview-market-data-content>.panel:has(#spread-compare),.overview-market-data-content>.panel:has(#coverage-chart){grid-column:auto;min-width:0;min-height:320px;display:flex;flex-direction:column}
+.overview-market-data-content>.panel:has(#spread-compare) .chart-box,.overview-market-data-content>.panel:has(#coverage-chart) .chart-box{height:260px;min-height:120px;flex:1 1 auto}
+.overview-market-data-content #spread-compare .bar-list,.overview-market-data-content #coverage-chart .bar-list{max-height:260px;overflow:auto;overscroll-behavior:contain}
+#overview-ranking{max-height:360px!important;overflow:auto!important;overscroll-behavior:contain}
+.filter-error{flex-basis:100%;color:#b42318;font-weight:750}
+.filter-error[hidden]{display:none}
+.widget-skeleton{height:100%;min-height:110px;border-radius:10px;background:linear-gradient(100deg,#edf4ee 25%,#f9fcf9 40%,#edf4ee 60%);background-size:220% 100%;animation:sli-skeleton 1.2s ease-in-out infinite}
+@keyframes sli-skeleton{to{background-position-x:-220%}}
+.history-range-controls button:focus-visible,.history-range-controls input:focus-visible,.history-range-controls select:focus-visible,.turnover-metric-switch button:focus-visible{outline:2px solid #008a45;outline-offset:2px}
+.history-range-presets button{transition:transform .16s ease,background-color .16s ease,border-color .16s ease,box-shadow .16s ease}
+.history-range-presets button:hover{transform:translateY(-1px);box-shadow:0 3px 9px #00592e22}
+.history-range-presets button:disabled,.history-range-controls button:disabled{opacity:.48;cursor:not-allowed}
+.overview-history-controls .button-primary{min-height:36px;box-shadow:0 3px 10px #00592e2e}
 .research-retry{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}
 .research-retry .button{padding:7px 11px;font-size:11px}
 @media(max-width:720px){.app-header{padding:7px 12px!important}.project-masthead h1{font-size:22px!important}.header-status{flex-wrap:wrap}.bar-row{grid-template-columns:48px minmax(0,1fr) 66px!important}.bar-row>span{min-width:48px}.bar-axis{grid-template-columns:48px minmax(0,1fr) 66px!important}}
+@media(max-width:1023px){.overview-market-data-content{grid-template-columns:minmax(0,1fr)}.overview-market-data-content>.panel:has(#historical-price-chart){grid-column:auto}}
 
 /* Compact market-board layout: keep the liquidity boxes visible together. */
 #view-overview>.page-heading{margin-bottom:8px;align-items:center}
@@ -504,3 +521,23 @@ body.liquidity-map-modal-open{overflow:hidden}
 #view-detail .detail-bookwalk-panel .bookwalk-layout{display:block}
 #view-detail .detail-bookwalk-panel .bookwalk-formula{margin-top:12px}
 @media(max-width:720px){#view-overview .depth-butterfly-chart{height:270px;min-height:270px}#view-detail>.content-grid{grid-template-columns:minmax(0,1fr);grid-template-areas:"spread" "book" "bookwalk" "depth" "alerts" "history"}.book-ladder-head,.book-ladder-row{grid-template-columns:minmax(55px,1fr) minmax(58px,.6fr) minmax(58px,.6fr) minmax(55px,1fr);gap:3px}.book-ladder-head,.book-size,.book-ladder>small{font-size:12px}.book-price{font-size:12px}}
+
+
+/* Overview layout repair: every named panel has a real grid area. */
+#view-overview>.content-grid{grid-template-columns:minmax(0,1.35fr) minmax(330px,.85fr);grid-template-areas:"spread ranking" "turnover turnover" "depth imbalance" "intraday intraday" "map map";align-items:stretch}
+#view-overview>.content-grid>.panel:has(#market-turnover-chart){grid-area:turnover;align-self:start}
+#view-overview>.content-grid>.panel:has(#overview-ranking){display:flex;flex-direction:column;min-height:420px}
+#view-overview #overview-ranking{flex:1;min-height:0;display:flex;flex-direction:column}
+#view-overview #overview-ranking .ranking-board{flex:1;min-height:0;display:flex;flex-direction:column}
+#view-overview #overview-ranking .ranking-table-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain}
+#view-overview .widget-stale-badge{position:absolute;z-index:3;top:7px;right:8px;max-width:calc(100% - 16px);padding:5px 8px;border:1px solid #e4c17a;border-radius:999px;background:#fff8e8;color:#704b00;font-size:11px;font-weight:750;line-height:1.25;pointer-events:none;box-shadow:0 2px 8px #17382a18}
+#view-overview [data-widget-state="stale"]{position:relative}
+#view-overview #overview-ranking .ranking-preview-table .rank-symbol{display:inline-block;vertical-align:middle}
+#view-overview #overview-ranking .ranking-preview-table .rank-exchange{display:inline-block!important;margin:0 0 0 7px!important;vertical-align:middle}
+#view-overview #overview-ranking .ranking-preview-table .quick-watch-button{display:inline-flex;align-items:center;min-height:22px;margin:0 0 0 8px;padding:2px 6px;font-size:10px;line-height:1.15;vertical-align:middle}
+#view-overview #overview-ranking .ranking-preview-table td{height:auto;min-height:40px;padding:6px 7px;white-space:nowrap}
+#view-overview .research-retry{display:flex;justify-content:center;align-items:center;gap:12px;flex-wrap:wrap}
+@media(max-width:1023px){#view-overview>.content-grid{grid-template-columns:minmax(0,1fr);grid-template-areas:"spread" "ranking" "turnover" "depth" "imbalance" "intraday" "map"}#view-overview>.content-grid>.panel:has(#overview-ranking){min-height:0}#view-overview #overview-ranking .ranking-preview-table .rank-exchange{margin-left:5px!important}#view-overview #overview-ranking .ranking-preview-table .quick-watch-button{margin-left:5px}}
+
+#view-overview #overview-ranking .ranking-preview-table th:first-child{width:126px}
+#view-overview #overview-ranking .ranking-preview-table .rank-change{font-size:10px}

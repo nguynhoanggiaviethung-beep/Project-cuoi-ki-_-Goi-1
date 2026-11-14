@@ -76,6 +76,12 @@ function fmtTime(value) {
   return Number.isNaN(date.valueOf()) ? escapeHtml(value) :
     date.toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "2-digit" });
 }
+function fmtDateTime(value) {
+  if (!value) return "chưa có bản ghi";
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? escapeHtml(value) :
+    date.toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
 function fmtDate(value) {
   if(!value)return "chưa có dữ liệu";
   const day=String(value).replaceAll("/","-").slice(0,10);
@@ -125,8 +131,10 @@ function feedStateText(data) {
   if (data.feed_state === "delayed") return "Đang kết nối, dữ liệu đến chậm" + age;
   if (data.feed_state === "stale") return "Tiến trình còn chạy nhưng dữ liệu đã quá hạn" + age;
   if (data.feed_state === "outside_session") {
-    if ((data.meta||data).state === "LUNCH_BREAK" || data.market_phase === "BREAK") return "Thị trường đang nghỉ trưa; kết nối SSI vẫn hoạt động, đang giữ dữ liệu mới nhất đến 11:30";
-    return "Thị trường ngoài giờ giao dịch liên tục; kết nối SSI vẫn hoạt động, quote sẽ tiếp tục khi phiên mở lại";
+    const latest=data.last_quote_received_at||data.last_persisted_at||data.last_data_at;
+    const saved=latest?" Bản ghi SSI gần nhất lúc "+fmtDateTime(latest)+"; dữ liệu đang giữ là dữ liệu đã lưu, không phải báo giá trực tiếp mới.":" Chưa có bản ghi SSI được lưu trong phiên hiện tại.";
+    if ((data.meta||data).state === "LUNCH_BREAK" || data.market_phase === "BREAK") return "Thị trường đang nghỉ trưa; WebSocket SSI vẫn kết nối và chờ báo giá khi phiên chiều mở lại."+saved;
+    return "Thị trường ngoài giờ giao dịch liên tục; WebSocket SSI vẫn kết nối và chờ báo giá khi phiên mở lại."+saved;
   }
   if (data.feed_state === "awaiting_quote") return "Đã kết nối, đang chờ báo giá đầu tiên";
   if (data.feed_state === "error") return "Kết nối dữ liệu gặp lỗi";
@@ -234,7 +242,7 @@ async function refreshStatus() {
       data.connection_status === "connected" ? "connected" :
       ["error", "disconnected"].includes(data.connection_status) ? "error" : ""
     );
-    $("#last-update").textContent = fmtTime(data.last_data_at);
+    $("#last-update").textContent = fmtDateTime(data.data_as_of || data.meta?.data_as_of || data.last_data_at);
     const notice = $("#global-notice");
     const feedWarning = ["disconnected", "error", "delayed", "stale"].includes(data.feed_state);
     notice.className = "notice " + (live && feedWarning ? "notice-error" : live && (liveReady || data.feed_state === "outside_session") ? "notice-live" : "notice-demo");

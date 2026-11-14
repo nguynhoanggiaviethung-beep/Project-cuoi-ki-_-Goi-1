@@ -79,3 +79,17 @@ def rank_rows(rows, minimum_bars):
     return {"eligible": eligible, "lowest_spread": low_spread, "highest_depth": high_depth,
             "spread_widening": widening, "depth_falling": falling,
             "one_tick_count": one_tick, "one_tick_share": one_tick / len(eligible) if eligible else None}
+
+def attach_rank_movement(current_rows, previous_rows):
+    """Attach 1-based ranks and movement versus an ordered historical ranking."""
+    previous_rank={row["symbol"]:index+1 for index,row in enumerate(previous_rows)}
+    result=[]
+    for index,row in enumerate(current_rows):
+        item=dict(row)
+        current_rank=index+1
+        prior=previous_rank.get(item["symbol"])
+        item["rank"]=current_rank
+        item["previous_rank"]=prior
+        item["rank_change"]=(prior-current_rank) if prior is not None else None
+        result.append(item)
+    return result

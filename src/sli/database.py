@@ -209,6 +209,14 @@ def data_quality_summary(source):
             "symbols": [{"symbol": row["symbol"], "observations": row["n"]} for row in symbols]}
 
 
+def previous_bar_session(source, session_date):
+    """Return the latest stored bar session strictly before session_date."""
+    with connect() as db:
+        row=db.execute("SELECT MAX(session_date) FROM bars_1m WHERE source=? AND session_date<?",
+                       (source,str(session_date)[:10])).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def fetch_bars_window_by_symbol(source, start_at, end_before, max_minutes=390):
     """Fetch completed minute bars for the same wall-clock window across symbols."""
     max_minutes=max(1,min(int(max_minutes),390))
@@ -263,18 +271,46 @@ def latest_bar_minute(source):
 
 
 def latest_historical_date(source="ssi"):
+    # Ask the indexed per-symbol date range for each catalogued common stock.
+    # MAX(replace(trading_date,...)) forced a full scan of millions of OHLC rows.
     with connect() as db:
-        row=db.execute("SELECT MAX(replace(trading_date,'/','-')) FROM historical_prices WHERE source=? AND timeframe='1d'",(source,)).fetchone()
-    return row[0] if row and row[0] else None
+        row=db.execute("""SELECT MAX(last_date) FROM (
+            SELECT (SELECT MAX(h.trading_date) FROM historical_prices h
+                    WHERE h.source=c.source AND h.symbol=c.symbol AND h.timeframe='1d') AS last_date
+            FROM securities_catalog c
+            WHERE c.source=? AND lower(trim(c.stock_type))='stock'
+        )""",(source,)).fetchone()
+    return str(row[0]).replace("/","-") if row and row[0] else None
+
+
+def historical_date_bounds(source="ssi"):
+    """Earliest and latest stored daily OHLC date for ordinary listed stocks."""
+    with connect() as db:
+        row=db.execute("""SELECT MIN(first_date) AS earliest_date,MAX(last_date) AS latest_date
+            FROM (
+              SELECT
+                (SELECT MIN(h.trading_date) FROM historical_prices h
+                 WHERE h.source=c.source AND h.symbol=c.symbol AND h.timeframe='1d') AS first_date,
+                (SELECT MAX(h.trading_date) FROM historical_prices h
+                 WHERE h.source=c.source AND h.symbol=c.symbol AND h.timeframe='1d') AS last_date
+              FROM securities_catalog c
+              WHERE c.source=? AND lower(trim(c.stock_type))='stock'
+            )""",(source,)).fetchone()
+    return {"earliest_date":str(row["earliest_date"]).replace("/","-") if row and row["earliest_date"] else None,
+            "latest_date":str(row["latest_date"]).replace("/","-") if row and row["latest_date"] else None}
 
 
 def latest_data_as_of(source="ssi"):
+    latest_day=latest_historical_date(source)
+    latest_day_db=latest_day.replace("-","/") if latest_day else None
     with connect() as db:
         row=db.execute("""SELECT MAX(stamp) FROM (
             SELECT MAX(received_at_vn) stamp FROM observations WHERE source=?
             UNION ALL SELECT MAX(minute_vn) FROM bars_1m WHERE source=?
-            UNION ALL SELECT MAX(fetched_at) FROM historical_prices WHERE source=? AND timeframe='1d'
-        )""",(source,source,source)).fetchone()
+            UNION ALL SELECT MAX(h.fetched_at) FROM securities_catalog c CROSS JOIN historical_prices h
+                WHERE c.source=? AND lower(trim(c.stock_type))='stock'
+                  AND h.source=c.source AND h.symbol=c.symbol AND h.timeframe='1d' AND h.trading_date=?
+        )""",(source,source,source,latest_day_db)).fetchone()
     return row[0] if row and row[0] else None
 
 
@@ -344,13 +380,16 @@ def connect():
     db = sqlite3.connect(config.DB_PATH, timeout=30, factory=_ClosingConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
-    db.execute("PRAGMA journal_mode = WAL")
     db.execute("PRAGMA synchronous = NORMAL")
     return db
 
 
 def initialize():
     with connect() as db:
+        # WAL is a database-level setting. Set it during initialization only;
+        # repeating this pragma on every request connection can serialize
+        # otherwise independent reads behind a writer.
+        db.execute("PRAGMA journal_mode = WAL")
         db.executescript("""
         CREATE TABLE IF NOT EXISTS observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1291,29 +1330,74 @@ def fetch_market_breadth(limit=90, source="ssi", start_date=None, end_date=None)
 
 
 def fetch_market_ohlc_sessions(limit=60, source="ssi", start_date=None, end_date=None):
-    """Aggregate daily SSI OHLC for catalogued common stocks only."""
+    """Aggregate common-stock OHLC using indexed per-symbol date ranges."""
     limit=max(1,min(int(limit),10000))
-    with connect() as db:
-        rows=db.execute("""WITH common_daily AS (
-            SELECT h.symbol,h.trading_date,h.value,h.volume,h.fetched_at,h.close_price,
-                LAG(h.close_price) OVER(PARTITION BY h.symbol ORDER BY h.trading_date) AS prior_close
-            FROM historical_prices h
-            JOIN securities_catalog c ON c.source=h.source AND c.symbol=h.symbol
-            WHERE h.source=? AND h.timeframe='1d' AND lower(trim(c.stock_type))='stock'
+    # SSI dates are zero-padded YYYY/MM/DD strings; normalize input once to
+    # preserve index use on (source,symbol,timeframe,trading_date).
+    start_db=str(start_date).replace("-","/")[:10] if start_date else None
+    end_db=str(end_date).replace("-","/")[:10] if end_date else None
+    bounded_filters=[]
+    range_params=[]
+    if start_db:
+        bounded_filters.append("AND h.trading_date>=?")
+        range_params.append(start_db)
+    if end_db:
+        bounded_filters.append("AND h.trading_date<=?")
+        range_params.append(end_db)
+    bounded_filter=" ".join(bounded_filters)
+    final_filters=[]
+    final_params=[]
+    if start_db:
+        final_filters.append("trading_date>=?")
+        final_params.append(start_db)
+    if end_db:
+        final_filters.append("trading_date<=?")
+        final_params.append(end_db)
+    final_filter=("WHERE "+" AND ".join(final_filters)) if final_filters else ""
+    if start_db:
+        prior_cte="""prior AS (
+          SELECT h.symbol,h.trading_date,h.value,h.volume,h.fetched_at,h.close_price
+          FROM securities s CROSS JOIN historical_prices h
+          WHERE h.source=? AND h.symbol=s.symbol AND h.timeframe='1d'
+            AND h.trading_date=(
+              SELECT MAX(p.trading_date) FROM historical_prices p
+              WHERE p.source=? AND p.symbol=s.symbol AND p.timeframe='1d'
+                AND p.trading_date<?
+            )
+        )"""
+        prior_params=[source,source,start_db]
+    else:
+        prior_cte="prior AS (SELECT symbol,trading_date,value,volume,fetched_at,close_price FROM historical_prices WHERE 0)"
+        prior_params=[]
+    query=f"""WITH securities AS (
+          SELECT symbol FROM securities_catalog
+          WHERE source=? AND lower(trim(stock_type))='stock'
+        ), bounded AS (
+          SELECT h.symbol,h.trading_date,h.value,h.volume,h.fetched_at,h.close_price
+          FROM securities s CROSS JOIN historical_prices h
+          WHERE h.source=? AND h.symbol=s.symbol AND h.timeframe='1d' {bounded_filter}
+        ), {prior_cte}, selected_daily AS (
+          SELECT * FROM bounded UNION ALL SELECT * FROM prior
+        ), common_daily AS (
+          SELECT symbol,trading_date,value,volume,fetched_at,close_price,
+              LAG(close_price) OVER(PARTITION BY symbol ORDER BY trading_date) AS prior_close
+          FROM selected_daily
         ), sessions AS (
-            SELECT trading_date,
-                SUM(value) AS total_value, SUM(volume) AS total_volume,
-                SUM(CASE WHEN close_price>prior_close THEN 1 ELSE 0 END) AS advancing,
-                SUM(CASE WHEN close_price<prior_close THEN 1 ELSE 0 END) AS declining,
-                SUM(CASE WHEN close_price=prior_close THEN 1 ELSE 0 END) AS unchanged,
-                COUNT(DISTINCT CASE WHEN value IS NOT NULL THEN symbol END) AS value_symbols,
-                COUNT(DISTINCT CASE WHEN volume IS NOT NULL THEN symbol END) AS volume_symbols,
-                COUNT(DISTINCT symbol) AS symbol_count,
-                MAX(fetched_at) AS data_as_of
-            FROM common_daily GROUP BY trading_date
-        ) SELECT * FROM sessions WHERE (? IS NULL OR replace(trading_date,'/','-')>=?)
-          AND (? IS NULL OR replace(trading_date,'/','-')<=?) ORDER BY trading_date DESC LIMIT ?""",
-          (source,start_date,start_date,end_date,end_date,limit)).fetchall()
+          SELECT trading_date,
+              SUM(value) AS total_value, SUM(volume) AS total_volume,
+              SUM(CASE WHEN close_price>prior_close THEN 1 ELSE 0 END) AS advancing,
+              SUM(CASE WHEN close_price<prior_close THEN 1 ELSE 0 END) AS declining,
+              SUM(CASE WHEN close_price=prior_close THEN 1 ELSE 0 END) AS unchanged,
+              COUNT(DISTINCT CASE WHEN value IS NOT NULL THEN symbol END) AS value_symbols,
+              COUNT(DISTINCT CASE WHEN volume IS NOT NULL THEN symbol END) AS volume_symbols,
+              COUNT(DISTINCT symbol) AS symbol_count, MAX(fetched_at) AS data_as_of
+          FROM common_daily GROUP BY trading_date
+        )
+        SELECT * FROM sessions {final_filter}
+        ORDER BY trading_date DESC LIMIT ?"""
+    params=(source,source,*range_params,*prior_params,*final_params,limit)
+    with connect() as db:
+        rows=db.execute(query,params).fetchall()
     return list(reversed([dict(row) for row in rows]))
 
 

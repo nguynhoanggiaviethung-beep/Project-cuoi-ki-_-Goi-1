@@ -65,3 +65,17 @@ def test_closed_market_marks_partial_latest_ohlc_pending_and_uses_last_complete_
     assert result["pending_ohlc_missing"] is True
     assert result["session_date"] == "2026/11/05"
     assert result["note"] == "Dữ liệu OHLC ngày 2026-11-06 chưa được đồng bộ từ SSI."
+
+
+def test_closed_session_reuses_same_ohlc_rows_for_value_and_volume_views():
+    rows = [daily(2_000_000_000_000, 720_000_000, index=0)]
+    meta = {"state": "CLOSED", "closed_reason": "weekend", "session_date": "2030-02-03"}
+    with patch("src.sli.market_context_service.database.fetch_market_ohlc_sessions", return_value=rows) as fetch:
+        value = get_market_turnover(market_meta=meta, metric="value")
+        volume = get_market_turnover(market_meta=meta, metric="volume")
+
+    assert fetch.call_count == 1
+    assert value["rows"][0]["value"] == 2
+    assert value["unit"] == "nghìn tỷ đồng"
+    assert volume["rows"][0]["value"] == 720
+    assert volume["unit"] == "triệu cổ phiếu"

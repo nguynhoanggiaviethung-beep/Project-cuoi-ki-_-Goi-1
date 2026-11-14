@@ -1,5 +1,6 @@
 """SSI FastConnect market data collector for the full listed-stock universe."""
 import dataclasses
+import logging
 import os
 import queue
 import threading
@@ -8,10 +9,56 @@ from datetime import datetime, timedelta, time as datetime_time, timezone
 
 from ssi_sdk import Auth, Config, Data, Stream
 from ssi_sdk.enums import Board
+from ssi_sdk.exceptions import AuthenticationError, ReauthenticationRequired
 from ssi_sdk.models.streaming import QuoteMessage, TradeMessage
 
 from . import config, database
 from .analytics import map_message, number_or_none, _to_local_timestamp
+
+
+_LOG = logging.getLogger(__name__)
+
+def _enable_automatic_data_reauthentication(auth):
+    """Retry SSI FastConnect Data login when an SDK refresh token expires.
+
+    The Data API authenticates with the configured consumer credentials. The SDK's
+    generic token manager otherwise stops and asks for OTP when refresh is rejected.
+    Keep OTP out of the worker and retry login once through the SDK's normal auth API.
+    """
+    manager = auth.token_manager
+    original_refresh = manager.refresh
+    original_ensure = manager.ensure_authenticated
+    lock = threading.RLock()
+
+    def authenticate_again():
+        with lock:
+            # A parallel REST/stream callback may already have renewed the token.
+            if manager.access_token and not manager.is_token_expired:
+                return manager.token
+            token = auth.authenticate()
+            _LOG.info("SSI FastConnect Data access token renewed; restoring stream.")
+            return token
+
+    def refresh_with_login_fallback():
+        try:
+            return original_refresh()
+        except ReauthenticationRequired:
+            return authenticate_again()
+
+    def ensure_with_login_fallback(*args, **kwargs):
+        try:
+            return original_ensure(*args, **kwargs)
+        except ReauthenticationRequired:
+            return authenticate_again().access_token
+        except AuthenticationError:
+            # A failed refresh can clear the SDK token before the stream asks again.
+            if manager.token is None:
+                return authenticate_again().access_token
+            raise
+
+    manager.refresh = refresh_with_login_fallback
+    manager.ensure_authenticated = ensure_with_login_fallback
+    return auth
 
 
 class SsiCollector:
@@ -309,6 +356,7 @@ class SsiCollector:
         self.runtime.update(collector_run_id=run_id,worker_id=self.worker_id)
         try:
             auth=Auth(self._make_config());auth.authenticate()
+            _enable_automatic_data_reauthentication(auth)
             symbols=self._load_catalog(auth)
             if not symbols:raise RuntimeError("SSI catalog không trả về cổ phiếu thường; không dùng dữ liệu giả lập.")
             self._writer=threading.Thread(target=self._write_loop,name="sli-ssi-db-writer",daemon=True);self._writer.start()
