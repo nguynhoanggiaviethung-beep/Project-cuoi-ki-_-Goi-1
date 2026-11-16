@@ -27,9 +27,9 @@ def main() -> int:
     lock = CollectorWorkerLock(config.DB_PATH)
     try:
         lock.acquire()
-    except WorkerAlreadyRunning as exc:
-        print(str(exc), flush=True)
-        return 2
+    except WorkerAlreadyRunning:
+        print("SSI collector worker đã chạy; bỏ qua lần khởi động trùng.", flush=True)
+        return 0
 
     worker_id = str(uuid.uuid4())
     runtime = RuntimeState()

@@ -60,7 +60,15 @@ Sau đó mở <http://127.0.0.1:8001/>. Mỗi cửa sổ Terminal có thể gi�
 
 ## Kết nối dữ liệu SSI
 
-Khi mở web, hộp thoại cho phép bạn kết nối SSI FastConnect hoặc tiếp tục xem mà chưa kết nối. Chọn **Kết nối dữ liệu** để mở collector dưới dạng tiến trình riêng; không cần mở Terminal thứ hai. Nút ngắt kết nối trong hộp thoại gửi yêu cầu dừng collector. Web không tự kết nối nếu bạn chưa chọn.
+Worker SSI FastConnect chạy riêng với web để lưu quote, khớp lệnh và đồng bộ OHLC vào SQLite. Có thể cài tác vụ Windows để worker tự chạy khi đăng nhập và lúc 08:45 từ thứ Hai đến thứ Sáu; worker giữ kết nối qua các phiên và cập nhật OHLC hằng ngày. Mở PowerShell trong thư mục dự án và cài một lần:
+
+```powershell
+.\scripts\install_daily_collector_task.ps1
+```
+
+Tác vụ đọc khóa từ `.env`, ghi log tại `logs\ssi_worker.log`, tự thử lại tối đa 3 lần nếu worker thoát lỗi và khóa tiến trình chống chạy trùng. Máy cần bật và có mạng; hiện cấu hình tác vụ chạy trong phiên người dùng Windows. Có thể xem trạng thái trong web hoặc Task Scheduler với tên **Stock Liquidity Intelligence - SSI Collector**. Để gỡ tác vụ: `Unregister-ScheduledTask -TaskName "Stock Liquidity Intelligence - SSI Collector" -Confirm:$false`.
+
+Khi không cài tác vụ tự động, hộp thoại web vẫn có nút **Kết nối dữ liệu** để chạy worker thủ công.
 
 - Điền `SSI_API_KEY` và `SSI_API_SECRET` vào `.env` bằng thông tin SSI FastConnect. Không chia sẻ hai khóa này trong chat.
 - Để khởi động collector thủ công khi cần xử lý sự cố, mở Terminal thứ hai và chạy:
@@ -81,7 +89,7 @@ Không chia sẻ hoặc commit file `.env`; file này chứa thông tin đăng n
 
 - Worker dùng SSI FastConnect WebSocket cho quote; snapshot, chỉ số và trạng thái lần chạy được lưu trong SQLite.
 - Đồng bộ OHLC ngày dùng REST SSI theo từng mã từ `HISTORY_START_DATE` (mặc định 01/01/2000), phân trang tối đa 10 trang × 1.000 dòng theo giới hạn tài liệu SSI; mỗi yêu cầu được giãn theo `HISTORY_REST_MIN_INTERVAL_SECONDS` và lỗi tạm thời được retry. Mã chỉ được đánh dấu backfill hoàn tất khi API trả trang cuối ngắn hơn page size; chạm giới hạn trang sẽ được báo là chưa xác nhận hết lịch sử.
-- Lịch sử OHLC đầy đủ hơn được tải nền cùng worker; lần đầu có thể mất nhiều thời gian và chưa chạy cho tới khi collector được khởi chạy. Các lần sau chỉ cập nhật cửa sổ gần đây cho mã đã backfill.
+- Lịch sử OHLC ban đầu và phần bổ sung được tải nền cùng worker. Worker kiểm tra lại dữ liệu OHLC mỗi ngày giao dịch, đồng bộ tăng dần theo từng mã và thử bù dữ liệu sau khi đóng phiên; dữ liệu sổ lệnh không thể suy ra từ OHLC.
 - Để phân tích spread/depth theo phiên, giữ backend chạy trong ít nhất 5 phiên giao dịch có quote thật. OHLC ngày có thể có nhiều phiên nhưng không thay thế lịch sử sổ lệnh.
 - Kiểm tra `/api/status`, `/api/quality` và `/api/collector/runs` để xem heartbeat, quote đã nhận, message trễ/trùng/bị rơi, lỗi và lịch sử phiên chạy. Trạng thái `connected` chỉ phản ánh kết nối; cần kiểm tra thời điểm quote mới nhất để xác nhận dữ liệu.
 - Mọi mốc nhận/tính toán hiển thị theo `Asia/Ho_Chi_Minh`; cột UTC được lưu kèm để xử lý kỹ thuật. Dữ liệu gốc nhạy cảm được lọc trước khi lưu.

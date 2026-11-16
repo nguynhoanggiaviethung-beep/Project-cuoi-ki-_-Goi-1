@@ -24,7 +24,9 @@
   function overviewWidgetNodes(url){if(url.includes('/api/market-turnover'))return ['#market-turnover-chart'];if(url.includes('/api/market-depth'))return ['#depth-chart'];if(url.includes('/api/liquidity-map'))return ['#liquidity-map'];if(url.includes('/api/trades'))return ['#live-trade-tape'];if(url.includes('/api/rankings'))return ['#overview-ranking'];if(url.includes('/api/intraday-profile'))return ['#intraday-profile'];if(url.includes('/api/market-leaders'))return ['#spread-compare','#coverage-chart'];if(url.includes('/api/market-breadth'))return ['#spread-chart','#imbalance-chart','#historical-price-chart'];if(url.includes('/api/overview'))return ['#spread-chart','#overview-data-context'];return [];}
   function setOverviewWidgetState(url,state,message=''){for(const selector of overviewWidgetNodes(url)){const node=document.querySelector(selector);if(!node)continue;node.dataset.widgetState=state;node.setAttribute('aria-busy',String(state==='loading'));let stale=node.querySelector(':scope > .widget-stale-badge');if(state==='stale'){if(!stale){stale=document.createElement('span');stale.className='widget-stale-badge';stale.setAttribute('role','status');stale.textContent='Chưa làm mới được · đang giữ dữ liệu đã tải';node.appendChild(stale);}node.setAttribute('aria-description','Đang hiển thị dữ liệu SSI đã tải gần nhất; lượt làm mới mới nhất chưa thành công.');}else{stale?.remove();node.removeAttribute('aria-description');}if(state==='loading'&&!node.dataset.widgetReady)node.innerHTML='<div class="widget-skeleton" aria-label="Đang tải dữ liệu"></div>';else if(state==='empty'&&!node.dataset.widgetReady)node.innerHTML='<div class="empty-state">'+esc(message||'Chưa có dữ liệu SSI trong phạm vi đã chọn.')+'</div>';else if(state==='error'&&!node.dataset.widgetReady)node.innerHTML='<div class="empty-state research-retry"><span>Khối này chưa tải được dữ liệu SSI.</span><button type="button" class="button button-secondary" data-retry-overview>Thử lại</button></div>';}}
   async function call(url,options={}){
-    const historicalRoute=/^\/api\/(market-turnover|market-breadth|price-history|market-leaders)/.test(url),requestTimeout=historicalRoute?90000:15000;
+    const historicalRoute=/^\/api\/(market-turnover|market-breadth|price-history|market-leaders)/.test(url),
+      heavyAggregateRoute=/^\/api\/(market-depth|liquidity-map|rankings|intraday-profile)/.test(url),
+      requestTimeout=historicalRoute||heavyAggregateRoute?90000:15000;
     const isOverview=window.sliRoute==='overview'&&!options.noStore;
     if(!isOverview){const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),requestTimeout);try{const r=await fetch(url,{...options,signal:options.signal||controller.signal});if(!r.ok)throw Error('HTTP '+r.status);return await r.json();}finally{clearTimeout(timeout);}}
     const currentKey=overviewFilterKey();
@@ -622,6 +624,7 @@
   async function enhancedOverview(){
     if(overviewRefreshPromise)return overviewRefreshPromise;
     overviewRefreshPromise=(async()=>{
+    let overviewCoreRendered=false;
     try{
       const previousLatestDate=overviewDataStore.bounds?.latest_date;
       const freshBounds=await loadOverviewDateBounds();
@@ -681,6 +684,7 @@
       overviewChartHeading('imbalance-chart',allMode?'Mất cân bằng trung vị toàn bộ mã':`Mất cân bằng mua/bán · ${chosen}`,`Chỉ số từ cùng bar một phút đã hoàn tất`);
       lineChart(document.querySelector('#spread-chart'),line,'spread_bps','Spread trung vị (điểm cơ bản, bps)');
       lineChart(document.querySelector('#imbalance-chart'),line,'queue_imbalance','Mất cân bằng bid/ask (tỷ lệ)');
+      overviewCoreRendered=true;
       const method='Mỗi phút: lấy trung vị snapshot hợp lệ của từng mã, rồi lấy trung vị giữa các mã. Hai biểu đồ spread dùng cùng tập bar, cùng cách tính và cùng số mã tham gia; phút hiện tại chưa hoàn tất bị loại.';
       setChartNote('spread-chart',`${allMode?'Tất cả mã. ':`Chỉ ${chosen}. `}${method} Số mã tham gia hiển thị khi rê chuột.`);
       setChartNote('imbalance-chart',`${allMode?'Tất cả mã. ':`Chỉ ${chosen}. `}${method} Dương nghiêng về khối lượng bid, âm nghiêng về ask.`);
@@ -688,12 +692,17 @@
       const latestMin=profileData.profile?.at(-1)?.minute||'—';
       const freshness=!status.market_session_expected?'Ngoài giờ liên tục; đang xem các bar SSI đã hoàn tất gần nhất.':status.processing_delayed?'Luồng SSI đang nhận dữ liệu nhưng bộ lưu có độ trễ.':'SSI đang trong phiên liên tục.';
       const context=document.querySelector('#overview-data-context');if(context)context.textContent=`${freshness} Cửa sổ biểu đồ: ${period} (${windowMinutes} phút), cập nhật đến bar ${latestMin}; loại phút chưa hoàn tất. KPI lấy quote mới nhất của mỗi mã trong đúng cửa sổ. Biểu đồ spread và diễn biến phiên dùng cùng các bar đã hoàn tất; số mã ở mỗi phút hiện khi rê chuột.`;
-      const ranking=await call(`/api/rankings?window_minutes=${windowMinutes}`);
-      renderOverviewSpreadRanking(ranking,windowMinutes,status);
+      try{
+        const ranking=await call(`/api/rankings?window_minutes=${windowMinutes}&limit=5`);
+        renderOverviewSpreadRanking(ranking,windowMinutes,status);
+      }catch{
+        const panel=document.querySelector('#overview-ranking');
+        if(panel)panel.innerHTML='<div class="ranking-empty">Chưa tải được bảng xếp hạng; các biểu đồ khác vẫn hoạt động.</div>';
+      }
       const reading=document.querySelector('#imbalance-reading');if(reading){const value=med(valid.map(r=>r.queue_imbalance));reading.textContent=value==null?'Chưa đủ quote hợp lệ để diễn giải.':Math.abs(value)<.1?'Khối lượng hai phía tương đối cân bằng ở quote mới nhất mỗi mã.':value>0?`Khối lượng bid trội hơn, trung vị ${num(value,3)}.`:`Khối lượng ask trội hơn, trung vị ${num(value,3)}.`;}
       const analysis=document.querySelector('#overview-analysis');if(analysis)analysis.textContent=`Phạm vi KPI: ${num(active.length,0)} mã có quote trong cửa sổ, ${num(valid.length,0)} quote hợp lệ (mỗi mã tối đa một quote mới nhất). Phạm vi biểu đồ: bar một phút đã hoàn tất trong ${windowMinutes} phút. Nguồn SSI FastConnect; đơn vị và phép tính được ghi dưới từng biểu đồ.`;
       await loadResearchPanels(profileData,windowMinutes,status);
-    }catch(e){const node=document.querySelector('#spread-chart'),hasPrior=!!node?.dataset.widgetReady;if(hasPrior){for(const url of ['/api/overview','/api/market-depth','/api/rankings','/api/intraday-profile','/api/trades','/api/market-leaders'])setOverviewWidgetState(url,'stale');}else if(node)node.innerHTML='<div class="empty-state research-retry"><span>Chưa tải được biểu đồ thanh khoản trong cửa sổ đã chọn.</span><button type="button" class="button button-secondary" id="retry-overview">Thử lại</button></div>';}
+    }catch(e){const node=document.querySelector('#spread-chart');if(overviewCoreRendered){const panel=document.querySelector('#overview-ranking');if(panel&&!panel.querySelector('.ranking-board'))panel.innerHTML='<div class="ranking-empty">Bảng xếp hạng đang tải chưa thành công; dữ liệu biểu đồ vẫn được giữ.</div>';}else{const hasPrior=!!node?.dataset.widgetReady;if(hasPrior){for(const url of ['/api/overview','/api/market-depth','/api/rankings','/api/intraday-profile','/api/trades','/api/market-leaders'])setOverviewWidgetState(url,'stale');}else if(node)node.innerHTML='<div class="empty-state research-retry"><span>Chưa tải được biểu đồ thanh khoản trong cửa sổ đã chọn.</span><button type="button" class="button button-secondary" id="retry-overview">Thử lại</button></div>';}}
     })().finally(()=>{overviewRefreshPromise=null;if(overviewRefreshQueued){overviewRefreshQueued=false;setTimeout(()=>void enhancedOverview(),0);}});
     return overviewRefreshPromise;
   }

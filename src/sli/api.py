@@ -786,7 +786,7 @@ def rankings(limit: int = Query(default=500, ge=1, le=2000), window_minutes: int
             if not valid: continue
             latest_spread,latest_depth=valid[-1]["spread_bps"],valid[-1]["total_depth_value"]
             results.append({"symbol":ticker,"snapshot_count":len(rows),"sample_count":len(valid),"bar_count":0,
-                "sample_kind":"synthetic_demo_snapshots","median_spread_bps":median(spreads) if spreads else None,
+                "sample_kind":f"{source}_observations","median_spread_bps":median(spreads) if spreads else None,
                 "median_total_depth_value":median(depths) if depths else None,"latest_spread_bps":latest_spread,
                 "latest_total_depth_value":latest_depth,"spread_expansion_bps":latest_spread-median(spreads) if spreads and latest_spread is not None else None,
                 "depth_change_pct":((latest_depth/median(depths)-1)*100) if depths and median(depths) and latest_depth is not None else None})
@@ -885,7 +885,7 @@ def liquidity_map(window_minutes:int=Query(default=120,ge=15,le=390),
             valid=[r for r in rows if r["validation_status"]=="valid"]
             spreads=_numeric([r["spread_bps"] for r in valid]); depths=_numeric([r["total_depth_value"] for r in valid])
             if len(valid)>=minimum and spreads and depths:
-                points.append({"symbol":ticker,"median_spread_bps":median(spreads),"median_total_depth_value":median(depths),"sample_count":len(valid),"sample_kind":"synthetic_demo_snapshots"})
+                points.append({"symbol":ticker,"median_spread_bps":median(spreads),"median_total_depth_value":median(depths),"sample_count":len(valid),"sample_kind":f"{selected_source}_observations"})
     security_metadata=database.fetch_security_metadata('ssi')
     quote_metadata=database.fetch_latest_quote_details(selected_source,[point['symbol'] for point in points])
     for point in points:
@@ -1118,10 +1118,7 @@ def stop_collector():
 
 @app.post("/api/collector/demo")
 def use_demo():
-    ssi_collector.stop()
-    runtime.update(mode="demo", connection_status="demo", last_error=None)
-    _start_demo_loop()
-    return {"ok": True, "status": runtime.snapshot()}
+    raise HTTPException(status_code=410, detail="Chế độ mô phỏng đã tắt; hệ thống chỉ dùng dữ liệu SSI.")
 
 
 

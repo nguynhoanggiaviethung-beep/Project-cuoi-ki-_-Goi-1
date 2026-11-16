@@ -575,7 +575,7 @@ def initialize():
         # The UTC-only indexes made every bar refresh scan the full observations table.
         db.execute("CREATE INDEX IF NOT EXISTS ix_observations_symbol_received_vn "
                    "ON observations(source,symbol,received_at_vn)")
-    seed_demo_if_empty()
+    # Synthetic demo data is disabled; use SSI data only.
 
 
 def _migrate_schema(db):

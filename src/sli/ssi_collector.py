@@ -282,6 +282,28 @@ class SsiCollector:
             now=datetime.now(config.TIMEZONE)
         self.runtime.update(historical_sync_phase="awaiting_next_session" if not self._stop.is_set() else "stopped")
 
+    def _history_scheduler(self, auth, symbols):
+        """Keep SSI OHLC history current once per configured trading day."""
+        last_sync_date = None
+        while not self._stop.is_set():
+            now = datetime.now(config.TIMEZONE)
+            session_date = now.date().isoformat()
+            is_weekday = now.weekday() < 5
+            is_configured_holiday = session_date in config.MARKET_HOLIDAYS
+            if is_weekday and not is_configured_holiday and session_date != last_sync_date:
+                _LOG.info("Bắt đầu đồng bộ OHLC SSI cho ngày %s.", session_date)
+                try:
+                    self._sync_history(auth, symbols)
+                    last_sync_date = session_date
+                except Exception as exc:
+                    message = f"SSI OHLC daily sync {type(exc).__name__}: {str(exc)[:180]}"
+                    _LOG.exception("Đồng bộ OHLC SSI ngày %s thất bại; sẽ thử lại sau 5 phút.", session_date)
+                    database.log_ingestion_error(message, source="ssi")
+                    self.runtime.update(historical_sync_phase="retry_pending", last_error=message)
+                    if self._stop.wait(300):
+                        break
+            self._stop.wait(30)
+
     @staticmethod
     def _quote_dict(message):
         q=dataclasses.asdict(message) if dataclasses.is_dataclass(message) else message if isinstance(message,dict) else None
@@ -428,7 +450,7 @@ class SsiCollector:
             except Exception as exc:
                 self.runtime.update(subscription_status="unverified",subscription_error=f"Không đọc được danh sách subscription SSI: {str(exc)[:180]}")
             # Daily OHLC is fetched per symbol; run incrementally while the stream remains active.
-            self._history_thread=threading.Thread(target=self._sync_history,args=(auth,symbols),name="sli-ssi-history",daemon=True);self._history_thread.start()
+            self._history_thread=threading.Thread(target=self._history_scheduler,args=(auth,symbols),name="sli-ssi-history",daemon=True);self._history_thread.start()
             self.runtime.update(connection_status="connected",last_error=None)
             database.set_collector_run_status(run_id,"running")
             run_status="stopped"

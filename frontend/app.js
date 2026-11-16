@@ -247,9 +247,10 @@ async function refreshStatus() {
     const feedWarning = ["disconnected", "error", "delayed", "stale"].includes(data.feed_state);
     notice.className = "notice " + (live && feedWarning ? "notice-error" : live && (liveReady || data.feed_state === "outside_session") ? "notice-live" : "notice-demo");
     const clock=data.meta||data;
+    const latestOhlcDate=clock.latest_historical_date||data.latest_historical_date||clock.session_date;
     const marketMessage=clock.state==="IN_SESSION"?`Trong phiên · cập nhật mỗi ${clock.refresh_seconds||5} giây`:
       clock.state==="LUNCH_BREAK"?`Nghỉ trưa · dữ liệu đến 11:30`:
-      `Ngoài phiên · phiên gần nhất ${fmtDate(clock.session_date)} · mở phiên lúc ${fmtTime(clock.next_open_at)}`;
+      `Ngoài phiên · OHLC SSI mới nhất đang có: ${fmtDate(latestOhlcDate)} · mở phiên lúc ${fmtTime(clock.next_open_at)}`;
     let message = live
       ? feedStateText(data) + ". Nguồn SSI FastConnect. Trạng thái kết nối: " + viStatus(data.connection_status) + "."
       : "MÔ PHỎNG (DEMO) · Dữ liệu tổng hợp để xem trước, không phải dữ liệu thị trường thật.";
@@ -313,6 +314,7 @@ async function loadSymbols() {
   });
 }
 async function loadOverview() {
+  let overviewCoreRendered = false;
   try {
     await loadSymbols();
     const selected = $("#overview-symbol").value;
@@ -328,20 +330,26 @@ async function loadOverview() {
     $("#overview-symbol-label").textContent = symbol || "Tất cả mã";
     renderLineChart("#spread-chart", data.series, "spread_bps", "#008A45", "Chênh lệch giá mua – bán (spread) theo thời gian");
       renderDepthChart("#depth-chart", data.series);
-    const rankings = await api("/api/rankings?limit=" + limit);
-    if (window.renderOverviewSpreadRanking) {
-      window.renderOverviewSpreadRanking(rankings, Number($("#overview-limit")?.value || 60), window.MarketClock?.get() || {});
-    } else {
-      const preview = (rankings.lowest_spread || []).slice(0, 5).map((row, index) => [
-        '<strong>' + (index + 1) + '</strong>',
-        '<strong>' + escapeHtml(row.symbol) + '</strong>',
-        fmt(row.median_spread_bps) + " điểm cơ bản (bps)",
-        fmt(row.snapshot_count, 0)
-      ]);
-      $("#overview-ranking").innerHTML = table(["Hạng", "Mã", "Trung vị chênh lệch giá (spread)", "Số ảnh chụp dữ liệu (snapshots)"], preview);
+    overviewCoreRendered = true;
+    try {
+      const rankings = await api("/api/rankings?limit=5&window_minutes=" + limit);
+      if (window.renderOverviewSpreadRanking) {
+        window.renderOverviewSpreadRanking(rankings, Number($("#overview-limit")?.value || 60), window.MarketClock?.get() || {});
+      } else {
+        const preview = (rankings.lowest_spread || []).slice(0, 5).map((row, index) => [
+          '<strong>' + (index + 1) + '</strong>',
+          '<strong>' + escapeHtml(row.symbol) + '</strong>',
+          fmt(row.median_spread_bps) + " điểm cơ bản (bps)",
+          fmt(row.snapshot_count, 0)
+        ]);
+        $("#overview-ranking").innerHTML = table(["Hạng", "Mã", "Trung vị chênh lệch giá (spread)", "Số ảnh chụp dữ liệu (snapshots)"], preview);
+      }
+    } catch {
+      const ranking = $("#overview-ranking");
+      if (ranking) ranking.innerHTML = '<div class="empty-state">Chưa tải được bảng xếp hạng; các biểu đồ vẫn hiển thị độc lập.</div>';
     }
   } catch (error) {
-    $("#spread-chart").innerHTML = '<div class="empty-state">Lỗi tải dữ liệu: ' + escapeHtml(error.message) + '</div>';
+    if (!overviewCoreRendered) $("#spread-chart").innerHTML = '<div class="empty-state">Chưa tải được biểu đồ thanh khoản trong cửa sổ đã chọn.</div>';
   }
 }
 async function loadDetail() {
