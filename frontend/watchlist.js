@@ -25,6 +25,16 @@
   window.watchAddQuickButtons=()=>{for(const selector of ['#ranking-spread','#ranking-depth','#alerts-table','#view-rankings'])$(selector)?.querySelectorAll('tbody tr').forEach(row=>{if(row.querySelector('[data-quick-watch-symbol]'))return;const symbol=(selector==='#alerts-table'?row.cells?.[0]:row.querySelector('[data-symbol]')||row.cells?.[1])?.textContent?.trim()||'';if(!symbol||symbol==='ALL'||!/^[A-Z0-9]{2,6}$/.test(symbol))return;const cell=row.insertCell(-1);cell.innerHTML=`<button type="button" class="quick-watch-button" data-quick-watch-symbol="${esc(symbol)}">＋ Danh mục</button>`;});document.querySelectorAll('#liquidity-map-highlights [data-map-select]').forEach(button=>{if(button.nextElementSibling?.matches('[data-quick-watch-symbol]'))return;const action=document.createElement('button');action.type='button';action.className='quick-watch-button map-quick-watch';action.dataset.quickWatchSymbol=button.dataset.mapSelect;action.textContent='＋ Danh mục';button.after(action);});};
   window.loadWatchlist=load;
   function bind(){
+    document.querySelectorAll('[data-watch-help]').forEach(button=>button.addEventListener('click',event=>{
+      event.preventDefault();event.stopPropagation();
+      const target=document.getElementById(button.dataset.watchHelp);if(!target)return;
+      const opening=target.hidden;
+      document.querySelectorAll('.watch-help-popover').forEach(popover=>{popover.hidden=true;});
+      document.querySelectorAll('[data-watch-help]').forEach(control=>control.setAttribute('aria-expanded','false'));
+      target.hidden=!opening;button.setAttribute('aria-expanded',String(opening));
+    }));
+    document.addEventListener('click',event=>{if(event.target.closest('.watch-help-popover,[data-watch-help]'))return;document.querySelectorAll('.watch-help-popover').forEach(popover=>{popover.hidden=true;});document.querySelectorAll('[data-watch-help]').forEach(control=>control.setAttribute('aria-expanded','false'));});
+    document.addEventListener('keydown',event=>{if(event.key!=='Escape')return;document.querySelectorAll('.watch-help-popover').forEach(popover=>{popover.hidden=true;});document.querySelectorAll('[data-watch-help]').forEach(control=>control.setAttribute('aria-expanded','false'));});
     $('#watchlist-select')?.addEventListener('change',e=>{selectedId=Number(e.target.value)||null;load(true);});
     $('#watchlist-create')?.addEventListener('click',async()=>{const name=prompt('Tên danh sách mới');if(name==null)return;try{const row=await request('/api/me/watchlists','POST',{name});selectedId=row.id;await load(true);feedback('Đã tạo danh sách.');}catch(error){feedback(error.message,true);}});
     $('#watchlist-rename')?.addEventListener('click',async()=>{const list=currentList();if(!list)return feedback('Hãy tạo hoặc chọn danh sách trước.',true);const name=prompt('Tên danh sách',list.name);if(name==null)return;try{await request(`/api/me/watchlists/${list.id}`,'PATCH',{name});await load(true);feedback('Đã đổi tên danh sách.');}catch(error){feedback(error.message,true);}});

@@ -14,6 +14,7 @@ from ssi_sdk.models.streaming import QuoteMessage, TradeMessage
 
 from . import config, database
 from .analytics import map_message, number_or_none, _to_local_timestamp
+from .market_clock import get_market_state
 
 
 _LOG = logging.getLogger(__name__)
@@ -241,9 +242,11 @@ class SsiCollector:
         # final daily bar (for example, when the worker starts during lunch).
         # After the session closes, backfill only symbols that still lack today's
         # OHLC row. Keep this in the collector worker and preserve REST pacing.
-        if self._stop.is_set() or not any(
-            database.is_session_open(today_key, board.value) for board in self.BOARDS
-        ):
+        session_calendar=database.session_calendar_overrides(today_key,today_key)
+        session_day=get_market_state(
+            datetime.combine(today,datetime_time(12,0),tzinfo=config.TIMEZONE),
+            "ALL",calendar=session_calendar)
+        if self._stop.is_set() or not session_day.get("is_trading_day"):
             return
         refresh_after=datetime.combine(today,datetime_time(15,0),tzinfo=config.TIMEZONE)
         wait_seconds=max(0.0,(refresh_after-datetime.now(config.TIMEZONE)).total_seconds())

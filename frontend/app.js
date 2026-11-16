@@ -514,7 +514,19 @@ window.setTimeout(() => {
 refreshStatus();
 const marketEvents=new EventSource('/api/stream');
 window.sliMarketStream=marketEvents;
+let observedHistoricalDate=null;
 for(const eventName of ['market_state','data_diff','heartbeat'])marketEvents.addEventListener(eventName,event=>{
-  try{const payload=JSON.parse(event.data),meta=payload.meta||payload;window.MarketClock.update(meta);if(!document.hidden&&(eventName==='heartbeat'||eventName==='market_state'))refreshStatus();if(!document.hidden&&eventName==='data_diff')window.enhancedRefresh?.();}catch(_){ }
+  try{
+    const payload=JSON.parse(event.data),meta=payload.meta||payload;
+    window.MarketClock.update(meta);
+    const latestDate=meta.latest_historical_date;
+    const historyDateChanged=Boolean(latestDate&&observedHistoricalDate&&latestDate!==observedHistoricalDate);
+    if(latestDate)observedHistoricalDate=latestDate;
+    if(!document.hidden&&(eventName==='heartbeat'||eventName==='market_state'))refreshStatus();
+    if(!document.hidden&&(eventName==='data_diff'||historyDateChanged)){
+      if(historyDateChanged)window.invalidateOverviewDateBounds?.();
+      window.enhancedRefresh?.();
+    }
+  }catch(_){ }
 });
 document.addEventListener('visibilitychange',()=>{window.MarketClock.visibilityChanged();if(!document.hidden){clearTimeout(connectionStatusTimer);refreshStatus();}});

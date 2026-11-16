@@ -164,7 +164,7 @@ async def market_stream(request: Request):
                 yield "event: market_state\ndata: "+json.dumps(meta,ensure_ascii=False)+"\n\n"
                 prior_state=state_key
             if meta["state"]=="IN_SESSION":
-                payload=overview(window_minutes=60)
+                payload=overview(symbol="__all__",limit=240,window_minutes=60,phase=None)
                 yield "event: data_diff\ndata: "+json.dumps({"meta":meta,"data":payload},ensure_ascii=False,default=str)+"\n\n"
                 until_change=max(0.25,(datetime.fromisoformat(meta["next_change_at"])-get_clock_now()).total_seconds()/meta.get("clock_speed",1)) if meta.get("next_change_at") else 60
                 await asyncio.sleep(min(meta["refresh_seconds"] or 5,until_change))
