@@ -742,7 +742,7 @@
         const spreadRows=charts.spread||[];
         overviewChartHeading('detail-spread-chart',`Spread theo thời gian · ${ticker}`,`${charts.session_dates?.length||0} phiên có bar trong khoảng chọn · mốc ${window.fmtTime(d.as_of)} · ${charts.baseline_eligible?'mốc tham chiếu dùng phiên trước':'chưa đủ dữ liệu tham chiếu'}`);
         const lines=[{name:'Spread mã '+ticker,rows:spreadRows,color:'#008A45'}];
-        if(charts.baseline_eligible){lines.push({name:'P10 baseline',rows:spreadRows.map(r=>({...r,spread_bps:r.baseline_p10})),color:'#8aa897'},{name:'P90 baseline',rows:spreadRows.map(r=>({...r,spread_bps:r.baseline_p90})),color:'#b6c8bd'});}
+        if(charts.baseline_eligible){lines.push({name:'Ngưỡng thuận lợi P25',rows:spreadRows.map(r=>({...r,spread_bps:r.baseline_p25})),color:'#8aa897'},{name:'Ngưỡng căng thẳng P90',rows:spreadRows.map(r=>({...r,spread_bps:r.baseline_p90})),color:'#b6c8bd'});}
         lineChart(document.querySelector('#detail-spread-chart'),lines,'spread_bps',`Spread ${ticker} · điểm cơ bản (bps)`);
         if(showCumulative)renderCumulativeDepthCurve(document.querySelector('#detail-depth-chart'),charts.depth_curve||d.widgets?.charts?.data?.depth_curve);
         else window.renderDepthChart('#detail-depth-chart',(charts.depth||[]).map(r=>({...r,bid_depth_value:r.bid,ask_depth_value:r.ask})));

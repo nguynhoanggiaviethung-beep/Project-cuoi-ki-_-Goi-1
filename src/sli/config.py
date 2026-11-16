@@ -17,9 +17,16 @@ SYMBOL_MARKETS = {
 # Vietnam is UTC+07:00 year-round; fixed offset avoids a platform tzdata dependency.
 TIMEZONE = timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
 STALE_AFTER_SECONDS = int(os.getenv("STALE_AFTER_SECONDS", "120"))
-BASELINE_MIN_OBSERVATIONS = int(os.getenv("BASELINE_MIN_OBSERVATIONS", "100"))
-BASELINE_MIN_BARS = int(os.getenv("BASELINE_MIN_BARS", "60"))
-BASELINE_SESSIONS = int(os.getenv("BASELINE_SESSIONS", "10"))
+# Fixed, shared liquidity classification thresholds. These are project screening
+# conventions based on each symbol's own historical distribution, not exchange rules.
+FAVORABLE_SPREAD_PERCENTILE = 25.0
+STRESS_SPREAD_PERCENTILE = 90.0
+FAVORABLE_DEPTH_PERCENTILE = 75.0
+STRESS_DEPTH_PERCENTILE = 10.0
+# P90/P10 tail estimates need enough independent prior sessions in the same phase.
+BASELINE_MIN_OBSERVATIONS = 120
+BASELINE_MIN_BARS = 120
+BASELINE_SESSIONS = 120
 MIN_BAR_SNAPSHOTS = int(os.getenv("MIN_BAR_SNAPSHOTS", "1"))
 ALERT_CONSECUTIVE_BARS = int(os.getenv("ALERT_CONSECUTIVE_BARS", "3"))
 ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "15"))
@@ -28,8 +35,9 @@ MIN_BARS_FOR_RANKING = max(1, int(os.getenv("MIN_BARS_FOR_RANKING", os.getenv("R
 # Backward-compatible name retained for existing callers.
 RANKING_MIN_BARS = MIN_BARS_FOR_RANKING
 RANKING_MIN_SNAPSHOTS = max(200, int(os.getenv("RANKING_MIN_SNAPSHOTS", "200")))
-SPREAD_PERCENTILE = float(os.getenv("SPREAD_PERCENTILE", "90"))
-DEPTH_PERCENTILE = float(os.getenv("DEPTH_PERCENTILE", "10"))
+# Alert thresholds alias the same fixed classification thresholds used by watchlists.
+SPREAD_PERCENTILE = STRESS_SPREAD_PERCENTILE
+DEPTH_PERCENTILE = STRESS_DEPTH_PERCENTILE
 IMBALANCE_THRESHOLD = float(os.getenv("IMBALANCE_THRESHOLD", "0.60"))
 RECONNECT_MAX_SECONDS = int(os.getenv("RECONNECT_MAX_SECONDS", "30"))
 MAX_EVENT_DELAY_SECONDS = max(1.0, float(os.getenv("MAX_EVENT_DELAY_SECONDS", "30")))

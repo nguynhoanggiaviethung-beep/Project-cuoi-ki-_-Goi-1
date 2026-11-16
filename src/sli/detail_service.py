@@ -135,7 +135,7 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=
                                       if item.get("symbol") == ticker and item.get("status") == "active"])
     bar_start=f"{from_date}T00:00:00" if from_date else None
     bar_end=f"{to_date}T23:59:59" if to_date else None
-    bars_load = _independent(lambda: database.fetch_bars(source, symbol=ticker, limit=10000,
+    bars_load = _independent(lambda: database.fetch_bars(source, symbol=ticker, limit=50000,
                                                          start_at=bar_start,end_at=bar_end))
     price_rows = history_load["data"] or []
     bars = bars_load["data"] or []
@@ -158,9 +158,16 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=
         baseline_sessions = set(sessions[max(1, min(int(window_sessions), 20)):][:config.BASELINE_SESSIONS])
     baseline = [bar for bar in bars if str(bar.get("session_date")) in baseline_sessions
                 and bar.get("coverage_status") == "ok"
-                and bar.get("baseline_bucket") == current_bucket]
+                and bar.get("baseline_bucket") == current_bucket
+                and (not market or bar.get("market") == market)]
+    spread_sessions={str(bar.get("session_date")) for bar in baseline if bar.get("spread_bps") is not None}
+    depth_sessions={str(bar.get("session_date")) for bar in baseline if bar.get("total_depth_value") is not None}
+    baseline_session_count=len(spread_sessions & depth_sessions)
     spread_values = sorted(float(b["spread_bps"]) for b in baseline if b.get("spread_bps") is not None)
     depth_values = sorted(float(b["total_depth_value"]) for b in baseline if b.get("total_depth_value") is not None)
+    baseline_eligible=(baseline_session_count>=config.BASELINE_SESSIONS
+                       and len(spread_values)>=config.BASELINE_MIN_BARS
+                       and len(depth_values)>=config.BASELINE_MIN_BARS)
     def percentile(values, p):
         if not values:
             return None
@@ -214,29 +221,31 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=
         "quote_time": ((latest or {}).get("source_ts_vn") or (latest or {}).get("received_at_vn") or (latest or {}).get("received_at_utc")),
         "depth_curve": depth_curve,
         "snapshot_count": len(rows), "valid_snapshot_count": len(valid),
-        "baseline_eligible": len(baseline) >= config.BASELINE_MIN_BARS,
+        "baseline_eligible": baseline_eligible,
+        "baseline_session_count": baseline_session_count,
         "widgets": {},
     }
     result["widgets"]["company"] = _independent(lambda: {"name": metadata.get("name_vi"), "board": market})
     result["widgets"]["orderbook"] = _independent(lambda: latest if latest else None)
     result["widgets"]["kpis"] = _independent(lambda: {
-        "spread_bps": spread, "spread_ticks": (latest or {}).get("spread_ticks"), "tick_size": (latest or {}).get("tick_size"), "spread_percentile": spread_percentile if len(spread_values) >= config.BASELINE_MIN_BARS else None,
+        "spread_bps": spread, "spread_ticks": (latest or {}).get("spread_ticks"), "tick_size": (latest or {}).get("tick_size"), "spread_percentile": spread_percentile if baseline_eligible else None,
         "spread_baseline_count": len(spread_values), "bid_depth_value": (latest or {}).get("bid_depth_value"),
         "ask_depth_value": (latest or {}).get("ask_depth_value"),
-        "depth_percentile": depth_percentile if len(depth_values) >= config.BASELINE_MIN_BARS else None,
-        "depth_baseline_count": len(depth_values), "queue_imbalance": (latest or {}).get("queue_imbalance"),
+        "depth_percentile": depth_percentile if baseline_eligible else None,
+        "depth_baseline_count": len(depth_values), "baseline_session_count": baseline_session_count, "queue_imbalance": (latest or {}).get("queue_imbalance"),
         "value_imbalance": (latest or {}).get("value_imbalance"), "active_alert_count": len(active_alerts),
     })
     result["widgets"]["charts"] = _independent(lambda: {
         "window_sessions": max(1, min(int(window_sessions), 20)), "session_dates": sorted(selected_sessions),
-        "spread": [{"minute": b.get("minute_vn"), "value": b.get("spread_bps"), "spread_bps": b.get("spread_bps"), "baseline_p10": percentile(spread_values, .10) if len(spread_values) >= config.BASELINE_MIN_BARS else None,
-                    "baseline_p90": percentile(spread_values, .90) if len(spread_values) >= config.BASELINE_MIN_BARS else None, "sample_count": b.get("n_snapshots"), "symbol": ticker} for b in chart_bars],
+        "spread": [{"minute": b.get("minute_vn"), "value": b.get("spread_bps"), "spread_bps": b.get("spread_bps"), "baseline_p25": percentile(spread_values, .25) if baseline_eligible else None,
+                    "baseline_p90": percentile(spread_values, .90) if baseline_eligible else None, "sample_count": b.get("n_snapshots"), "symbol": ticker} for b in chart_bars],
         "depth": [{"minute": b.get("minute_vn"), "bid": b.get("bid_depth_value"), "ask": b.get("ask_depth_value"), "bid_depth_value": b.get("bid_depth_value"),
                    "ask_depth_value": b.get("ask_depth_value"), "symbol": ticker} for b in chart_bars],
         "depth_curve": depth_curve, "levels_used": depth_curve["levels_used"],
-        "baseline_sample_count": len(baseline), "baseline_eligible": len(baseline) >= config.BASELINE_MIN_BARS,
-        "spread_baseline_p10": percentile(spread_values, .10) if len(spread_values) >= config.BASELINE_MIN_BARS else None,
-        "spread_baseline_p90": percentile(spread_values, .90) if len(spread_values) >= config.BASELINE_MIN_BARS else None,
+        "baseline_sample_count": len(baseline), "baseline_eligible": baseline_eligible,
+        "baseline_session_count": baseline_session_count,
+        "spread_baseline_p25": percentile(spread_values, .25) if baseline_eligible else None,
+        "spread_baseline_p90": percentile(spread_values, .90) if baseline_eligible else None,
     })
     result["widgets"]["alerts"] = _independent(lambda: active_alerts)
     result["widgets"]["history"] = _independent(lambda: {

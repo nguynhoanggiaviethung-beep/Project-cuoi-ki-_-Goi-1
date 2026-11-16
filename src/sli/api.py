@@ -540,24 +540,28 @@ def local_watchlist_live(watchlist_id:int):
 
 @app.get("/api/me/settings")
 def local_user_settings():
-    return {"profile":"local","settings":database.get_local_settings()}
+    settings=database.get_local_settings()
+    settings.update({"favorable_spread_pctl":config.FAVORABLE_SPREAD_PERCENTILE,
+                     "stress_spread_pctl":config.STRESS_SPREAD_PERCENTILE,
+                     "favorable_depth_pctl":config.FAVORABLE_DEPTH_PERCENTILE,
+                     "stress_depth_pctl":config.STRESS_DEPTH_PERCENTILE})
+    return {"profile":"local","settings":settings}
 
 
 def _validate_local_settings(payload,base=None):
-    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
-             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+    threshold_keys={"favorable_spread_pctl","stress_spread_pctl","favorable_depth_pctl","stress_depth_pctl"}
+    editable={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
+    allowed=editable|threshold_keys  # accept older clients/profile files; ignore their threshold values
     unknown=set(payload)-allowed
     if unknown:raise HTTPException(status_code=422,detail="Có trường cài đặt không được hỗ trợ.")
     merged={**(base or database.get_local_settings()),**payload}
     shares=merged.get("standard_order_shares")
     if isinstance(shares,bool) or not isinstance(shares,int) or not 100<=shares<=10000000 or shares%100:
         raise HTTPException(status_code=422,detail="Quy mô lệnh chuẩn phải là bội số 100, từ 100 đến 10.000.000 cổ phiếu.")
-    for key in ("favorable_spread_pctl","stress_spread_pctl","favorable_depth_pctl","stress_depth_pctl"):
-        try:merged[key]=float(merged[key])
-        except (TypeError,ValueError):raise HTTPException(status_code=422,detail="Ngưỡng phân vị phải là số từ 0 đến 100.")
-        if not 0<=merged[key]<=100:raise HTTPException(status_code=422,detail="Ngưỡng phân vị phải từ 0 đến 100.")
-    if merged["favorable_spread_pctl"]>=merged["stress_spread_pctl"] or merged["stress_depth_pctl"]>=merged["favorable_depth_pctl"]:
-        raise HTTPException(status_code=422,detail="Ngưỡng thuận lợi và căng thẳng phải tách biệt.")
+    merged.update({"favorable_spread_pctl":config.FAVORABLE_SPREAD_PERCENTILE,
+                   "stress_spread_pctl":config.STRESS_SPREAD_PERCENTILE,
+                   "favorable_depth_pctl":config.FAVORABLE_DEPTH_PERCENTILE,
+                   "stress_depth_pctl":config.STRESS_DEPTH_PERCENTILE})
     for key in ("quiet_start","quiet_end"):
         value=merged.get(key)
         if value is not None and value!="":
@@ -566,7 +570,7 @@ def _validate_local_settings(payload,base=None):
         else:merged[key]=None
     if merged.get("notification_channel") not in {"in_app","browser"}:
         raise HTTPException(status_code=422,detail="Kênh thông báo chỉ hỗ trợ trong ứng dụng hoặc trình duyệt.")
-    return {key:merged[key] for key in allowed}
+    return {key:merged[key] for key in editable}
 
 
 @app.put("/api/me/settings")
@@ -602,9 +606,12 @@ def _validate_profile_document(payload):
 @app.get("/api/me/export")
 def export_local_profile():
     settings=database.get_local_settings()
-    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
-             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
-    return {"format":"sli-local-profile-v1","settings":{key:settings[key] for key in allowed},
+    allowed={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
+    fixed={"favorable_spread_pctl":config.FAVORABLE_SPREAD_PERCENTILE,
+           "stress_spread_pctl":config.STRESS_SPREAD_PERCENTILE,
+           "favorable_depth_pctl":config.FAVORABLE_DEPTH_PERCENTILE,
+           "stress_depth_pctl":config.STRESS_DEPTH_PERCENTILE}
+    return {"format":"sli-local-profile-v1","settings":{**{key:settings[key] for key in allowed},**fixed},
             "watchlists":[{"name":row["name"],"items":[{"symbol":item["symbol"],"note":item["note"]} for item in row["items"]]}
                           for row in database.fetch_local_watchlists()]}
 
@@ -1027,13 +1034,13 @@ def methodology():
             {"metric": "Chênh lệch theo báo giá (quoted spread)", "meaning": "Chi phí tức thời quan sát được giữa giá mua tốt nhất và giá bán tốt nhất. Chênh lệch giá (spread) thấp thường thuận lợi hơn cho giao dịch nhỏ tại thời điểm ảnh chụp dữ liệu (snapshot).", "caveat": "Không tính phí, trượt giá, kích thước lệnh hay khả năng khớp; cần so sánh theo thời gian và giữa các mã cùng bối cảnh."},
             {"metric": "Độ sâu ba mức giá đầu (top-3 depth)", "meaning": "Giá trị chào mua/chào bán đang hiển thị trong ba mức giá tốt nhất. Độ sâu (depth) lớn biểu thị nhiều lượng niêm yết hơn gần giá hiện tại.", "caveat": "Lệnh có thể bị hủy; đây không phải thanh khoản thực hiện được hay toàn bộ sổ lệnh."},
             {"metric": "Mất cân bằng khối lượng chờ (queue imbalance)", "meaning": "Chuẩn hóa chênh lệch khối lượng hiển thị hai phía về khoảng [-1, 1]. Số dương nghĩa là khối lượng bên mua (bid) lớn hơn bên bán (ask) trong các mức hợp lệ.", "caveat": "Mô tả trạng thái sổ lệnh, không phải mất cân bằng dòng lệnh (order-flow imbalance, OFI), không chứng minh chiều giá tiếp theo."},
-            {"metric": "Cảnh báo theo phân vị (percentile)", "meaning": "So sánh chênh lệch giá (spread) hiện tại với phân vị 90 (P90) lịch sử hoặc độ sâu (depth) với phân vị 10 (P10) lịch sử của chính mã sau khi đạt số mẫu tối thiểu đã cấu hình.", "caveat": "Ngưỡng là quy tắc giám sát nội bộ; kết quả phụ thuộc cửa sổ, phiên, chất lượng dữ liệu và không phải chuẩn đầu tư."}
+            {"metric": "Phân loại thanh khoản theo phân vị lịch sử", "meaning": "Thuận lợi khi spread ≤ P25 và depth ≥ P75; căng thẳng khi spread ≥ P90 hoặc depth ≤ P10; vùng giữa là cần lưu ý. So sánh với lịch sử cùng mã/cùng pha.", "caveat": "Đây là quy ước sàng lọc nội bộ, không phải chuẩn của cơ quan quản lý hay lý thuyết tài chính. Chỉ phân loại khi mỗi chỉ tiêu có ít nhất 120 bar hợp lệ, trải trên 120 phiên lịch sử riêng biệt."}
         ],
         "theoretical_framework": [
             {"title": "Chênh lệch giá (spread) như chi phí giao dịch tức thời", "body": "Chênh lệch giá mua – bán (bid–ask spread) biểu thị khoảng cách giữa giá mua tốt nhất và giá bán tốt nhất đang được niêm yết. Theo vi cấu trúc thị trường, mức chênh lệch này bù đắp một phần chi phí xử lý lệnh, nắm giữ tồn kho và rủi ro giao dịch với đối tác có thông tin tốt hơn. SLI tính chênh lệch theo báo giá (quoted spread) bằng điểm cơ bản (bps) so với giá giữa (mid-price) để giảm lệ thuộc vào thang giá tuyệt đối. Đây là chỉ báo từ báo giá, không phải chênh lệch thực tế (effective spread) tính từ giao dịch đã khớp."},
             {"title": "Độ sâu sổ lệnh (depth) và khả năng hấp thụ lệnh", "body": "Độ sâu ba mức giá đầu (top-3 depth) cộng lượng niêm yết ở ba mức giá tốt nhất cho mỗi phía; giá trị độ sâu (depth value) nhân giá từng mức với khối lượng tương ứng. Nhiều lượng hiển thị gần giá có thể cho thấy vùng đệm niêm yết dày hơn, nhưng không chứng minh thị trường hấp thụ được một lệnh cụ thể: lệnh có thể bị rút, thứ tự ưu tiên và tốc độ cập nhật có ý nghĩa, còn SLI không mô phỏng khớp lệnh."},
             {"title": "Mất cân bằng khối lượng chờ (queue imbalance) là ảnh chụp sổ lệnh", "body": "Chỉ số mất cân bằng khối lượng chờ (queue imbalance) chuẩn hóa chênh lệch tổng khối lượng bên mua (bid) và bên bán (ask). Chỉ số gần +1 cho biết lượng mua hiển thị trội; gần −1 cho biết lượng bán trội; gần 0 cho biết tương đối cân bằng. Nghiên cứu mất cân bằng dòng lệnh (order-flow imbalance, OFI) thường xét biến động sổ lệnh qua sự kiện thêm, hủy và khớp lệnh. Vì SLI hiện tính từ ảnh chụp dữ liệu (snapshot), không được gọi chỉ số này là OFI hoặc dùng như dự báo giá."},
-            {"title": "Mốc tham chiếu (baseline) riêng từng mã và cảnh báo theo phân vị", "body": "Ngưỡng được tính từ phân phối lịch sử của chính mã: chênh lệch giá (spread) cao hơn phân vị 90 (P90) hoặc độ sâu sổ lệnh (depth) thấp hơn phân vị 10 (P10) khi đủ số mẫu tối thiểu đã cấu hình. Cách so sánh theo mã giúp hạn chế việc áp một thang giá trị tuyệt đối cho các cổ phiếu khác nhau. Phân vị (percentile) nhạy với cửa sổ, phiên giao dịch, ngoại lệ và chế độ thị trường; cần đọc cảnh báo cùng số mẫu và trạng thái nguồn."},
+            {"title": "Mốc tham chiếu riêng từng mã và ngưỡng phân loại dùng chung", "body": "Thuận lợi: spread ≤ P25 và depth ≥ P75. Căng thẳng: spread ≥ P90 hoặc depth ≤ P10. Đây là quy ước sàng lọc nội bộ, không phải chuẩn bắt buộc. Baseline lấy tối đa 120 phiên trước, cùng mã và cùng pha trong ngày; chỉ phân loại khi mỗi chỉ tiêu có ít nhất 120 bar hợp lệ, trải trên 120 phiên lịch sử riêng biệt. Đọc cùng số mẫu và trạng thái nguồn."},
             {"title": "Tính nhất quán và dữ liệu thiếu", "body": "Mỗi ảnh chụp dữ liệu (snapshot) được lưu cùng gói dữ liệu gốc (payload), thời điểm nhận cục bộ, mã nguồn và trạng thái kiểm tra; các chỉ tiêu có thể được tính lại từ trường mua/bán (bid/ask) hợp lệ. Trường thiếu được để null (không có giá trị), không tự thay bằng 0. Nếu gói dữ liệu (payload) không có mốc thời gian máy chủ (server timestamp), thời điểm nhận không thể thay thế chính xác thời điểm tạo dữ liệu."}
         ],
         "references": [
@@ -1057,6 +1064,10 @@ def methodology():
             "minimum_snapshots_per_bar": config.MIN_BAR_SNAPSHOTS,
             "alert_consecutive_bars": config.ALERT_CONSECUTIVE_BARS,
             "alert_cooldown_minutes": config.ALERT_COOLDOWN_MIN,
+            "favorable_spread_percentile": config.FAVORABLE_SPREAD_PERCENTILE,
+            "stress_spread_percentile": config.STRESS_SPREAD_PERCENTILE,
+            "favorable_depth_percentile": config.FAVORABLE_DEPTH_PERCENTILE,
+            "stress_depth_percentile": config.STRESS_DEPTH_PERCENTILE,
             "spread_percentile": config.SPREAD_PERCENTILE,
             "depth_percentile": config.DEPTH_PERCENTILE,
             "imbalance_threshold": config.IMBALANCE_THRESHOLD,

@@ -15,14 +15,21 @@ def _widget(detail, name):
 def _condition(kpis, settings):
     spread=kpis.get("spread_percentile")
     depth=kpis.get("depth_percentile")
+    spread_count=int(kpis.get("spread_baseline_count") or 0)
+    depth_count=int(kpis.get("depth_baseline_count") or 0)
+    session_count=int(kpis.get("baseline_session_count") or 0)
+    baseline_summary=(f"Mẫu nền: {session_count}/{config.BASELINE_SESSIONS} phiên · spread {spread_count} bar · độ sâu {depth_count} bar")
     if spread is None or depth is None:
-        return {"label":"Chưa đủ dữ liệu","key":"insufficient","explanation":"Cần đủ bar lịch sử của chính mã để so sánh spread và độ sâu với mốc tham chiếu."}
-    if spread>=float(settings["stress_spread_pctl"]) or depth<=float(settings["stress_depth_pctl"]):
-        return {"label":"Căng thẳng","key":"stress","explanation":f"Spread ở phân vị {spread:.0f}% hoặc độ sâu ở phân vị {depth:.0f}%, vượt ngưỡng người dùng đặt."}
-    if spread<=float(settings["favorable_spread_pctl"]) and depth>=float(settings["favorable_depth_pctl"]):
-        return {"label":"Thuận lợi","key":"favorable","explanation":f"Spread ở phân vị {spread:.0f}% và độ sâu ở phân vị {depth:.0f}% so với lịch sử của mã."}
-    return {"label":"Cần lưu ý","key":"caution","explanation":f"Spread phân vị {spread:.0f}%, độ sâu phân vị {depth:.0f}%; chưa đồng thời nằm trong ngưỡng thuận lợi hoặc căng thẳng."}
-
+        return {"label":"Chưa đủ dữ liệu","key":"insufficient","baseline_summary":baseline_summary,
+                "explanation":f"Cần tối thiểu {config.BASELINE_SESSIONS} phiên lịch sử hợp lệ cùng mã/sàn/pha để ước lượng các phân vị. Hiện có {session_count}/{config.BASELINE_SESSIONS} phiên, {spread_count} bar spread và {depth_count} bar độ sâu. Bar realtime không thay thế baseline lịch sử."}
+    if spread>=config.STRESS_SPREAD_PERCENTILE or depth<=config.STRESS_DEPTH_PERCENTILE:
+        return {"label":"Căng thẳng","key":"stress","baseline_summary":baseline_summary,
+                "explanation":f"Spread ở P{spread:.0f} (ngưỡng căng thẳng P90) hoặc độ sâu ở P{depth:.0f} (ngưỡng P10), so với lịch sử cùng pha của mã. {baseline_summary}."}
+    if spread<=config.FAVORABLE_SPREAD_PERCENTILE and depth>=config.FAVORABLE_DEPTH_PERCENTILE:
+        return {"label":"Thuận lợi","key":"favorable","baseline_summary":baseline_summary,
+                "explanation":f"Spread ở P{spread:.0f} (≤P25) và độ sâu ở P{depth:.0f} (≥P75), so với lịch sử cùng pha của mã. {baseline_summary}."}
+    return {"label":"Cần lưu ý","key":"caution","baseline_summary":baseline_summary,
+            "explanation":f"Spread phân vị {spread:.0f}%, độ sâu phân vị {depth:.0f}%; chưa đồng thời nằm trong ngưỡng thuận lợi hoặc căng thẳng. {baseline_summary}."}
 
 def build_watchlist_live(watchlist, market_meta, as_of: datetime | None = None):
     """Build every row with one page clock; no quote or financial values are synthesized."""
@@ -37,7 +44,7 @@ def build_watchlist_live(watchlist, market_meta, as_of: datetime | None = None):
     rows=[]
     for item in items:
         symbol=str(item["symbol"]).upper()
-        detail=build_detail(symbol,source="ssi",as_of=clock_time,window_sessions=20)
+        detail=build_detail(symbol,source="ssi",as_of=clock_time,window_sessions=1)
         company=_widget(detail,"company") or {}
         kpis=_widget(detail,"kpis") or {}
         charts=_widget(detail,"charts") or {}

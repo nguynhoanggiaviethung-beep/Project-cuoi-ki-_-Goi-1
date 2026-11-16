@@ -118,7 +118,7 @@ def fetch_bars(source, symbol=None, limit=1000, start_at=None, end_at=None, buck
         query += " AND baseline_bucket=?"
         args.append(bucket.upper())
     query += " ORDER BY minute_vn DESC LIMIT ?"
-    args.append(max(1, min(int(limit), 10000)))
+    args.append(max(1, min(int(limit), 50000)))
     with connect() as db:
         rows = db.execute(query, args).fetchall()
     return [dict(row) for row in reversed(rows)]
@@ -332,10 +332,14 @@ def _cached_baseline_qualified_symbols(source,before_session):
             ), qualified AS (
               SELECT b.symbol,b.baseline_bucket,COUNT(*) AS n FROM bars_1m b
               JOIN prior_sessions s ON s.session_date=b.session_date
-              WHERE b.source=? AND b.baseline_bucket IS NOT NULL
-              GROUP BY b.symbol,b.baseline_bucket HAVING COUNT(*)>=?
+              WHERE b.source=? AND b.baseline_bucket IS NOT NULL AND b.coverage_status='ok'
+              GROUP BY b.symbol,b.baseline_bucket HAVING COUNT(b.spread_bps)>=?
+                AND COUNT(b.total_depth_value)>=?
+                AND COUNT(DISTINCT CASE WHEN b.spread_bps IS NOT NULL AND b.total_depth_value IS NOT NULL
+                                        THEN b.session_date END)>=?
             ) SELECT DISTINCT symbol FROM qualified""",
-            (source,before_session,config.BASELINE_SESSIONS,source,config.BASELINE_MIN_BARS)).fetchall()
+            (source,before_session,config.BASELINE_SESSIONS,source,config.BASELINE_MIN_BARS,
+             config.BASELINE_MIN_BARS,config.BASELINE_SESSIONS)).fetchall()
     return frozenset(row[0] for row in rows)
 
 
@@ -524,9 +528,9 @@ def initialize():
         CREATE TABLE IF NOT EXISTS user_settings (
             profile_id TEXT PRIMARY KEY CHECK(profile_id='local'),
             standard_order_shares INTEGER NOT NULL DEFAULT 10000,
-            favorable_spread_pctl REAL NOT NULL DEFAULT 50,
+            favorable_spread_pctl REAL NOT NULL DEFAULT 25,
             stress_spread_pctl REAL NOT NULL DEFAULT 90,
-            favorable_depth_pctl REAL NOT NULL DEFAULT 50,
+            favorable_depth_pctl REAL NOT NULL DEFAULT 75,
             stress_depth_pctl REAL NOT NULL DEFAULT 10,
             quiet_start TEXT, quiet_end TEXT,
             notification_channel TEXT NOT NULL DEFAULT 'in_app',
@@ -546,6 +550,10 @@ def initialize():
         """)
         db.execute("INSERT OR IGNORE INTO user_settings(profile_id,updated_at) VALUES('local',?)",
                    (datetime.now(config.TIMEZONE).isoformat(timespec='seconds'),))
+        db.execute("""UPDATE user_settings SET favorable_spread_pctl=?,stress_spread_pctl=?,
+                      favorable_depth_pctl=?,stress_depth_pctl=?""",
+                   (config.FAVORABLE_SPREAD_PERCENTILE,config.STRESS_SPREAD_PERCENTILE,
+                    config.FAVORABLE_DEPTH_PERCENTILE,config.STRESS_DEPTH_PERCENTILE))
         schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='observations'").fetchone()
         if schema and "'ssi'" not in (schema[0] or ""):
             db.execute("PRAGMA foreign_keys=OFF")
@@ -607,8 +615,7 @@ def get_local_settings():
 
 
 def update_local_settings(values):
-    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
-             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+    allowed={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
     updates={key:value for key,value in values.items() if key in allowed}
     if not updates:return get_local_settings()
     updates["updated_at"]=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
@@ -687,8 +694,7 @@ def replace_local_profile(settings,watchlists):
     with connect() as db:
         db.execute("SAVEPOINT import_local_profile")
         try:
-            allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
-                     "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+            allowed={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
             clean={key:value for key,value in settings.items() if key in allowed}
             if clean:
                 assignments=",".join(f"{key}=?" for key in clean)
@@ -712,8 +718,7 @@ def backup_local_profile_json():
     import json
     from pathlib import Path
     settings=get_local_settings()
-    allowed={"standard_order_shares","favorable_spread_pctl","stress_spread_pctl",
-             "favorable_depth_pctl","stress_depth_pctl","quiet_start","quiet_end","notification_channel"}
+    allowed={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
     payload={"format":"sli-local-profile-v1","settings":{key:settings[key] for key in allowed},
              "watchlists":[{"name":row["name"],"items":[{"symbol":item["symbol"],"note":item["note"]} for item in row["items"]]}
                            for row in fetch_local_watchlists()]}
@@ -860,11 +865,18 @@ def _baseline_bars(db, bar):
         return [], "insufficient"
     placeholders = ",".join("?" for _ in prior_sessions)
     args = [bar["source"], bar["symbol"], *prior_sessions]
-    bucket_rows = db.execute(f"SELECT * FROM bars_1m WHERE source=? AND symbol=? AND session_date IN ({placeholders}) AND baseline_bucket=? ORDER BY minute_vn",
-                             (*args, bar["baseline_bucket"])).fetchall() if bar["baseline_bucket"] else []
-    # Require a sufficiently populated baseline for the same symbol and session phase.
-    # Pooling other phases makes opening/closing behavior contaminate the comparison.
-    if len(bucket_rows) >= config.BASELINE_MIN_BARS:
+    bucket_rows = db.execute(f"SELECT * FROM bars_1m WHERE source=? AND symbol=? AND market=? AND coverage_status='ok' AND session_date IN ({placeholders}) AND baseline_bucket=? ORDER BY minute_vn",
+                             (bar["source"],bar["symbol"],bar["market"],*prior_sessions,bar["baseline_bucket"])).fetchall() if bar["baseline_bucket"] else []
+    # Require enough bars across distinct prior sessions for this symbol, board and
+    # intraday phase; many minutes from only a few sessions are not independent days.
+    spread_rows=[row for row in bucket_rows if row["spread_bps"] is not None]
+    depth_rows=[row for row in bucket_rows if row["total_depth_value"] is not None]
+    spread_sessions={row["session_date"] for row in spread_rows}
+    depth_sessions={row["session_date"] for row in depth_rows}
+    sessions_used=len(spread_sessions & depth_sessions)
+    if (len(spread_rows)>=config.BASELINE_MIN_BARS
+            and len(depth_rows)>=config.BASELINE_MIN_BARS
+            and sessions_used>=config.BASELINE_SESSIONS):
         return bucket_rows, "bucket"
     return [], "insufficient"
 
@@ -883,14 +895,14 @@ def _evaluate_bar_alerts(db, bar, observation_id):
     recent = db.execute("SELECT * FROM bars_1m WHERE source=? AND symbol=? AND baseline_bucket=? AND minute_vn<=? ORDER BY minute_vn DESC LIMIT ?",
                         (bar["source"], bar["symbol"], bar["baseline_bucket"], bar["minute_vn"], k)).fetchall()
     recent = list(reversed(recent))
-    spread_hit = spread_limit is not None and len(recent) == k and all(r["spread_bps"] is not None and r["spread_bps"] > spread_limit for r in recent)
-    depth_hit = depth_limit is not None and len(recent) == k and all(r["total_depth_value"] is not None and r["total_depth_value"] < depth_limit for r in recent)
+    spread_hit = spread_limit is not None and len(recent) == k and all(r["spread_bps"] is not None and r["spread_bps"] >= spread_limit for r in recent)
+    depth_hit = depth_limit is not None and len(recent) == k and all(r["total_depth_value"] is not None and r["total_depth_value"] <= depth_limit for r in recent)
     imb_hit = len(recent) == k and all(r["queue_imbalance"] is not None and abs(r["queue_imbalance"]) >= config.IMBALANCE_THRESHOLD for r in recent)
     triggers = []
     if spread_hit:
-        triggers.append(("spread_widening", "medium", bar["spread_bps"], spread_limit, "Spread bar vượt P90 baseline cùng mã/cùng pha phiên liên tiếp."))
+        triggers.append(("spread_widening", "medium", bar["spread_bps"], spread_limit, "Spread bar chạm hoặc vượt P90 baseline cùng mã/sàn/pha trong ba bar hợp lệ liên tiếp."))
     if depth_hit:
-        triggers.append(("depth_drop", "medium", bar["total_depth_value"], depth_limit, "Depth top 3 thấp hơn P10 baseline cùng mã/cùng pha phiên liên tiếp."))
+        triggers.append(("depth_drop", "medium", bar["total_depth_value"], depth_limit, "Depth top 3 chạm hoặc thấp hơn P10 baseline cùng mã/sàn/pha trong ba bar hợp lệ liên tiếp."))
     if spread_hit and depth_hit:
         triggers.append(("combined_liquidity_stress", "high", None, None, "Spread rộng và độ sâu mỏng đồng thời."))
     if imb_hit:
