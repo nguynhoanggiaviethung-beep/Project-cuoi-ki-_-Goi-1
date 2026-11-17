@@ -55,6 +55,10 @@ def estimate(observation, side, quantity=None, notional=None, max_slippage_bps=N
     vwap = total_value / total_qty
     slippage = ((vwap - mid) if side == "buy" else (mid - vwap)) / mid * 10000
     fill_ratio = min(1.0, total_qty / requested) if requested_qty is not None else min(1.0, total_value / requested)
+    # A notional budget is converted to board lots. Cash left below the cost of
+    # the next 100-share lot is normal rounding residue, not missing depth.
+    notional_rounding_residue = (notional is not None and remaining_value is not None
+                                 and remaining_value < levels[-1][0] * lot_size)
     qmax = None
     if max_slippage_bps is not None:
         qmax = 0
@@ -77,7 +81,7 @@ def estimate(observation, side, quantity=None, notional=None, max_slippage_bps=N
                 qmax += max(0, floor(allowed / lot_size) * lot_size)
                 break
     return {
-        "status": "full" if fill_ratio >= 1 else "partial_exceeds_visible_depth",
+        "status": "full" if fill_ratio >= 1 or notional_rounding_residue else "partial_exceeds_visible_depth",
         "side": side, "requested_quantity": requested_qty, "requested_notional": notional,
         "filled_quantity": int(total_qty), "filled_value": total_value,
         "fill_ratio": fill_ratio, "vwap": vwap, "mid_price": mid,

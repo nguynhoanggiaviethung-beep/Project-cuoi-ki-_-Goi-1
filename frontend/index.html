@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#008A45">
   <title>Stock Liquidity Intelligence</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=44">
+  <link rel="stylesheet" href="/assets/styles.css?v=47">
 </head>
 <body>
   <div id="onboarding" class="onboarding">
@@ -107,7 +107,23 @@
           <div class="watchlist-table-wrap"><table class="watchlist-table"><thead><tr><th>Mã / doanh nghiệp</th><th>Giá gần nhất</th><th>Thay đổi</th><th>Spread</th><th>Độ sâu top 3</th><th>Spread 60 phút</th><th>Điều kiện</th><th>Cảnh báo</th><th>Ghi chú / thứ tự</th></tr></thead><tbody id="watchlist-rows"><tr><td colspan="9">Đang tải danh mục cục bộ…</td></tr></tbody></table></div>
           <p class="analysis-note">Giá là OHLC gần nhất từ SSI; spread và độ sâu cần quote đã lưu. Nhãn điều kiện so sánh với lịch sử của chính mã, không phải khuyến nghị đầu tư.</p>
         </article>
-        <details class="panel watch-settings-panel"><summary class="watch-settings-summary"><span>Cài đặt hồ sơ cục bộ</span><span class="watch-help-wrap"><button class="watch-help-button" type="button" data-watch-help="watch-settings-help" aria-controls="watch-settings-help" aria-expanded="false" aria-label="Giải thích cài đặt hồ sơ">i</button></span></summary><div id="watch-settings-help" class="watch-help-popover watch-settings-help" hidden><h3>Hồ sơ cục bộ là gì?</h3><p>Đây là thiết lập của ứng dụng trên máy chủ đang chạy SLI, không phải tài khoản SSI và không cần đăng nhập. Danh sách, ghi chú và thiết lập được lưu trong database cục bộ; có thể xuất hoặc nhập hồ sơ JSON.</p><p><strong>Ngưỡng dùng chung, không chỉnh theo hồ sơ:</strong> thuận lợi khi spread ≤ P25 và độ sâu ≥ P75; căng thẳng khi spread ≥ P90 hoặc độ sâu ≤ P10. Các mốc là quy ước sàng lọc nội bộ theo lịch sử cùng mã/cùng pha, không phải chuẩn do HOSE/HNX ban hành. Cần 120 phiên lịch sử hợp lệ để phân loại.</p><p><strong>Quy mô lệnh, giờ yên lặng và kênh thông báo</strong> hiện được lưu trong hồ sơ nhưng chưa được nối vào mô phỏng lệnh hoặc bộ phát cảnh báo cá nhân.</p></div><div class="watch-settings-grid"><label>Quy mô lệnh chuẩn (cổ phiếu)<input id="watch-standard-shares" type="number" min="100" step="100"></label><p class="threshold-policy-note"><strong>Ngưỡng dùng chung:</strong> thuận lợi khi spread ≤ P25 và độ sâu ≥ P75; căng thẳng khi spread ≥ P90 hoặc độ sâu ≤ P10. Cần tối thiểu 120 phiên lịch sử cùng pha; ngưỡng này không thể chỉnh theo hồ sơ.</p><label>Giờ bắt đầu yên lặng<input id="watch-quiet-start" type="time"></label><label>Giờ kết thúc yên lặng<input id="watch-quiet-end" type="time"></label><label>Kênh thông báo<select id="watch-channel"><option value="in_app">Trong ứng dụng</option><option value="browser">Trình duyệt</option></select></label><button id="watch-settings-save" class="button button-primary" type="button">Lưu cài đặt</button></div></details>
+
+        <section class="panel portfolio-analysis-panel" aria-labelledby="portfolio-analysis-title">
+          <div class="watchlist-panel-heading"><div><h2 id="portfolio-analysis-title">Phân tích danh mục</h2><p>So sánh điều kiện thanh khoản và mô phỏng chi phí trên snapshot SSI đã lưu.</p></div><span id="portfolio-analysis-asof" class="portfolio-asof">Đang tải dữ liệu…</span></div>
+          <div id="portfolio-analysis-kpis" class="portfolio-kpis" aria-live="polite"></div>
+          <div class="portfolio-execution">
+            <div class="portfolio-section-heading"><div><h3>Chi phí khớp lệnh mua theo quy mô lệnh (trượt giá so với giá giữa, bps)</h3><p>Mô phỏng tĩnh theo ba mức giá đang hiển thị trong sổ lệnh.</p></div><label for="portfolio-slippage-limit">Ngưỡng chấp nhận của bạn <output id="portfolio-slippage-value">30 bps</output></label></div>
+            <input id="portfolio-slippage-limit" class="portfolio-slider" type="range" min="5" max="100" step="1" value="30" aria-label="Ngưỡng trượt giá chấp nhận, tính bằng điểm cơ bản">
+            <div class="portfolio-table-wrap"><table class="portfolio-cost-table"><thead><tr><th>Mã</th><th>50 triệu</th><th>100 triệu</th><th>200 triệu</th><th>500 triệu</th></tr></thead><tbody id="portfolio-cost-rows"><tr><td colspan="5">Đang tải mô phỏng…</td></tr></tbody></table></div>
+            <p class="portfolio-legend">Xanh: không quá nửa ngưỡng · Vàng: trong ngưỡng · Đỏ: vượt ngưỡng · Xám: lệnh vượt độ sâu hiển thị hoặc thiếu snapshot. Mô phỏng trên snapshot SSI, không gửi lệnh; không tính thanh khoản ẩn, ưu tiên hàng chờ hay tác động giá.</p>
+          </div>
+          <div class="portfolio-position">
+            <div class="portfolio-section-heading"><div><h3>Vị trí so với toàn thị trường (cùng cửa sổ, cổ phiếu có dữ liệu)</h3><p>Phân vị chéo trên các mã có bar SSI hợp lệ; không phải phân vị lịch sử của riêng mã.</p></div></div>
+            <div id="portfolio-market-positions" class="portfolio-market-positions"><p>Đang tải phân vị thị trường…</p></div>
+            <p class="portfolio-legend"><span class="portfolio-dot spread-dot"></span> Chấm xanh dương: spread (phần trăm mã có spread thấp hơn). <span class="portfolio-dot depth-dot"></span> Chấm xanh lá: độ sâu top 3 (phần trăm mã có độ sâu thấp hơn). Càng về phải là phân vị cao hơn; so sánh spread giữa mã chịu ảnh hưởng của bước giá.</p>
+          </div>
+        </section>
+
         <p id="watchlist-feedback" class="analysis-note" role="status"></p>
       </section>
 
@@ -208,8 +224,8 @@
     </form>
   </dialog>
   <script src="/assets/app.js?v=34" defer></script>
-  <script src="/assets/enhancements.js?v=98" defer></script>
-  <script src="/assets/watchlist.js?v=3" defer></script>
+  <script src="/assets/enhancements.js?v=99" defer></script>
+  <script src="/assets/watchlist.js?v=4" defer></script>
 </body>
 </html>
 

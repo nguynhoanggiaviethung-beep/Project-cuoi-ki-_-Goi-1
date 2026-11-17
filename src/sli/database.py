@@ -1228,6 +1228,13 @@ def list_catalog_symbols(source="ssi"):
     return [row["symbol"] for row in rows]
 
 
+def list_stock_symbols(source="ssi"):
+    """Return catalogued common stocks without scanning historical prices."""
+    with connect() as db:
+        rows=db.execute("SELECT symbol FROM securities_catalog WHERE source=? AND lower(trim(stock_type))='stock' ORDER BY symbol",(source,)).fetchall()
+    return {row["symbol"] for row in rows}
+
+
 def fetch_latest_historical_page(search=None, page=1, page_size=50, source="ssi", exclude_date=None):
     page=max(1,int(page)); page_size=max(1,min(int(page_size),200)); offset=(page-1)*page_size
     where=" WHERE c.source=?"; args=[source]
