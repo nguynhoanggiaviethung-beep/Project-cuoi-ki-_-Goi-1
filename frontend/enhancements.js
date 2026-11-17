@@ -5,7 +5,7 @@
     VPB: { name: 'Ngân hàng TMCP Việt Nam Thịnh Vượng', sector: 'Ngân hàng' }
   };
   const colors = ['#008A45', '#E2231A', '#68A92E', '#A7BF36', '#00592E'];
-  const routeOrder = ['overview','watchlist','detail','rankings','alerts','methodology','guide','intro','project'];
+  const routeOrder = ['overview','watchlist','detail','rankings','alerts','methodology','guide','intro'];
   let marketHistoryCache=null,marketHistoryFetchedAt=0,marketHistoryCacheKey='';
   let turnoverMetric='value',turnoverPayload=null,turnoverResizeObserver=null,turnoverSignature='';
   let symbolsCache=null,symbolsFetchedAt=0,securitiesDirectory=[],detailSearchDirty=false;
@@ -90,7 +90,7 @@
   }
   const baseRankings=window.loadRankings,baseAlerts=window.loadAlerts,baseMethodology=window.loadMethodology;
   const enhanceWatchButtons=()=>window.watchAddQuickButtons?.();
-  const enhancedRankings=async()=>{await baseRankings?.();enhanceWatchButtons();},enhancedAlerts=async()=>{await baseAlerts?.();enhanceWatchButtons();},enhancedMethodology=()=>baseMethodology?.();
+  const enhancedRankings=async()=>{await baseRankings?.();enhanceWatchButtons();},enhancedAlerts=async(...args)=>{await baseAlerts?.(...args);enhanceWatchButtons();},enhancedMethodology=()=>baseMethodology?.();
 
   function setupMarketBackground() {
     if (document.querySelector('#market-background')) return;

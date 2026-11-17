@@ -617,3 +617,86 @@ body.liquidity-map-modal-open{overflow:hidden}
 #view-detail .bookwalk-formula{background:#f8fbf8}
 @media(max-width:800px){#view-detail>.content-grid{grid-template-columns:minmax(0,1fr);grid-template-areas:"spread" "book" "bookwalk" "depth" "alerts" "history"}#view-detail .bookwalk-controls{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:560px){#view-detail>.content-grid>.detail-book-panel,#view-detail .detail-bookwalk-panel{padding:16px}#view-detail .bookwalk-controls{grid-template-columns:1fr}#view-detail .bookwalk-controls button{width:100%}#view-detail .bookwalk-result-grid{grid-template-columns:1fr 1fr}#view-detail .book-ladder-head,#view-detail .book-ladder-row{grid-template-columns:minmax(0,1fr) minmax(58px,.68fr) minmax(58px,.68fr) minmax(0,1fr);gap:4px}}
+
+/* Cảnh báo: màn hình giám sát có thứ bậc thị giác và độ tương phản rõ */
+#view-alerts{--alert-ink:#173d2b;--alert-muted:#587263;--alert-line:#d8e7dc}
+#view-alerts>.page-heading{position:relative;display:block;margin:0 0 20px;padding:24px 28px 25px 30px;overflow:hidden;border:1px solid #bcd9c5;border-radius:18px;background:linear-gradient(112deg,#063d27 0%,#087847 58%,#119455 100%);box-shadow:0 14px 34px #052b1d40}
+#view-alerts>.page-heading:after{content:"!";position:absolute;right:34px;top:50%;transform:translateY(-50%);display:grid;place-items:center;width:68px;height:68px;border:1px solid #ffffff42;border-radius:20px;background:#ffffff14;color:#fff;font-size:38px;font-weight:850}
+#view-alerts>.page-heading .eyebrow{color:#a8e7bd;font-size:11px}
+#view-alerts>.page-heading h1{margin:2px 90px 7px 0;color:#fff;font-size:clamp(30px,3.3vw,42px)}
+#view-alerts>.page-heading>div>p:last-child{max-width:760px;color:#dcf1e3;font-size:14px}
+#view-alerts #alert-explainer{position:relative;margin:0 0 14px;padding:18px 22px 18px 24px;border:1px solid #cce2d2;border-left:5px solid #e2231a;border-radius:14px;background:linear-gradient(110deg,#fff 0%,#f4faf5 100%);box-shadow:0 6px 20px #123d2410}
+#view-alerts #alert-explainer h2{margin:0 0 6px;color:#075d36;font-size:17px}
+#view-alerts #alert-explainer p{max-width:1040px;margin:0;color:#425d4c;font-size:13px;line-height:1.7}
+#view-alerts #alert-live-counts{margin-top:10px}
+#view-alerts #alert-summary{display:flex;align-items:center;min-height:56px;margin:0 0 18px;padding:12px 17px;border:1px solid #a7d8b8;border-radius:12px;background:#e8f6ec;color:#075d36;font-size:14px;font-weight:750;box-shadow:0 4px 14px #14562a0d}
+#view-alerts #alert-summary .notice-icon{width:24px;height:24px;font-size:13px;background:#fff}
+#view-alerts>article.panel{padding:22px 24px;border:1px solid #d7e4da;border-radius:16px;background:rgba(255,255,255,.97);box-shadow:0 12px 30px #0b3d2415}
+#view-alerts>article.panel>.panel-heading{align-items:flex-end;margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid #e3ece5}
+#view-alerts>article.panel>.panel-heading h2{color:#173d2b;font-size:21px}
+#view-alerts>article.panel>.panel-heading p{color:#63796a;font-size:12px}
+#view-alerts #alerts-table{overflow-x:auto;border:1px solid #dce8df;border-radius:12px;background:#fff}
+#view-alerts #alerts-table table{min-width:1040px;border-collapse:separate;border-spacing:0;font-size:13px}
+#view-alerts #alerts-table thead th{position:sticky;top:0;padding:13px 12px;background:#e8f3eb;color:#315641;border-bottom:1px solid #cfdfd2;font-size:10px;letter-spacing:.07em}
+#view-alerts #alerts-table tbody td{padding:14px 12px;border-bottom:1px solid #edf2ee;color:#355344;vertical-align:middle;white-space:normal;line-height:1.55}
+#view-alerts #alerts-table tbody tr:nth-child(even) td{background:#f8fbf8}
+#view-alerts #alerts-table tbody tr:hover td{background:#edf7ef}
+#view-alerts #alerts-table tbody td:first-child{min-width:76px;font-weight:800;color:#075d36}
+#view-alerts #alerts-table tbody td:nth-child(2){min-width:215px;font-weight:650}
+#view-alerts #alerts-table tbody td:nth-child(4),#view-alerts #alerts-table tbody td:nth-child(5),#view-alerts #alerts-table tbody td:nth-child(6){font-variant-numeric:tabular-nums;font-weight:700;white-space:nowrap}
+#view-alerts #alerts-table tbody td:last-child{min-width:260px;color:#536d5e}
+@media(max-width:700px){#view-alerts>.page-heading{padding:20px 20px 22px}#view-alerts>.page-heading:after{right:18px;width:48px;height:48px;border-radius:14px;font-size:28px}#view-alerts>.page-heading h1{margin-right:56px}#view-alerts>article.panel{padding:16px}#view-alerts #alert-explainer{padding:16px 17px}#view-alerts #alerts-table table{min-width:900px}}
+
+#view-alerts .alerts-pager{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 4px 0;color:#587263;font-size:12px;font-weight:700}
+#view-alerts .alerts-pager button{min-width:190px}
+@media(max-width:560px){#view-alerts .alerts-pager{align-items:stretch;flex-direction:column}#view-alerts .alerts-pager button{width:100%}}
+
+#view-alerts .alert-symbol-filter{display:grid;gap:6px;margin:0 0 14px;padding:15px 17px;border:1px solid #cfe2d3;border-radius:12px;background:#f8fcf8}
+#view-alerts .alert-symbol-filter>label{color:#315641;font-size:12px;font-weight:800}
+#view-alerts .alert-symbol-filter>div{display:flex;gap:8px;flex-wrap:wrap}
+#view-alerts .alert-symbol-filter input{flex:1 1 240px;min-width:180px;min-height:42px;padding:9px 12px;border:1px solid #bfd5c5;border-radius:9px;background:#fff;color:#173d2b;font:inherit}
+#view-alerts .alert-symbol-filter input:focus{outline:2px solid #71bd88;outline-offset:1px}
+#view-alerts .alert-symbol-filter small{color:#71857a;font-size:11px}
+
+/* Dữ liệu & phương pháp: tương phản trạng thái và cân bằng chiều cao các khối */
+#view-methodology>.page-heading{margin-bottom:16px;padding:18px 22px;border:1px solid #cfe2d3;border-radius:16px;background:linear-gradient(105deg,#f8fcf8,#eaf5ed);box-shadow:0 8px 22px #073d2010}
+#view-methodology>.page-heading .eyebrow{color:#008a45}
+#view-methodology>.page-heading h1{margin-bottom:5px;color:#123f2a}
+#view-methodology>.page-heading>div>p:last-child{color:#587263}
+#view-methodology .methodology-grid{grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr);gap:16px;align-items:stretch}
+#view-methodology .methodology-grid>.methodology-collector,#view-methodology .methodology-grid>.methodology-pipeline{height:auto;min-height:100%;padding:22px;border:1px solid #d4e4d8;border-radius:17px;background:rgba(255,255,255,.97);box-shadow:0 10px 28px #0b3d2412}
+#view-methodology .methodology-collector{border-top:4px solid #008a45}
+#view-methodology .methodology-pipeline{border-top:4px solid #e2231a}
+#view-methodology .methodology-collector .panel-heading,#view-methodology .methodology-pipeline .panel-heading{min-height:86px;margin-bottom:16px;padding-bottom:13px;border-bottom:1px solid #e3ece5}
+#view-methodology .methodology-collector .panel-heading h2,#view-methodology .methodology-pipeline .panel-heading h2{color:#143d2b;font-size:20px}
+#view-methodology .methodology-collector .panel-heading p:last-child,#view-methodology .methodology-pipeline .panel-heading p:last-child{color:#5e7567;font-size:12px}
+#view-methodology .collector-status{grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+#view-methodology .status-cell{min-width:0;padding:12px 13px;border:1px solid #e0eae2;border-radius:11px;background:#f5f9f5}
+#view-methodology .status-cell:nth-child(3){grid-column:1/-1;background:#eef7f0;border-left:3px solid #008a45}
+#view-methodology .status-cell small{color:#687d6f;font-size:10px;font-weight:700;letter-spacing:.015em}
+#view-methodology .status-cell strong{display:block;margin-top:5px;color:#174a2d!important;font-size:13px;font-weight:800;line-height:1.5;overflow-wrap:anywhere}
+#view-methodology .methodology-collector .small-note{margin-top:14px;padding:11px 13px;border-radius:10px;background:#f5f8f5;color:#596f61;font-size:11px;line-height:1.65}
+#view-methodology .methodology-pipeline .pipeline{display:grid;grid-template-rows:repeat(5,minmax(54px,auto));gap:0;margin:2px 0 0;padding:0}
+#view-methodology .methodology-pipeline .pipeline li{position:relative;display:grid;grid-template-columns:38px minmax(0,1fr);align-content:center;column-gap:12px;min-height:62px;padding:10px 4px;border-bottom:1px solid #e6eee7}
+#view-methodology .methodology-pipeline .pipeline li:last-child{border-bottom:0}
+#view-methodology .methodology-pipeline .pipeline li:before{display:grid;place-items:center;grid-row:span 2;width:30px;height:30px;border:1px solid #cce3d1;border-radius:10px;background:#eaf5ed;color:#08743e;font-size:11px}
+#view-methodology .methodology-pipeline .pipeline li b{align-self:end;color:#17432c;font-size:13px}
+#view-methodology .methodology-pipeline .pipeline li span{grid-column:2;margin-top:2px;color:#607568;font-size:11px;line-height:1.55}
+#view-methodology .methodology-quality,#view-methodology .methodology-methods{padding:23px;border:1px solid #d4e4d8;border-radius:17px;background:rgba(255,255,255,.97);box-shadow:0 10px 28px #0b3d2412}
+#view-methodology .methodology-quality .kpi-card{background:#f7faf7;border-color:#e0eae2}
+#view-methodology .methodology-quality .kpi-card span{color:#566f5e}
+#view-methodology .methodology-quality .kpi-card strong{color:#075d36!important}
+#view-methodology .methodology-quality .kpi-card small{color:#6d8072}
+#view-methodology .methodology-methods .method-section-heading h2{color:#17432c}
+#view-methodology .methodology-methods .method-section-heading>div>p:last-child{color:#607568}
+@media(max-width:950px){#view-methodology .methodology-grid{grid-template-columns:1fr}#view-methodology .methodology-pipeline .pipeline{grid-template-rows:none}}
+@media(max-width:620px){#view-methodology>.page-heading{padding:16px}#view-methodology .methodology-grid>.methodology-collector,#view-methodology .methodology-grid>.methodology-pipeline,#view-methodology .methodology-quality,#view-methodology .methodology-methods{padding:16px}#view-methodology .collector-status{grid-template-columns:repeat(2,minmax(0,1fr))}#view-methodology .status-cell:nth-child(3){grid-column:1/-1}#view-methodology .methodology-collector .panel-heading,#view-methodology .methodology-pipeline .panel-heading{min-height:0}}
+
+#view-rankings .ranking-table td small{display:block;margin-top:3px;color:#657b6b;font-size:10px;line-height:1.4}
+#view-rankings .ranking-table td:first-child .rank-move{margin:4px 0 0 5px}
+#view-rankings .ranking-empty-state{padding:30px 18px;color:#556f5d;line-height:1.7}
+#view-rankings #ranking-more[hidden]{display:none}
+
+#view-intro .intro-overview-grid{align-items:stretch}
+#view-intro .intro-overview-grid>.panel{min-height:160px}
+@media(max-width:720px){#view-intro .intro-overview-grid>.panel{min-height:0}}

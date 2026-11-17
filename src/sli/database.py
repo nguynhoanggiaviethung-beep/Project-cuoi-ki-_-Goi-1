@@ -1126,20 +1126,41 @@ def list_symbols(source):
     return [row["symbol"] for row in rows]
 
 
-def fetch_alerts(source, limit=100):
+def fetch_alerts(source, limit=100, offset=0, symbol=None):
+    ticker = str(symbol or "").strip().upper()
+    page_size = max(1, min(int(limit), 500))
+    page_offset = max(0, int(offset))
     with connect() as db:
-        rows = db.execute("""
-            SELECT id,symbol,alert_type,severity,metric_value,threshold_value,
-                   baseline_window,triggered_at,status,explanation,bucket,baseline_mode,consecutive_bars
-            FROM alerts WHERE source=? ORDER BY triggered_at DESC LIMIT ?
-        """, (source, max(1, min(int(limit), 500)))).fetchall()
-        system_rows = db.execute("""SELECT id, 'ALL' AS symbol, alert_type, severity,
-            NULL AS metric_value, threshold_value, NULL AS baseline_window, triggered_at,
-            status, explanation, NULL AS bucket, NULL AS baseline_mode, NULL AS consecutive_bars
-            FROM system_alerts WHERE source=? ORDER BY triggered_at DESC LIMIT ?""",
-            (source, max(1, min(int(limit), 500)))).fetchall()
-    combined = [dict(row) for row in rows] + [dict(row) for row in system_rows]
-    return sorted(combined, key=lambda row: row["triggered_at"], reverse=True)[:max(1, min(int(limit), 500))]
+        if ticker:
+            rows = db.execute("""
+                SELECT id,symbol,alert_type,severity,metric_value,threshold_value,
+                       baseline_window,triggered_at,status,explanation,bucket,baseline_mode,consecutive_bars
+                FROM alerts WHERE source=? AND symbol=? ORDER BY triggered_at DESC LIMIT ? OFFSET ?
+            """, (source, ticker, page_size, page_offset)).fetchall()
+        else:
+            rows = db.execute("""
+                SELECT * FROM (
+                    SELECT id,symbol,alert_type,severity,metric_value,threshold_value,
+                           baseline_window,triggered_at,status,explanation,bucket,baseline_mode,consecutive_bars
+                    FROM alerts WHERE source=?
+                    UNION ALL
+                    SELECT id, 'ALL' AS symbol, alert_type, severity,
+                           NULL AS metric_value, threshold_value, NULL AS baseline_window, triggered_at,
+                           status, explanation, NULL AS bucket, NULL AS baseline_mode, NULL AS consecutive_bars
+                    FROM system_alerts WHERE source=?
+                ) ORDER BY triggered_at DESC LIMIT ? OFFSET ?
+            """, (source, source, page_size, page_offset)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_alerts(source, symbol=None):
+    ticker = str(symbol or "").strip().upper()
+    with connect() as db:
+        if ticker:
+            return int(db.execute("SELECT COUNT(*) FROM alerts WHERE source=? AND symbol=?", (source, ticker)).fetchone()[0])
+        alerts_count = db.execute("SELECT COUNT(*) FROM alerts WHERE source=?", (source,)).fetchone()[0]
+        system_count = db.execute("SELECT COUNT(*) FROM system_alerts WHERE source=?", (source,)).fetchone()[0]
+    return int(alerts_count) + int(system_count)
 
 
 def count_active_alerts_by_symbol(source, symbols):

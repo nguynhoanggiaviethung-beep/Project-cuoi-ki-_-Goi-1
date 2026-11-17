@@ -99,6 +99,7 @@ async function api(path, options = {}) {
 }
 window.attachChartTooltip = attachChartTooltip;
 function setRoute(route) {
+  if (route === "project") route = "intro";
   state.route = route;
   window.sliRoute = route;
   $$(".view").forEach((view) => view.classList.toggle("hidden", view.id !== "view-" + route));
@@ -390,32 +391,70 @@ async function loadDetail() {
     $("#orderbook").innerHTML = '<div class="empty-state">' + escapeHtml(error.message) + '</div>';
   }
 }
+let rankingPayload = null;
+let rankingTab = "spread";
+let rankingVisibleCount = 10;
+function renderRankings() {
+  const host = $("#ranking-table-container");
+  if (!host) return;
+  if (!rankingPayload) { host.innerHTML = '<div class="empty-state">Đang tải xếp hạng…</div>'; return; }
+  const map = {spread:"lowest_spread",depth:"highest_depth",widen:"spread_widening",fall:"depth_falling"};
+  const sourceRows = rankingPayload[map[rankingTab]] || [];
+  const query = $("#ranking-search")?.value.trim().toUpperCase() || "";
+  const rows = query ? sourceRows.filter(row => String(row.symbol || "").toUpperCase().includes(query)) : sourceRows;
+  const shown = rows.slice(0, rankingVisibleCount);
+  const metric = row => {
+    if (rankingTab === "spread") return `${fmt(row.median_spread_bps, 2)} bps <small>${fmt(row.median_spread_ticks, 1)} bước giá</small>`;
+    if (rankingTab === "depth") return `${fmt(row.median_total_depth_value, 0)} đồng <small>Giá trị niêm yết top 3</small>`;
+    if (rankingTab === "widen") return `${fmt(row.spread_expansion_bps, 2)} bps <small>Spread mới nhất ${fmt(row.latest_spread_bps, 2)} bps</small>`;
+    return `${fmt(row.depth_change_pct, 1)}% <small>Độ sâu mới nhất ${fmt(row.latest_total_depth_value, 0)} đồng</small>`;
+  };
+  const body = shown.map((row, index) => {
+    const change = Number(row.rank_change);
+    const movement = Number.isFinite(change) ? `<small class="rank-move ${change > 0 ? "up" : change < 0 ? "down" : ""}">${change > 0 ? `↑ ${change} hạng` : change < 0 ? `↓ ${Math.abs(change)} hạng` : "0 hạng"}</small>` : '<small class="rank-move">Mốc đầu</small>';
+    const tie = row.one_tick_tie ? '<span class="rank-tie">1 bước giá</span>' : '';
+    return `<tr><td><span class="rank-number">${index + 1}</span>${movement}</td><td><strong>${escapeHtml(row.symbol)}</strong><small class="rank-exchange">${escapeHtml(row.board || "—")}</small></td><td>${metric(row)}${tie}</td><td>${fmt(row.median_spread_bps, 2)} bps <small>${fmt(row.median_spread_ticks, 1)} bước giá</small></td><td>${fmt(row.median_total_depth_value, 0)} đồng</td><td>${fmt(row.bar_count || row.sample_count || row.snapshot_count, 0)}</td></tr>`;
+  }).join("");
+  const labels={spread:"Spread thấp nhất",depth:"Độ sâu top 3 cao nhất",widen:"Spread nới rộng nhiều nhất",fall:"Độ sâu suy giảm nhiều nhất"};
+  const empty=rankingPayload.symbols_with_window_bars===0
+    ? `Không có bar SSI trong cửa sổ ${rankingPayload.sample_window_minutes} phút đã chọn. Dữ liệu sổ lệnh mới nhất lưu đến ${escapeHtml(rankingPayload.window_end_exclusive || "—")}.`
+    : query ? `Không tìm thấy mã “${escapeHtml(query)}” trong nhóm ${labels[rankingTab].toLocaleLowerCase("vi-VN")}.` : `Có ${fmt(rankingPayload.symbols_with_window_bars,0)} mã có bar trong cửa sổ, nhưng chưa mã nào đạt tối thiểu ${fmt(rankingPayload.minimum_eligible_samples,0)} bar hợp lệ.`;
+  host.innerHTML = shown.length ? `<table class="ranking-table"><thead><tr><th>HẠNG · THAY ĐỔI</th><th>MÃ / SÀN</th><th>${labels[rankingTab].toLocaleUpperCase("vi-VN")}</th><th>SPREAD TRUNG VỊ</th><th>ĐỘ SÂU TOP 3</th><th>SỐ BAR</th></tr></thead><tbody>${body}</tbody></table>` : `<div class="empty-state ranking-empty-state">${empty}</div>`;
+  $("#ranking-count").textContent = `Hiển thị ${shown.length} / ${rows.length} mã · ${fmt(rankingPayload.eligible_symbols,0)} mã đủ điều kiện`;
+  const more=$("#ranking-more"); if(more){more.hidden=shown.length>=rows.length;more.textContent=`Xem thêm ${Math.min(25,rows.length-shown.length)}`;}
+  const note=$("#ranking-live-note"); if(note) note.textContent=`${rankingPayload.note||""} Cửa sổ ${rankingPayload.sample_window_minutes} phút · từ ${fmtTime(rankingPayload.window_start)} đến ${fmtTime(rankingPayload.window_end_exclusive)} · bar phiên ${rankingPayload.comparison_session_date||String(rankingPayload.window_end_exclusive||"").slice(0,10)}. Spread thấp và độ sâu cao là hai chiều quan sát riêng, không phải khuyến nghị giao dịch.`;
+}
 async function loadRankings() {
+  const host=$("#ranking-table-container");
+  if(host)host.innerHTML='<div class="empty-state">Đang tải dữ liệu xếp hạng SSI…</div>';
   try {
-    const limit = Number($("#ranking-limit").value || 120);
-    const data = await api("/api/rankings?limit=" + limit);
-    const spreadRows = (data.lowest_spread || []).map((row, index) => [
-      '<strong>' + (index + 1) + '</strong>', '<strong>' + escapeHtml(row.symbol) + '</strong>',
-      fmt(row.median_spread_bps) + " điểm cơ bản (bps)", fmt(row.snapshot_count, 0)
-    ]);
-    const depthRows = (data.highest_depth || []).map((row, index) => [
-      '<strong>' + (index + 1) + '</strong>', '<strong>' + escapeHtml(row.symbol) + '</strong>',
-      fmt(row.median_total_depth_value, 0), fmt(row.snapshot_count, 0)
-    ]);
-    $("#ranking-spread").innerHTML = table(["Hạng", "Mã", "Trung vị chênh lệch giá (spread)", "Số ảnh chụp dữ liệu (snapshots)"], spreadRows);
-    $("#ranking-depth").innerHTML = table(["Hạng", "Mã", "Trung vị giá trị độ sâu (depth)", "Số ảnh chụp dữ liệu (snapshots)"], depthRows);
-  } catch (error) {
-    $("#ranking-spread").innerHTML = '<div class="empty-state">' + escapeHtml(error.message) + '</div>';
+    const windowMinutes=Number($("#ranking-limit")?.value||60),board=$("#ranking-board")?.value||"";
+    const params=new URLSearchParams({limit:"2000",window_minutes:String(windowMinutes)});if(board)params.set("board",board);
+    rankingPayload=await api("/api/rankings?"+params.toString());
+    rankingVisibleCount=Number($("#ranking-size")?.value||10);
+    renderRankings();
+    const updated=$("#ranking-updated");if(updated)updated.textContent=rankingPayload.comparison_session_date?`Đối chiếu phiên ${rankingPayload.comparison_session_date}`:`Dữ liệu SSI · ${fmtTime(rankingPayload.window_end_exclusive)}`;
+  } catch(error) {
+    rankingPayload=null;
+    if(host)host.innerHTML=`<div class="empty-state ranking-empty-state">Không tải được dữ liệu xếp hạng: ${escapeHtml(error.message)}<br><button class="button button-secondary" type="button" id="ranking-retry">Thử tải lại</button></div>`;
+    const updated=$("#ranking-updated");if(updated)updated.textContent="Lỗi tải dữ liệu";
   }
 }
-async function loadAlerts() {
+let alertsLoadedCount = 0;
+let alertsTotalCount = 0;
+async function loadAlerts(offset = 0) {
+  void initAlertSymbolSearch();
   try {
-    const data = await api("/api/alerts");
+    const pageSize = 100;
+    const symbol = document.querySelector("#alert-symbol-search")?.value.trim().toUpperCase() || "";
+    const data = await api(`/api/alerts?limit=${pageSize}&offset=${offset}${symbol ? `&symbol=${encodeURIComponent(symbol)}` : ""}`);
     const alerts = data.alerts || [];
+    alertsTotalCount = Number(data.alert_count ?? data.total_count ?? alerts.length);
+    alertsLoadedCount = offset + alerts.length;
     $("#alert-summary").innerHTML = '<span class="notice-icon">i</span><span>' +
-      (alerts.length ? alerts.length + " cảnh báo trong dữ liệu đang chọn." :
+      (alertsTotalCount ? `${symbol ? `Mã ${escapeHtml(symbol)} · ` : ""}${alertsLoadedCount.toLocaleString("vi-VN")} / ${alertsTotalCount.toLocaleString("vi-VN")} cảnh báo đã tải.` :
         "Chưa có cảnh báo được lưu. Mốc tham chiếu (baseline) cần tối thiểu " + data.baseline_min_observations + " quan sát hợp lệ.") + '</span>';
-    $("#alerts-table").innerHTML = table(
+    const rendered = table(
       ["Mã", "Loại cảnh báo", "Mức độ", "Chỉ số (metric)", "Ngưỡng", "Số mẫu", "Thời điểm", "Giải thích"],
       alerts.map((row) => [
         '<strong>' + escapeHtml(row.symbol) + '</strong>', escapeHtml(viAlert(row.alert_type)),
@@ -424,10 +463,43 @@ async function loadAlerts() {
       ]),
       "Chưa có cảnh báo cho nguồn dữ liệu này."
     );
+    const host = $("#alerts-table");
+    if (offset > 0 && host.querySelector("tbody")) {
+      const temp = document.createElement("div"); temp.innerHTML = rendered;
+      host.querySelector("tbody").insertAdjacentHTML("beforeend", temp.querySelector("tbody")?.innerHTML || "");
+    } else host.innerHTML = rendered;
+    let pager = document.querySelector("#alerts-pager");
+    if (!pager) { pager = document.createElement("div"); pager.id = "alerts-pager"; pager.className = "alerts-pager"; host.after(pager); }
+    pager.innerHTML = alertsLoadedCount < alertsTotalCount
+      ? `<span>Đang hiển thị ${alertsLoadedCount.toLocaleString("vi-VN")} trên ${alertsTotalCount.toLocaleString("vi-VN")} cảnh báo</span><button class="button button-secondary" type="button" id="alerts-load-more">Tải thêm 100 cảnh báo</button>`
+      : `<span>Đã hiển thị tất cả ${alertsTotalCount.toLocaleString("vi-VN")} cảnh báo</span>`;
+    document.querySelector("#alerts-load-more")?.addEventListener("click", () => loadAlerts(alertsLoadedCount), { once: true });
   } catch (error) {
     $("#alerts-table").innerHTML = '<div class="empty-state">' + escapeHtml(error.message) + '</div>';
   }
 }
+
+async function initAlertSymbolSearch() {
+  const list = document.querySelector("#alert-symbol-options");
+  if (!list || list.dataset.loaded) return;
+  list.dataset.loaded = "1";
+  try {
+    const data = await api("/api/symbols");
+    list.innerHTML = (data.symbols || []).map((symbol) => `<option value="${escapeHtml(symbol)}"></option>`).join("");
+  } catch (_) { list.dataset.loaded = ""; }
+}
+document.addEventListener("submit", (event) => {
+  if (event.target?.id !== "alert-symbol-filter") return;
+  event.preventDefault();
+  loadAlerts(0);
+});
+document.addEventListener("click", (event) => {
+  if (event.target?.id !== "alert-symbol-clear") return;
+  const input = document.querySelector("#alert-symbol-search");
+  if (input) input.value = "";
+  loadAlerts(0);
+});
+
 async function loadMethodology() {
   try {
     const data = await api("/api/methodology");
@@ -504,6 +576,14 @@ $("#overview-symbol").addEventListener("change", () => (window.loadOverview || l
 $("#overview-limit").addEventListener("change", () => (window.loadOverview || loadOverview)());
 $("#detail-symbol").addEventListener("change", () => (window.loadDetail || loadDetail)());
 $("#ranking-limit").addEventListener("change", () => (window.loadRankings || loadRankings)());
+$("#ranking-size")?.addEventListener("change", () => { rankingVisibleCount=Number($("#ranking-size").value||10);renderRankings(); });
+$("#ranking-search")?.addEventListener("input", () => renderRankings());
+$("#ranking-more")?.addEventListener("click", () => { rankingVisibleCount+=25;renderRankings(); });
+document.addEventListener("click", event => {
+  const tab=event.target.closest("[data-ranking-tab]");
+  if(tab){rankingTab=tab.dataset.rankingTab;document.querySelectorAll("[data-ranking-tab]").forEach(button=>button.setAttribute("aria-selected",String(button===tab)));rankingVisibleCount=Number($("#ranking-size")?.value||10);renderRankings();}
+  if(event.target?.id==="ranking-retry")(window.loadRankings||loadRankings)();
+});
 // enhancements.js replaces the legacy overview loader. Defer the first route
 // until all deferred scripts have initialized so the legacy loader cannot
 // finish later and overwrite the SSI-specific charts with empty placeholders.

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#008A45">
   <title>Stock Liquidity Intelligence</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=47">
+  <link rel="stylesheet" href="/assets/styles.css?v=53">
 </head>
 <body>
   <div id="onboarding" class="onboarding">
@@ -69,7 +69,6 @@
       <button data-route="methodology" class="nav-item">Dữ liệu & phương pháp</button>
       <button data-route="guide" class="nav-item">Hướng dẫn</button>
       <button data-route="intro" class="nav-item">Giới thiệu</button>
-      <button data-route="project" class="nav-item">Về dự án</button>
     </nav>
     <main class="page-shell">
       <div id="global-notice" class="notice notice-demo"><span class="notice-icon">i</span><span id="notice-text">Đang tải dữ liệu…</span></div>
@@ -170,6 +169,11 @@
 
       <section id="view-alerts" class="view hidden">
         <div class="page-heading"><div><p class="eyebrow">GIÁM SÁT THAY ĐỔI</p><h1>Cảnh báo</h1><p>Các cảnh báo được so với mốc tham chiếu lịch sử (baseline) của từng mã khi đủ số quan sát.</p></div></div>
+        <form id="alert-symbol-filter" class="alert-symbol-filter">
+          <label for="alert-symbol-search">Lọc cảnh báo theo mã cổ phiếu</label>
+          <div><input id="alert-symbol-search" type="search" list="alert-symbol-options" placeholder="Nhập mã, ví dụ FPT" autocomplete="off"><datalist id="alert-symbol-options"></datalist><button class="button button-primary" type="submit">Tìm cảnh báo</button><button class="button button-secondary" type="button" id="alert-symbol-clear">Tất cả mã</button></div>
+          <small>Để trống ô tìm kiếm để xem cảnh báo toàn bộ thị trường.</small>
+        </form>
         <div id="alert-summary" class="notice"><span class="notice-icon">i</span><span>Đang tải cảnh báo…</span></div>
         <article class="panel"><div class="panel-heading"><div><h2>Lịch sử cảnh báo</h2><p>Chỉ số (metric), ngưỡng tham chiếu và lý do phát cảnh báo</p></div></div><div id="alerts-table"></div></article>
       </section>
@@ -196,16 +200,14 @@
 
       <section id="view-intro" class="view hidden">
         <div class="page-heading"><div><p class="eyebrow">GIỚI THIỆU</p><h1>Stock Liquidity Intelligence</h1><p>Hệ thống phân tích và giám sát thanh khoản cổ phiếu từ dữ liệu sổ lệnh.</p></div></div>
-        <div class="content-grid">
+        <div class="content-grid intro-overview-grid">
           <article class="panel"><span class="eyebrow">MỤC TIÊU</span><h2>Nhìn vào điều kiện giao dịch đang niêm yết</h2><p>SLI quan sát giá và khối lượng chờ mua/bán để mô tả chênh lệch giá (spread), độ sâu sổ lệnh (depth) và mức cân bằng giữa hai phía.</p></article>
           <article class="panel"><span class="eyebrow">PHẠM VI</span><h2>Hỗ trợ quan sát, không thực hiện giao dịch</h2><p>Sản phẩm không đặt lệnh, không khẳng định có thể dự báo chiều giá và không đảm bảo ảnh chụp dữ liệu (snapshot) sẽ khớp được.</p></article>
           <article class="panel"><span class="eyebrow">CÁCH ĐỌC</span><h2>Mỗi chỉ số (metric) có công thức và giới hạn</h2><p>Chỉ tiêu được tính từ dữ liệu hợp lệ; trường thiếu được đánh dấu không khả dụng thay vì tự thay bằng 0.</p></article>
+          <article class="panel"><span class="eyebrow">VẤN ĐỀ NGHIÊN CỨU</span><h2>Giá khớp chưa cho thấy toàn bộ điều kiện đang chờ</h2><p>Giá và khối lượng khớp lệnh chưa mô tả đầy đủ điều kiện giao dịch đang hiển thị. SLI bổ sung quan sát khoảng cách giá mua – bán (bid–ask), khối lượng niêm yết và cách các chỉ tiêu thay đổi theo thời gian.</p></article>
+          <article class="panel"><span class="eyebrow">ĐẦU RA</span><h2>Quy trình có thể kiểm tra và tái lập</h2><p>Bộ thu thập dữ liệu (collector), kho ảnh chụp dữ liệu (snapshot) cục bộ, phân tích (analytics), bảng tổng quan, biểu đồ, xếp hạng và cảnh báo dựa trên mốc tham chiếu (baseline) từng mã.</p></article>
+          <article class="panel"><span class="eyebrow">GIỚI HẠN</span><h2>Chỉ báo quan sát, không phải lời khuyên đầu tư</h2><p>Dữ liệu ba mức giá đầu không đại diện toàn bộ sổ lệnh (order book); lệnh niêm yết có thể thay đổi trước khi khớp. Cảnh báo là quy tắc thống kê của sản phẩm, không phải chuẩn pháp lý hay khuyến nghị đầu tư.</p></article>
         </div>
-      </section>
-
-      <section id="view-project" class="view hidden">
-        <div class="page-heading"><div><p class="eyebrow">VỀ DỰ ÁN</p><h1>Mô tả dự án</h1><p>Đề tài học thuật về thanh khoản niêm yết và vi cấu trúc thị trường.</p></div></div>
-        <article class="panel project-copy"><h2>Vấn đề nghiên cứu</h2><p>Giá và khối lượng khớp lệnh chưa mô tả đầy đủ điều kiện giao dịch đang hiển thị. SLI bổ sung quan sát khoảng cách giá mua – bán (bid–ask), khối lượng niêm yết và cách các chỉ tiêu thay đổi theo thời gian.</p><h2>Đầu ra</h2><p>Bộ thu thập dữ liệu (collector), kho ảnh chụp dữ liệu (snapshot) cục bộ, phân tích (analytics) có thể tái lập, bảng tổng quan, biểu đồ, xếp hạng và cảnh báo dựa trên mốc tham chiếu (baseline) từng mã.</p><h2>Giới hạn</h2><p>Dữ liệu ba mức giá đầu không đại diện toàn bộ sổ lệnh (order book); lệnh niêm yết có thể thay đổi trước khi khớp. Cảnh báo là quy tắc thống kê của sản phẩm, không phải chuẩn pháp lý hay khuyến nghị đầu tư.</p></article>
       </section>
     </main>
     <footer class="app-footer"><span>Stock Liquidity Intelligence (SLI)</span><span>Ảnh chụp sổ lệnh (snapshot) · Không phải khuyến nghị đầu tư</span></footer>
@@ -223,8 +225,8 @@
       </div>
     </form>
   </dialog>
-  <script src="/assets/app.js?v=34" defer></script>
-  <script src="/assets/enhancements.js?v=99" defer></script>
+  <script src="/assets/app.js?v=38" defer></script>
+  <script src="/assets/enhancements.js?v=101" defer></script>
   <script src="/assets/watchlist.js?v=4" defer></script>
 </body>
 </html>

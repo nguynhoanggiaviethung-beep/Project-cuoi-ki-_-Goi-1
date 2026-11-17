@@ -950,16 +950,23 @@ def bookwalk(symbol: str, side: str = Query(..., pattern="^(buy|sell)$"),
 
 
 @app.get("/api/alerts")
-def alerts(limit: int = Query(default=100, ge=1, le=500)):
-    items = database.fetch_alerts(_source(), limit)
+def alerts(limit: int = Query(default=100, ge=1, le=500), offset: int = Query(default=0, ge=0), symbol: str | None = Query(default=None, max_length=20)):
+    selected_source = _source()
+    selected_symbol = symbol.strip().upper() if symbol and symbol.strip() else None
+    items = database.fetch_alerts(selected_source, limit, offset, selected_symbol)
+    total_count = database.count_alerts(selected_source, selected_symbol)
     return {
-        "source": _source(),
+        "source": selected_source,
         "baseline_min_observations": config.BASELINE_MIN_BARS,
         "baseline_min_bars": config.BASELINE_MIN_BARS,
         "baseline_sessions": config.BASELINE_SESSIONS,
-        "baseline_qualified_symbols":database.count_baseline_qualified_symbols(_source()) if _source() in {"live","ssi"} else 0,
-        "alerts": items[:limit],
-        "alert_count": len(items),
+        "baseline_qualified_symbols": database.count_baseline_qualified_symbols(selected_source) if selected_source in {"live", "ssi"} else 0,
+        "alerts": items,
+        "alert_count": total_count,
+        "offset": offset,
+        "limit": limit,
+        "symbol": selected_symbol,
+        "has_more": offset + len(items) < total_count,
         "active_count": sum(1 for item in items if item.get("status") == "active"),
         "resolved_count": sum(1 for item in items if item.get("status") == "resolved"),
     }
