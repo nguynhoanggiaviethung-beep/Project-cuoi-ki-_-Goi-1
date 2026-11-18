@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import os
 import queue
+import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, time as datetime_time, timezone
@@ -12,7 +13,7 @@ from ssi_sdk.enums import Board
 from ssi_sdk.exceptions import AuthenticationError, ReauthenticationRequired
 from ssi_sdk.models.streaming import QuoteMessage, TradeMessage
 
-from . import config, database
+from . import config, database, daily_archive
 from .analytics import map_message, number_or_none, _to_local_timestamp
 from .market_clock import get_market_state
 
@@ -69,22 +70,21 @@ class SsiCollector:
         self.runtime=runtime; self._stop=threading.Event(); self._thread=None
         self.worker_id=worker_id
         self._stream=None; self._lock=threading.Lock(); self._writer=None
-        self._history_thread=None; self._pending_by_symbol={}; self._pending_lock=threading.Lock()
-        self._pending_signal=threading.Event(); self._pending_trades=queue.Queue(maxsize=20000)
+        self._history_thread=None; self._pending_quotes=queue.Queue()
+        self._pending_signal=threading.Event(); self._pending_trades=queue.Queue()
         self._board_by_symbol={}
 
     def start(self):
         with self._lock:
             if self._thread and self._thread.is_alive(): return False
             self._stop.clear()
-            with self._pending_lock:self._pending_by_symbol.clear()
-            while not self._pending_trades.empty():
-                try:self._pending_trades.get_nowait()
-                except queue.Empty:break
+            self._clear_queue(self._pending_quotes)
+            self._clear_queue(self._pending_trades)
             self._pending_signal.clear()
             self.runtime.update(mode="ssi",connection_status="connecting",provider="SSI FastConnect · all listed stocks",
                 last_error=None,messages_received=0,rows_valid=0,rows_invalid=0,duplicate_messages=0,queue_dropped=0,reconnect_count=0,
                 queue_depth=0,queue_coalesced=0,last_message_at=None,last_persisted_at=None,
+                quote_messages_filtered=0,
                 trade_messages_received=0,trade_messages_saved=0,trade_messages_dropped=0,trade_messages_filtered=0,
                 last_trade_received_at=None,last_trade_persisted_at=None,trade_queue_depth=0,
                 historical_prices_rows=0,historical_symbols_total=0,historical_symbols_processed=0,
@@ -99,6 +99,12 @@ class SsiCollector:
             try:self._stream.disconnect()
             except Exception:pass
         if self.runtime.snapshot().get("mode")=="ssi":self.runtime.update(connection_status="disconnected")
+
+    @staticmethod
+    def _clear_queue(pending):
+        while True:
+            try: pending.get_nowait()
+            except queue.Empty: return
 
     @staticmethod
     def _make_config():
@@ -286,7 +292,7 @@ class SsiCollector:
         self.runtime.update(historical_sync_phase="awaiting_next_session" if not self._stop.is_set() else "stopped")
 
     def _history_scheduler(self, auth, symbols):
-        """Keep SSI OHLC history current once per configured trading day."""
+        """Run OHLC backfill after all exchanges close to protect live writes."""
         last_sync_date = None
         while not self._stop.is_set():
             now = datetime.now(config.TIMEZONE)
@@ -294,6 +300,14 @@ class SsiCollector:
             is_weekday = now.weekday() < 5
             is_configured_holiday = session_date in config.MARKET_HOLIDAYS
             if is_weekday and not is_configured_holiday and session_date != last_sync_date:
+                # Full-history paging writes thousands of rows to the same SQLite
+                # file as the live collector. Start only after UPCoM closes.
+                after_all_sessions = now.time() >= datetime_time(15, 5)
+                if not after_all_sessions:
+                    self.runtime.update(historical_sync_phase="deferred_until_after_close")
+                    if self._stop.wait(30):
+                        break
+                    continue
                 _LOG.info("Bắt đầu đồng bộ OHLC SSI cho ngày %s.", session_date)
                 try:
                     self._sync_history(auth, symbols)
@@ -346,35 +360,64 @@ class SsiCollector:
             "source_delay_seconds":delay,"validation_status":"valid" if source_ts_vn else "missing_source_timestamp"}
 
     def _write_loop(self):
-        while not self._stop.is_set() or self._pending_by_symbol or not self._pending_trades.empty():
+        while not self._stop.is_set() or not self._pending_quotes.empty() or not self._pending_trades.empty():
             self._pending_signal.wait(timeout=.25)
-            with self._pending_lock:
-                symbols=list(self._pending_by_symbol)[:250]
-                batch=[self._pending_by_symbol.pop(symbol) for symbol in symbols]
-                depth=len(self._pending_by_symbol)
+            batch=[]
+            for _ in range(1000):
+                try: batch.append(self._pending_quotes.get_nowait())
+                except queue.Empty: break
+            depth=self._pending_quotes.qsize()
             trade_batch=[]
             for _ in range(500):
                 try:trade_batch.append(self._pending_trades.get_nowait())
                 except queue.Empty:break
-            if not depth and self._pending_trades.empty():self._pending_signal.clear()
+            self._pending_signal.clear()
+            if not self._pending_quotes.empty() or not self._pending_trades.empty():
+                self._pending_signal.set()
             self.runtime.update(queue_depth=depth)
             self.runtime.update(trade_queue_depth=self._pending_trades.qsize())
             if batch:
+                self._persist_with_retry("daily quote archive", lambda: daily_archive.persist_quote_batch(batch))
                 try:
-                    counts=database.insert_observation_batch(batch,"ssi")
-                    self.runtime.increment("duplicate_messages",counts["duplicate"])
-                    self.runtime.increment("rows_valid",counts["valid"]);self.runtime.increment("rows_invalid",counts["invalid"])
-                    if counts.get("last_persisted_at"):
-                        self.runtime.update(last_persisted_at=counts["last_persisted_at"])
-                except Exception as exc:self.runtime.update(last_error=f"SQLite quote batch: {str(exc)[:180]}")
+                    counts=self._persist_with_retry("SQLite quote batch", lambda: database.insert_observation_batch(batch,"ssi"))
+                    if counts is not None:
+                        self.runtime.increment("duplicate_messages",counts["duplicate"])
+                        self.runtime.increment("rows_valid",counts["valid"]);self.runtime.increment("rows_invalid",counts["invalid"])
+                        if counts.get("last_persisted_at"):
+                            self.runtime.update(last_persisted_at=counts["last_persisted_at"])
+                except Exception as exc:
+                    self.runtime.update(last_error=f"SQLite quote batch: {str(exc)[:180]}")
             if trade_batch:
+                self._persist_with_retry("daily trade archive", lambda: daily_archive.persist_trade_batch(trade_batch))
                 try:
-                    counts=database.insert_trade_batch(trade_batch,"ssi")
-                    self.runtime.increment("trade_messages_saved",counts["inserted"])
-                    self.runtime.increment("trade_messages_dropped",counts["invalid"])
-                    if counts.get("last_persisted_at"):
-                        self.runtime.update(last_trade_persisted_at=counts["last_persisted_at"])
-                except Exception as exc:self.runtime.update(last_error=f"SQLite trade batch: {str(exc)[:180]}")
+                    counts=self._persist_with_retry("SQLite trade batch", lambda: database.insert_trade_batch(trade_batch,"ssi"))
+                    if counts is not None:
+                        self.runtime.increment("trade_messages_saved",counts["inserted"])
+                        self.runtime.increment("trade_messages_dropped",counts["invalid"])
+                        if counts.get("last_persisted_at"):
+                            self.runtime.update(last_trade_persisted_at=counts["last_persisted_at"])
+                except Exception as exc:
+                    self.runtime.update(last_error=f"SQLite trade batch: {str(exc)[:180]}")
+
+    def _persist_with_retry(self, label, write):
+        delay=.25
+        while True:
+            try:
+                return write()
+            except sqlite3.OperationalError as exc:
+                message=str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    self.runtime.update(last_error=f"{label}: {str(exc)[:180]}")
+                    _LOG.exception("Lỗi ghi %s; batch hiện tại không thể lưu.", label)
+                    return None
+                self.runtime.update(last_error=f"{label}: SQLite đang khóa; đang giữ batch và thử lại")
+                _LOG.warning("SQLite khóa khi ghi %s; giữ batch, thử lại sau %.2f giây.", label, delay)
+                time.sleep(delay)
+                delay=min(delay*2,5.0)
+            except Exception as exc:
+                self.runtime.update(last_error=f"{label}: {str(exc)[:180]}")
+                _LOG.exception("Lỗi ghi %s; batch hiện tại không thể lưu.", label)
+                return None
 
     def _run(self):
         auth=None;stream=None;run_id=database.start_collector_run(self.worker_id,os.getpid());run_status="failed"
@@ -401,13 +444,7 @@ class SsiCollector:
                     # SSI also publishes index aggregates on trade topics. Keep only listed stocks.
                     if trade["symbol"] not in self._board_by_symbol:
                         self.runtime.increment("trade_messages_filtered");return
-                    try:self._pending_trades.put_nowait(trade)
-                    except queue.Full:
-                        try:self._pending_trades.get_nowait()
-                        except queue.Empty:pass
-                        self.runtime.increment("trade_messages_dropped")
-                        try:self._pending_trades.put_nowait(trade)
-                        except queue.Full:return
+                    self._pending_trades.put_nowait(trade)
                     self.runtime.update(last_trade_received_at=trade["received_at_utc"],trade_queue_depth=self._pending_trades.qsize())
                     self._pending_signal.set();return
                 # SSI shares many event types on one callback; only order-book quotes and public trades are stored.
@@ -418,14 +455,17 @@ class SsiCollector:
                 observation_list=map_message({"channel":"quote","data":item})
                 if not observation_list:self.runtime.increment("rows_invalid");return
                 for observation in observation_list:
-                    observation["market"]=self._board_by_symbol.get(observation["symbol"],"HOSE")
+                    board=self._board_by_symbol.get(observation["symbol"])
+                    if board is None:
+                        # SSI board feeds can include covered warrants and other
+                        # instruments; this dashboard's universe is common stocks.
+                        self.runtime.increment("quote_messages_filtered")
+                        continue
+                    observation["market"]=board
                     symbol=observation["symbol"]
-                    with self._pending_lock:
-                        replaced=symbol in self._pending_by_symbol
-                        self._pending_by_symbol[symbol]=observation
-                        depth=len(self._pending_by_symbol)
+                    self._pending_quotes.put_nowait(observation)
+                    depth=self._pending_quotes.qsize()
                     self.runtime.update(last_message_at=observation["received_at_utc"],queue_depth=depth)
-                    if replaced:self.runtime.increment("queue_coalesced")
                     self._pending_signal.set()
             client.on_connection=on_connection;client.on_data=on_data;client.connect()
             ack_lock=threading.Lock(); ack_messages=[]
@@ -468,7 +508,8 @@ class SsiCollector:
                 try:stream.streaming.disconnect()
                 except Exception:pass
             if self._history_thread and self._history_thread.is_alive():self._history_thread.join(timeout=10)
-            if self._writer and self._writer.is_alive():self._writer.join(timeout=10)
+            if self._writer and self._writer.is_alive():self._writer.join()
+            daily_archive.close_all()
             if auth:
                 try:auth.close()
                 except Exception:pass

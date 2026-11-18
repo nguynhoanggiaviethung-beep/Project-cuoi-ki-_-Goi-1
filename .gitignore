@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 database/*.sqlite3
 database/*.sqlite3.*
+database/20??-??-??.sqlite*
 database/*.db
 database/local-profile-backup-*.json
 __pycache__/

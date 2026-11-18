@@ -225,10 +225,34 @@ function table(headers, rows, emptyText = "Chưa có dữ liệu.") {
 function statusCell(label, value) {
   return '<div class="status-cell"><small>' + escapeHtml(label) + '</small><strong>' + escapeHtml(value ?? "—") + '</strong></div>';
 }
+let collectorEnsureInFlight = false;
+let collectorEnsureAttemptAt = 0;
+function ensureCollectorOnPageLoad(data) {
+  if (!["live", "ssi"].includes(data.source)) return;
+  if (localStorage.getItem("sli-collector-manually-stopped") === "1") return;
+  const heartbeatFresh = data.worker_status === "running" &&
+    Number(data.worker_heartbeat_age_seconds ?? Infinity) <= 15;
+  if (heartbeatFresh || collectorEnsureInFlight || Date.now() - collectorEnsureAttemptAt < 15000) return;
+  collectorEnsureInFlight = true;
+  collectorEnsureAttemptAt = Date.now();
+  api("/api/collector/start", { method: "POST" })
+    .then((result) => {
+      if (result?.ok) {
+        window.setTimeout(refreshStatus, 1200);
+      } else {
+        connectionStatusTimer = window.setTimeout(refreshStatus, 10000);
+      }
+    })
+    .catch(() => {
+      connectionStatusTimer = window.setTimeout(refreshStatus, 10000);
+    })
+    .finally(() => { collectorEnsureInFlight = false; });
+}
 async function refreshStatus() {
   try {
     const data = await api("/api/status");
     state.status = data;
+    ensureCollectorOnPageLoad(data);
     clearTimeout(connectionStatusTimer);
     window.MarketClock.update(data.meta||data);
     state.source = data.source;
@@ -537,6 +561,7 @@ $("#connect-now").addEventListener("click", async () => {
   button.disabled = true;
   button.textContent = "Đang khởi chạy…";
   message.textContent = "Đang yêu cầu kết nối SSI FastConnect…";
+  localStorage.removeItem("sli-collector-manually-stopped");
   try {
     const result = await api("/api/collector/start", { method: "POST" });
     if (!result.ok) {
@@ -564,6 +589,7 @@ $("#disconnect-data").addEventListener("click", async () => {
   $("#connection-dialog-status").textContent = "Đang gửi yêu cầu ngắt kết nối…";
   try {
     await api("/api/collector/stop", { method: "POST" });
+    localStorage.setItem("sli-collector-manually-stopped", "1");
     $("#connection-dialog-status").textContent = "Đã gửi yêu cầu ngắt kết nối SSI.";
     window.setTimeout(refreshStatus, 1000);
   } catch (_) {

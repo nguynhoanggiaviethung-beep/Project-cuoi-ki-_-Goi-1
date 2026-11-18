@@ -157,14 +157,19 @@ async def market_stream(request: Request):
     async def events():
         prior_state=None
         while not await request.is_disconnected():
-            meta=_market_meta()
+            # Market metadata and overview queries hit SQLite synchronously.
+            # Running them on the event loop starves page reloads and status
+            # requests whenever the live stream is busy.
+            meta=await asyncio.to_thread(_market_meta)
             exchange_key=tuple((name,item["state"],item.get("phase")) for name,item in sorted(meta.get("exchange_states",{}).items()))
             state_key=(meta["state"],meta.get("phase"),meta.get("session_date"),exchange_key)
             if state_key!=prior_state:
                 yield "event: market_state\ndata: "+json.dumps(meta,ensure_ascii=False)+"\n\n"
                 prior_state=state_key
             if meta["state"]=="IN_SESSION":
-                payload=overview(symbol="__all__",limit=240,window_minutes=60,phase=None)
+                payload=await asyncio.to_thread(
+                    overview, symbol="__all__", limit=240, window_minutes=60, phase=None
+                )
                 yield "event: data_diff\ndata: "+json.dumps({"meta":meta,"data":payload},ensure_ascii=False,default=str)+"\n\n"
                 until_change=max(0.25,(datetime.fromisoformat(meta["next_change_at"])-get_clock_now()).total_seconds()/meta.get("clock_speed",1)) if meta.get("next_change_at") else 60
                 await asyncio.sleep(min(meta["refresh_seconds"] or 5,until_change))
@@ -178,6 +183,22 @@ async def market_stream(request: Request):
 @app.on_event("startup")
 def startup():
     database.initialize()
+    # Keep SSI collection independent of browser tabs and start it again when
+    # the web backend is restarted, provided local SSI credentials are set.
+    if os.getenv("SSI_API_KEY", "").strip() and os.getenv("SSI_API_SECRET", "").strip():
+        def ensure_collector():
+            try:
+                current = database.latest_collector_run()
+                # Respect an explicit stop request across a web restart. A failed,
+                # abandoned, or stale worker is recovered automatically.
+                if current and current.get("status") == "stopped" and current.get("ended_at"):
+                    return
+                start_collector()
+            except Exception as exc:
+                database.log_ingestion_error(
+                    f"collector_autostart_{type(exc).__name__}: {str(exc)[:180]}", source="ssi"
+                )
+        threading.Thread(target=ensure_collector, name="sli-collector-autostart", daemon=True).start()
 
 
 @app.on_event("shutdown")
