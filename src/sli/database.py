@@ -1,6 +1,7 @@
 import json
 import math
 import sqlite3
+import time
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 
@@ -219,6 +220,8 @@ def previous_bar_session(source, session_date):
 
 def fetch_bars_window_by_symbol(source, start_at, end_before, max_minutes=390):
     """Fetch completed minute bars for the same wall-clock window across symbols."""
+    if max_minutes is None:
+        return _fetch_bars_range_cached(source, start_at, end_before, int(time.monotonic() // 5))
     max_minutes=max(1,min(int(max_minutes),390))
     sql="""WITH window_rows AS (
         SELECT * FROM bars_1m WHERE source=? AND minute_vn>=? AND minute_vn<?
@@ -227,6 +230,18 @@ def fetch_bars_window_by_symbol(source, start_at, end_before, max_minutes=390):
         FROM window_rows
     ) SELECT * FROM ranked WHERE rn<=? ORDER BY symbol,minute_vn"""
     with connect() as db:rows=db.execute(sql,(source,start_at,end_before,max_minutes)).fetchall()
+    grouped={}
+    for row in rows:grouped.setdefault(row["symbol"],[]).append(dict(row))
+    return grouped
+
+
+@lru_cache(maxsize=8)
+def _fetch_bars_range_cached(source, start_at, end_before, _five_second_bucket):
+    """Cache full historical bar ranges briefly; active session bars refresh every five seconds."""
+    sql="""SELECT * FROM bars_1m WHERE source=? AND minute_vn>=? AND minute_vn<?
+      ORDER BY symbol,minute_vn"""
+    args=(source,start_at,end_before)
+    with connect() as db:rows=db.execute(sql,args).fetchall()
     grouped={}
     for row in rows:grouped.setdefault(row["symbol"],[]).append(dict(row))
     return grouped
@@ -344,13 +359,17 @@ def _cached_baseline_qualified_symbols(source,before_session):
 
 
 def fetch_security_metadata(source="ssi"):
+    return _fetch_security_metadata_cached(source, int(time.monotonic() // 300))
+
+
+@lru_cache(maxsize=8)
+def _fetch_security_metadata_cached(source, _five_minute_bucket):
     with connect() as db:
-        rows=db.execute("""WITH latest AS (
-          SELECT symbol,close_price,ROW_NUMBER() OVER(PARTITION BY symbol ORDER BY trading_date DESC) rn
-          FROM historical_prices WHERE source=? AND timeframe='1d'
-        ) SELECT c.symbol,c.board,c.name_vi,c.stock_type,l.close_price AS latest_close
-          FROM securities_catalog c LEFT JOIN latest l ON l.symbol=c.symbol AND l.rn=1
-          WHERE c.source=?""",(source,source)).fetchall()
+        rows=db.execute("""SELECT c.symbol,c.board,c.name_vi,c.stock_type,
+          (SELECT h.close_price FROM historical_prices h
+           WHERE h.source=c.source AND h.symbol=c.symbol AND h.timeframe='1d'
+           ORDER BY h.trading_date DESC LIMIT 1) AS latest_close
+          FROM securities_catalog c WHERE c.source=?""",(source,)).fetchall()
     return {row["symbol"]:dict(row) for row in rows}
 
 
@@ -796,7 +815,7 @@ def insert_observation(observation, source="live"):
         return {"inserted": observation_id is not None, "duplicate": observation_id is None, "id": observation_id}
 
 
-def _refresh_bar(db, observation, source, metrics, observation_id):
+def _refresh_bar(db, observation, source, metrics, observation_id, evaluate_alerts=True):
     received = observation.get("received_at_vn") or observation.get("received_at_utc")
     try:
         stamp = datetime.fromisoformat(received.replace("Z", "+00:00"))
@@ -853,7 +872,8 @@ def _refresh_bar(db, observation, source, metrics, observation_id):
           "ok" if len(eligible) >= config.MIN_BAR_SNAPSHOTS else "sparse"))
     bar = db.execute("SELECT * FROM bars_1m WHERE source=? AND symbol=? AND minute_vn=?",
                      (source, observation["symbol"], minute)).fetchone()
-    _evaluate_bar_alerts(db, bar, observation_id)
+    if evaluate_alerts:
+        _evaluate_bar_alerts(db, bar, observation_id)
 
 
 def _baseline_bars(db, bar):
@@ -1048,6 +1068,11 @@ def fetch_detail_default_symbol(source="ssi"):
 
 
 def count_historical_symbols(source='ssi'):
+    return _count_historical_symbols_cached(source, int(datetime.now(config.TIMEZONE).timestamp() // 300))
+
+
+@lru_cache(maxsize=16)
+def _count_historical_symbols_cached(source, _five_minute_bucket):
     with connect() as db:
         return db.execute("SELECT COUNT(DISTINCT symbol) FROM historical_prices WHERE source=? AND timeframe='1d'",(source,)).fetchone()[0]
 
@@ -1275,7 +1300,7 @@ def fetch_latest_historical_page(search=None, page=1, page_size=50, source="ssi"
     return {"total":total,"page":page,"page_size":page_size,"rows":[dict(row) for row in rows]}
 
 
-def insert_observation_batch(observations, source="ssi"):
+def insert_observation_batch(observations, source="ssi", evaluate_alerts=True):
     counts={"inserted":0,"duplicate":0,"valid":0,"invalid":0,"last_persisted_at":None}
     if not observations:return counts
     refresh_groups={}
@@ -1292,7 +1317,8 @@ def insert_observation_batch(observations, source="ssi"):
                 if minute: refresh_groups[(observation["symbol"],minute)]=(observation,observation_id)
                 counts["last_persisted_at"]=observation.get("received_at_utc") or counts["last_persisted_at"]
         for observation,observation_id in refresh_groups.values():
-            _refresh_bar(db,observation,source,calculate_metrics(observation),observation_id)
+            _refresh_bar(db,observation,source,calculate_metrics(observation),observation_id,
+                         evaluate_alerts=evaluate_alerts)
     return counts
 
 

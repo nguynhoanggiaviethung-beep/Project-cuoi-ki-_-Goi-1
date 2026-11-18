@@ -848,19 +848,27 @@ def bars(symbol: str | None = None, limit: int = Query(default=1000, ge=1, le=10
 
 @app.get("/api/intraday-profile")
 def intraday_profile(symbol: str | None = None, window_minutes: int = Query(default=60,ge=5,le=390),start_at: str | None = None,
-                     end_at: str | None = None, source: str | None = None):
+                     end_at: str | None = None, from_date: str | None = None,
+                     to_date: str | None = None, source: str | None = None):
     selected_source = source or _source()
     window_start,window_end=_market_window(window_minutes,selected_source)
-    start_at=start_at or window_start
-    end_exclusive=end_at or window_end
+    historical_range=bool(from_date or to_date)
+    start_at=start_at or (f"{from_date}T00:00:00+07:00" if from_date else window_start)
+    end_exclusive=end_at or (f"{(datetime.fromisoformat(to_date)+timedelta(days=1)).date().isoformat()}T00:00:00+07:00" if to_date else window_end)
+    if historical_range and to_date:
+        meta=_market_meta(selected_source)
+        if (str(to_date)[:10]==str(meta.get("session_date") or "")[:10]
+                and meta.get("state") in {"IN_SESSION","LUNCH_BREAK"} and meta.get("effective_now")):
+            completed_cutoff=datetime.fromisoformat(meta["effective_now"]).replace(second=0,microsecond=0).isoformat(timespec="minutes")
+            end_exclusive=min(end_exclusive,completed_cutoff)
     if selected_source in {"live","ssi"}:
-        grouped_bars=database.fetch_bars_window_by_symbol(selected_source,start_at,end_exclusive,window_minutes)
+        grouped_bars=database.fetch_bars_window_by_symbol(selected_source,start_at,end_exclusive,None if historical_range else window_minutes)
         bars_data=[row for ticker,rows in grouped_bars.items() if not symbol or ticker==symbol.upper() for row in rows]
     else:
         bars_data=database.fetch_bars(selected_source,symbol,10000,start_at,end_exclusive)
     grouped = {}
     for row in bars_data:
-        minute = datetime.fromisoformat(row["minute_vn"]).strftime("%H:%M")
+        minute = str(row["minute_vn"])[:16] if historical_range else datetime.fromisoformat(row["minute_vn"]).strftime("%H:%M")
         slot = grouped.setdefault(minute, {"spread": [], "ticks": [], "depth": [], "imbalance":[],"snapshots": 0, "symbols": set()})
         for key, target in (("spread_bps", "spread"), ("spread_ticks", "ticks"), ("total_depth_value", "depth"),("queue_imbalance","imbalance")):
             if row.get(key) is not None:
@@ -869,7 +877,7 @@ def intraday_profile(symbol: str | None = None, window_minutes: int = Query(defa
         slot["symbols"].add(row["symbol"])
     session_date = max((str(row.get("minute_vn") or "")[:10] for row in bars_data), default=None) or None
     latest_bar = max((str(row.get("minute_vn") or "") for row in bars_data), default=None) or None
-    profile = [{"minute": f"{session_date}T{minute}:00+07:00" if session_date else minute, "median_spread_bps": median(v["spread"]) if v["spread"] else None,
+    profile = [{"minute": (minute+":00+07:00" if historical_range else (f"{session_date}T{minute}:00+07:00" if session_date else minute)), "median_spread_bps": median(v["spread"]) if v["spread"] else None,
                 "median_spread_ticks": median(v["ticks"]) if v["ticks"] else None,
                 "median_total_depth_value": median(v["depth"]) if v["depth"] else None,
                 "median_queue_imbalance":median(v["imbalance"]) if v["imbalance"] else None,
@@ -879,14 +887,17 @@ def intraday_profile(symbol: str | None = None, window_minutes: int = Query(defa
             "profile": profile, "basis": "completed_bars_1m", "window_minutes":window_minutes,
             "window_start":start_at,"completed_through_exclusive":end_exclusive,
             "session_date":session_date,"as_of":latest_bar,"data_as_of":latest_bar,
+            "sessions_count":len({str(row.get("minute_vn") or "")[:10] for row in bars_data}),
             "note": "Chỉ dùng bar một phút đã hoàn tất; mỗi phút lấy trung vị bar của từng mã, sau đó lấy trung vị giữa các mã. Số mã tham gia được ghi tại từng điểm."}
 
 
 @app.get("/api/market-depth")
-def market_depth(window_minutes: int = Query(default=60, ge=5, le=390)):
+def market_depth(window_minutes: int = Query(default=60, ge=5, le=390),
+                 from_date: str | None = None, to_date: str | None = None):
     """Single-service, latest-session depth payload for the overview widget."""
     meta = _market_meta("ssi")
-    payload = build_market_depth(window_minutes=window_minutes, source="ssi", market_meta=meta)
+    payload = build_market_depth(window_minutes=window_minutes, source="ssi", market_meta=meta,
+                                 start_date=from_date, end_date=to_date)
     payload["meta"] = meta
     return payload
 
@@ -894,12 +905,22 @@ def market_depth(window_minutes: int = Query(default=60, ge=5, le=390)):
 @app.get("/api/liquidity-map")
 def liquidity_map(window_minutes:int=Query(default=120,ge=15,le=390),
                   start_at: str | None = None, end_at: str | None = None,
+                  from_date: str | None = None, to_date: str | None = None,
                   source: str | None = None):
     selected_source = source or _source()
     points=[]
     if selected_source in {"live","ssi"}:
         window_start,window_end=_market_window(window_minutes,selected_source)
-        grouped=database.fetch_bars_window_by_symbol(selected_source,start_at or window_start,end_at or window_end,window_minutes)
+        historical_range=bool(from_date or to_date)
+        start_at=start_at or (f"{from_date}T00:00:00+07:00" if from_date else window_start)
+        end_at=end_at or (f"{(datetime.fromisoformat(to_date)+timedelta(days=1)).date().isoformat()}T00:00:00+07:00" if to_date else window_end)
+        if historical_range and to_date:
+            meta=_market_meta(selected_source)
+            if (str(to_date)[:10]==str(meta.get("session_date") or "")[:10]
+                    and meta.get("state") in {"IN_SESSION","LUNCH_BREAK"} and meta.get("effective_now")):
+                completed_cutoff=datetime.fromisoformat(meta["effective_now"]).replace(second=0,microsecond=0).isoformat(timespec="minutes")
+                end_at=min(end_at,completed_cutoff)
+        grouped=database.fetch_bars_window_by_symbol(selected_source,start_at,end_at,None if historical_range else window_minutes)
         minimum=config.RANKING_MIN_BARS
         for ticker,rows in grouped.items():
             spreads=_numeric([r["spread_bps"] for r in rows]); depths=_numeric([r["total_depth_value"] for r in rows])

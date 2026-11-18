@@ -1,13 +1,16 @@
 """Shared, persisted-bar service for the overview's two-sided market depth."""
 from datetime import datetime, timedelta
 from statistics import median
+import time
 
 from . import config, database
 from .market_rules import CONTINUOUS_WINDOWS
 from .ranking import is_rankable_stock
 
+_closed_session_cache = {}
 
-def build_market_depth(window_minutes=60, source="ssi", market_meta=None):
+
+def _build_market_depth_session(window_minutes=60, source="ssi", market_meta=None):
     """Return a balanced eligible-stock panel from completed 1m bars only.
 
     This service aggregates already-computed bid/ask top-three notional values;
@@ -44,12 +47,13 @@ def build_market_depth(window_minutes=60, source="ssi", market_meta=None):
         if row.get("baseline_bucket") not in {"OPEN", "MID", "CLOSE"}:
             continue
         by_symbol.setdefault(row["symbol"], []).append(row)
-    all_minutes = sorted({row["minute_vn"] for group in by_symbol.values() for row in group})
+    all_minutes = sorted({datetime.fromisoformat(row["minute_vn"]).replace(tzinfo=None, second=0, microsecond=0).isoformat(timespec="minutes")
+                          for group in by_symbol.values() for row in group})
     if not all_minutes:
         return {"source": source, "session_date": session_date, "rows": [], "n0": len(by_symbol), "n1": 0,
                 "n2": 0, "n3": 0, "empty": True, "message": "Chưa có bar phút liên tục hợp lệ trong phiên gần nhất."}
     latest_minute = datetime.fromisoformat(all_minutes[-1])
-    effective_stamp = datetime.fromisoformat(str(effective)) if effective else None
+    effective_stamp = datetime.fromisoformat(str(effective)).replace(tzinfo=None) if effective else None
     if state in {"IN_SESSION", "LUNCH_BREAK"} and effective_stamp:
         end = effective_stamp.replace(second=0, microsecond=0)
         fresh = (end - latest_minute).total_seconds() <= 60 and end.date() == latest_minute.date()
@@ -62,7 +66,8 @@ def build_market_depth(window_minutes=60, source="ssi", market_meta=None):
     if not selected_minutes:
         return {"source": source, "session_date": session_date, "rows": [], "n0": len(by_symbol), "n1": 0,
                 "n2": 0, "n3": 0, "empty": True, "message": "Chưa có bar phút hoàn tất trong cửa sổ thời gian đã chọn."}
-    selected = {symbol: [row for row in group if row["minute_vn"] in selected_minutes]
+    selected = {symbol: [row for row in group
+                         if datetime.fromisoformat(row["minute_vn"]).replace(tzinfo=None, second=0, microsecond=0).isoformat(timespec="minutes") in selected_minutes]
                 for symbol, group in by_symbol.items()}
     selected = {symbol: group for symbol, group in selected.items() if group}
     metadata = database.fetch_security_metadata("ssi")
@@ -107,9 +112,13 @@ def build_market_depth(window_minutes=60, source="ssi", market_meta=None):
     minute_rows = []
     expected_chart_minutes = sorted({minute for values in expected_by_market.values() for minute in values
                                      if start <= datetime.fromisoformat(minute) < end})
+    panel_by_minute = {
+        symbol: {datetime.fromisoformat(row["minute_vn"]).replace(tzinfo=None, second=0, microsecond=0).isoformat(timespec="minutes"): row
+                 for row in group}
+        for symbol, group in panel.items()
+    }
     for minute in expected_chart_minutes:
-        available = [group_by_minute[minute] for group in panel
-                     if (group_by_minute := {datetime.fromisoformat(row["minute_vn"]).replace(second=0, microsecond=0).isoformat(timespec="minutes"): row for row in panel[group]}).get(minute)]
+        available = [minute_map[minute] for minute_map in panel_by_minute.values() if minute in minute_map]
         if not available:
             minute_rows.append({"minute": minute, "bid_depth_value": None,
                                 "ask_depth_value": None, "symbols_count": 0, "n_snapshots": 0})
@@ -125,3 +134,58 @@ def build_market_depth(window_minutes=60, source="ssi", market_meta=None):
             "window_minutes": window_minutes, "as_of": minute_rows[-1]["minute"] if minute_rows else None,
             "empty": not bool(minute_rows),
             "message": None if minute_rows else "Chưa đủ bar hợp lệ để lập nhóm cổ phiếu cân bằng."}
+
+
+def build_market_depth(window_minutes=60, source="ssi", market_meta=None,
+                       start_date=None, end_date=None):
+    """Return either the latest intraday window or all stored sessions in a date range."""
+    meta = market_meta or {}
+    if not start_date and not end_date:
+        return _build_market_depth_session(window_minutes, source, meta)
+    with database.connect() as db:
+        clauses = ["source=?"]
+        args = [source]
+        if start_date:
+            clauses.append("session_date>=?")
+            args.append(str(start_date)[:10])
+        if end_date:
+            clauses.append("session_date<=?")
+            args.append(str(end_date)[:10])
+        dates = [str(row[0]) for row in db.execute(
+            f"SELECT DISTINCT session_date FROM bars_1m WHERE {' AND '.join(clauses)} ORDER BY session_date",
+            args).fetchall()]
+    if not dates:
+        return {"source": source, "session_date": None, "session_dates": [], "rows": [],
+                "panel_symbols": 0, "n3": 0, "as_of": None, "empty": True,
+                "message": "Không có dữ liệu độ sâu trong khoảng phiên đã chọn."}
+    sessions = []
+    now_monotonic = time.monotonic()
+    live_session = str(meta.get("session_date") or "")[:10] if meta.get("state") in {"IN_SESSION", "LUNCH_BREAK"} else None
+    for date in dates:
+        cached = _closed_session_cache.get((source, date))
+        if date != live_session and cached and now_monotonic - cached[0] < 300:
+            sessions.append(cached[1])
+            continue
+        session_meta = dict(meta)
+        session_meta["session_date"] = date
+        if date != str(meta.get("session_date") or "")[:10]:
+            session_meta["state"] = "CLOSED"
+            session_meta["effective_now"] = None
+        item = _build_market_depth_session(390, source, session_meta)
+        if item.get("rows"):
+            sessions.append(item)
+            if date != live_session:
+                _closed_session_cache[(source, date)] = (now_monotonic, item)
+    if len(_closed_session_cache) > 256:
+        for key, _ in sorted(_closed_session_cache.items(), key=lambda item: item[1][0])[:64]:
+            _closed_session_cache.pop(key, None)
+    if not sessions:
+        return {"source": source, "session_date": dates[-1], "session_dates": dates,
+                "rows": [], "panel_symbols": 0, "n3": 0, "as_of": None,
+                "empty": True, "message": "Chưa có bar phút hợp lệ trong các phiên đã chọn."}
+    rows = [row for item in sessions for row in item["rows"]]
+    latest = sessions[-1]
+    return {**latest, "source": source, "rows": rows, "session_dates": dates,
+            "session_count": len(sessions), "session_date": latest["session_date"],
+            "as_of": latest.get("as_of"), "window_minutes": None,
+            "empty": False}
