@@ -87,6 +87,7 @@ class SsiCollector:
                 quote_messages_filtered=0,
                 trade_messages_received=0,trade_messages_saved=0,trade_messages_dropped=0,trade_messages_filtered=0,
                 last_trade_received_at=None,last_trade_persisted_at=None,trade_queue_depth=0,
+                quote_persistence_status="pending",trade_persistence_status="pending",
                 historical_prices_rows=0,historical_symbols_total=0,historical_symbols_processed=0,
                 watchlist=config.WATCHLIST,universe_status="loading",subscription_status="pending",
                 subscription_ack_count=0,subscription_topics=[],subscribed_boards=[],subscription_error=None,
@@ -169,6 +170,13 @@ class SsiCollector:
         end=today.strftime("%Y/%m/%d 23:59:59")
         today_key=today.isoformat()
         today_data_key=today.strftime("%Y/%m/%d")
+        next_session=today+timedelta(days=1)
+        while next_session.weekday()>=5 or next_session.isoformat() in config.MARKET_HOLIDAYS:
+            next_session+=timedelta(days=1)
+
+        def live_session_nearby():
+            now=datetime.now(config.TIMEZONE)
+            return now.date()>next_session or (now.date()==next_session and now.time()>=datetime_time(8,45))
 
         def sync_symbols(target_symbols, skip_fetched_today=False):
             already_fetched=(database.historical_symbols_fetched_on(today_key,source="ssi")
@@ -183,7 +191,7 @@ class SsiCollector:
             last_request_at=None
             processed=0
             for index,symbol in enumerate(target_symbols,1):
-                if self._stop.is_set():break
+                if self._stop.is_set() or live_session_nearby():break
                 full_backfill=symbol not in full_history_done
                 if full_backfill or symbol not in already_fetched:
                     # First pass starts at market inception. Later passes resume
@@ -196,7 +204,7 @@ class SsiCollector:
                     collected=[];pages_fetched=0;page_limit_reached=False
                     try:
                         for page in range(1,max_pages+1):
-                            if self._stop.is_set():break
+                            if self._stop.is_set() or live_session_nearby():break
                             if last_request_at is not None:
                                 remaining=config.HISTORY_REST_MIN_INTERVAL_SECONDS-(time.monotonic()-last_request_at)
                                 if remaining>0 and self._stop.wait(remaining):break
@@ -212,29 +220,32 @@ class SsiCollector:
                                 page_limit_reached=True
                         if self._stop.is_set():
                             break
-                        database.upsert_historical_prices(symbol,collected,source="ssi")
+                        if live_session_nearby():
+                            self.runtime.update(historical_sync_phase="deferred_until_after_close")
+                            return
+                        self._persist_with_retry("SSI OHLC batch", lambda: database.upsert_historical_prices(symbol,collected,source="ssi"))
                         if full_backfill:
                             status="page_limit_reached" if page_limit_reached else "complete"
-                            database.set_historical_backfill_state(symbol,full_history_start,today_data_key,status,
-                                pages_fetched,len(collected),source="ssi")
+                            self._persist_with_retry("SSI OHLC backfill state", lambda: database.set_historical_backfill_state(symbol,full_history_start,today_data_key,status,
+                                pages_fetched,len(collected),source="ssi"))
                             if page_limit_reached:
-                                database.log_ingestion_error(
+                                self._persist_with_retry("SSI OHLC page-limit log", lambda: database.log_ingestion_error(
                                     f"ssi_history_page_limit_reached: SSI trả đủ {max_pages} trang; chưa thể xác nhận đã hết lịch sử.",
-                                    symbol=symbol,source="ssi")
+                                    symbol=symbol,source="ssi"))
                             full_history_done.add(symbol) if not page_limit_reached else None
                         elif not page_limit_reached:
-                            database.set_historical_backfill_state(symbol,full_history_start,today_data_key,"complete",
-                                pages_fetched,len(collected),source="ssi")
+                            self._persist_with_retry("SSI OHLC backfill state", lambda: database.set_historical_backfill_state(symbol,full_history_start,today_data_key,"complete",
+                                pages_fetched,len(collected),source="ssi"))
                         else:
-                            database.log_ingestion_error(
+                            self._persist_with_retry("SSI OHLC page-limit log", lambda: database.log_ingestion_error(
                                 f"ssi_history_incremental_page_limit_reached: SSI trả đủ {max_pages} trang trong lần cập nhật tăng dần.",
-                                symbol=symbol,source="ssi")
+                                symbol=symbol,source="ssi"))
                     except Exception as exc:
                         if full_backfill:
-                            database.set_historical_backfill_state(symbol,full_history_start,today_data_key,"error",
-                                pages_fetched,len(collected),source="ssi")
+                            self._persist_with_retry("SSI OHLC backfill error state", lambda: database.set_historical_backfill_state(symbol,full_history_start,today_data_key,"error",
+                                pages_fetched,len(collected),source="ssi"))
                         if not self._stop.is_set():
-                            database.log_ingestion_error(f"ssi_history_{type(exc).__name__}: {str(exc)[:180]}",symbol=symbol,source="ssi")
+                            self._persist_with_retry("SSI OHLC error log", lambda: database.log_ingestion_error(f"ssi_history_{type(exc).__name__}: {str(exc)[:180]}",symbol=symbol,source="ssi"))
                 processed=index
                 if index%10==0 or index==len(target_symbols):
                     self.runtime.update(historical_symbols_processed=index,historical_prices_rows=database.count_historical_prices("ssi"),
@@ -243,6 +254,12 @@ class SsiCollector:
                 historical_prices_updated_at=datetime.now(config.TIMEZONE).isoformat(timespec="seconds"))
 
         sync_symbols(symbols,skip_fetched_today=True)
+
+        # Historical REST work must always yield before the next live session.
+        # Keep quotes/trades on the shared SQLite writer's priority path.
+        if live_session_nearby():
+            self.runtime.update(historical_sync_phase="deferred_until_after_close")
+            return
 
         # The first history pass can finish before the exchange publishes the
         # final daily bar (for example, when the worker starts during lunch).
@@ -261,9 +278,7 @@ class SsiCollector:
         database.record_session_close(today_key,source="ssi")
         retry_slots=[datetime.combine(today,datetime_time(hour,minute),tzinfo=config.TIMEZONE)
                      for hour,minute in ((15,0),(15,30),(16,0),(17,0),(18,0))]
-        next_morning=today+timedelta(days=1)
-        while next_morning.weekday()>=5 or next_morning.isoformat() in config.MARKET_HOLIDAYS:
-            next_morning+=timedelta(days=1)
+        next_morning=next_session
         retry_slots.append(datetime.combine(next_morning,datetime_time(9,0),tzinfo=config.TIMEZONE))
         now=datetime.now(config.TIMEZONE)
         first_attempt=True
@@ -315,7 +330,7 @@ class SsiCollector:
                 except Exception as exc:
                     message = f"SSI OHLC daily sync {type(exc).__name__}: {str(exc)[:180]}"
                     _LOG.exception("Đồng bộ OHLC SSI ngày %s thất bại; sẽ thử lại sau 5 phút.", session_date)
-                    database.log_ingestion_error(message, source="ssi")
+                    self._persist_with_retry("SSI OHLC scheduler error log", lambda: database.log_ingestion_error(message, source="ssi"))
                     self.runtime.update(historical_sync_phase="retry_pending", last_error=message)
                     if self._stop.wait(300):
                         break
@@ -377,6 +392,7 @@ class SsiCollector:
             self.runtime.update(queue_depth=depth)
             self.runtime.update(trade_queue_depth=self._pending_trades.qsize())
             if batch:
+                self.runtime.update(quote_persistence_status="writing")
                 self._persist_with_retry("daily quote archive", lambda: daily_archive.persist_quote_batch(batch))
                 try:
                     counts=self._persist_with_retry("SQLite quote batch", lambda: database.insert_observation_batch(batch,"ssi"))
@@ -384,10 +400,16 @@ class SsiCollector:
                         self.runtime.increment("duplicate_messages",counts["duplicate"])
                         self.runtime.increment("rows_valid",counts["valid"]);self.runtime.increment("rows_invalid",counts["invalid"])
                         if counts.get("last_persisted_at"):
-                            self.runtime.update(last_persisted_at=counts["last_persisted_at"])
+                            self.runtime.update(last_persisted_at=counts["last_persisted_at"],
+                                quote_persistence_status="saved" if counts["valid"] else "saved_invalid_only")
+                        else:
+                            self.runtime.update(quote_persistence_status="duplicate_only" if counts["duplicate"] else "failed")
+                    else:
+                        self.runtime.update(quote_persistence_status="failed")
                 except Exception as exc:
-                    self.runtime.update(last_error=f"SQLite quote batch: {str(exc)[:180]}")
+                    self.runtime.update(quote_persistence_status="failed",last_error=f"SQLite quote batch: {str(exc)[:180]}")
             if trade_batch:
+                self.runtime.update(trade_persistence_status="writing")
                 self._persist_with_retry("daily trade archive", lambda: daily_archive.persist_trade_batch(trade_batch))
                 try:
                     counts=self._persist_with_retry("SQLite trade batch", lambda: database.insert_trade_batch(trade_batch,"ssi"))
@@ -395,9 +417,14 @@ class SsiCollector:
                         self.runtime.increment("trade_messages_saved",counts["inserted"])
                         self.runtime.increment("trade_messages_dropped",counts["invalid"])
                         if counts.get("last_persisted_at"):
-                            self.runtime.update(last_trade_persisted_at=counts["last_persisted_at"])
+                            self.runtime.update(last_trade_persisted_at=counts["last_persisted_at"],
+                                trade_persistence_status="saved" if counts["inserted"] else "saved_invalid_only")
+                        else:
+                            self.runtime.update(trade_persistence_status="duplicate_only" if counts["duplicate"] else "failed")
+                    else:
+                        self.runtime.update(trade_persistence_status="failed")
                 except Exception as exc:
-                    self.runtime.update(last_error=f"SQLite trade batch: {str(exc)[:180]}")
+                    self.runtime.update(trade_persistence_status="failed",last_error=f"SQLite trade batch: {str(exc)[:180]}")
 
     def _persist_with_retry(self, label, write):
         delay=.25
@@ -406,12 +433,17 @@ class SsiCollector:
                 return write()
             except sqlite3.OperationalError as exc:
                 message=str(exc).lower()
-                if "locked" not in message and "busy" not in message:
+                retryable = any(token in message for token in (
+                    "locked", "busy", "disk i/o error", "unable to open database file"
+                ))
+                if not retryable:
                     self.runtime.update(last_error=f"{label}: {str(exc)[:180]}")
                     _LOG.exception("Lỗi ghi %s; batch hiện tại không thể lưu.", label)
                     return None
-                self.runtime.update(last_error=f"{label}: SQLite đang khóa; đang giữ batch và thử lại")
-                _LOG.warning("SQLite khóa khi ghi %s; giữ batch, thử lại sau %.2f giây.", label, delay)
+                status_key="trade_persistence_status" if "trade" in label.lower() else "quote_persistence_status" if "quote" in label.lower() else None
+                if status_key:self.runtime.update(**{status_key:"retrying"})
+                self.runtime.update(last_error=f"{label}: SQLite tạm thời không ghi được; đang giữ batch và thử lại")
+                _LOG.warning("SQLite chưa ghi được %s (%s); giữ batch, thử lại sau %.2f giây.", label, str(exc)[:120], delay)
                 time.sleep(delay)
                 delay=min(delay*2,5.0)
             except Exception as exc:
@@ -433,8 +465,10 @@ class SsiCollector:
                 state=getattr(event,"state","")
                 if state=="reconnected":self.runtime.increment("reconnect_count")
                 if state in {"connected","reconnected"}:self.runtime.update(connection_status="connected",last_error=None)
-                elif state in {"failed","disconnected"} and not self._stop.is_set():
-                    error=getattr(event,"error",None);self.runtime.update(connection_status="error" if state=="failed" else "disconnected",last_error=str(error)[:240] if error else None)
+                elif state=="disconnected" and not self._stop.is_set():
+                    error=getattr(event,"error",None);self.runtime.update(connection_status="reconnecting",last_error=str(error)[:240] if error else None)
+                elif state=="failed" and not self._stop.is_set():
+                    error=getattr(event,"error",None);self.runtime.update(connection_status="error",last_error=str(error)[:240] if error else None)
             def on_data(message):
                 if isinstance(message,TradeMessage) or (isinstance(message,dict) and {"symbol","price","quantity"}.issubset(message)):
                     self.runtime.increment("trade_messages_received")
@@ -499,7 +533,8 @@ class SsiCollector:
             run_status="stopped"
             while not self._stop.is_set():
                 client.wait(timeout_ms=1000)
-                if not client.is_connected and not self._stop.is_set() and client.last_error:self.runtime.update(connection_status="error",last_error=str(client.last_error)[:240])
+                if not client.is_connected and not self._stop.is_set() and client.last_error:
+                    self.runtime.update(connection_status="reconnecting",last_error=str(client.last_error)[:240])
         except Exception as exc:
             run_status="failed"
             if not self._stop.is_set():self.runtime.update(connection_status="error",last_error=str(exc)[:240]);database.log_ingestion_error(str(exc)[:240],source="ssi")

@@ -1,4 +1,5 @@
 import hashlib
+import bisect
 import json
 import math
 from datetime import date, datetime, time, timezone
@@ -265,3 +266,20 @@ def quantile(values, percentile):
         return ordered[lower]
     weight = position - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def percentile_rank(values, value):
+    """Invert the same linearly interpolated (Hyndman-Fan type 7) sample quantile."""
+    ordered=sorted(float(item) for item in values if item is not None)
+    if not ordered or value is None:return None
+    value=float(value);n=len(ordered)
+    if n==1:return 50.0 if value==ordered[0] else (0.0 if value<ordered[0] else 100.0)
+    left=bisect.bisect_left(ordered,value);right=bisect.bisect_right(ordered,value)
+    if left<right:
+        return ((left+right-1)/2)/(n-1)*100
+    if left==0:return 0.0
+    if left==n:return 100.0
+    lower,upper=ordered[left-1],ordered[left]
+    if upper==lower:return (left-0.5)/(n-1)*100
+    position=(left-1)+(value-lower)/(upper-lower)
+    return position/(n-1)*100

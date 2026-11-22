@@ -20,56 +20,70 @@ def _build_market_depth_session(window_minutes=60, source="ssi", market_meta=Non
     market_meta = market_meta or {}
     requested_date = market_meta.get("session_date")
     state = market_meta.get("state")
+    effective = market_meta.get("effective_now")
+    live_cutoff = (str(effective)[:16]
+                   if effective and state in {"IN_SESSION", "LUNCH_BREAK"} else None)
     with database.connect() as db:
         if requested_date:
-            dates = db.execute("SELECT DISTINCT session_date FROM bars_1m WHERE source=? AND session_date<=? ORDER BY session_date DESC LIMIT 10",
-                               (source, requested_date)).fetchall()
+            dates = db.execute(
+                "SELECT DISTINCT session_date FROM bars_1m WHERE source=? AND session_date<=? ORDER BY session_date DESC LIMIT 10",
+                (source, requested_date),
+            ).fetchall()
         else:
-            dates = db.execute("SELECT DISTINCT session_date FROM bars_1m WHERE source=? ORDER BY session_date DESC LIMIT 10", (source,)).fetchall()
+            dates = db.execute(
+                "SELECT DISTINCT session_date FROM bars_1m WHERE source=? ORDER BY session_date DESC LIMIT 10",
+                (source,),
+            ).fetchall()
         session_date = next((str(row[0]) for row in dates), None)
         if not session_date:
             return {"source": source, "session_date": None, "rows": [], "n0": 0, "n1": 0, "n2": 0,
                     "n3": 0, "empty": True, "message": "Chưa có bar sổ lệnh đã lưu để vẽ độ sâu."}
+
+        day_start = session_date + "T00:00"
+        day_end = (datetime.fromisoformat(session_date) + timedelta(days=1)).date().isoformat() + "T00:00"
+        latest_sql = """SELECT minute_vn FROM bars_1m
+            WHERE source=? AND minute_vn>=? AND minute_vn<? AND session_date=?
+              AND coverage_status='ok' AND baseline_bucket IN ('OPEN','MID','CLOSE')
+              AND bid_depth_value IS NOT NULL AND ask_depth_value IS NOT NULL"""
+        latest_args = [source, day_start, day_end, session_date]
+        if live_cutoff:
+            latest_sql += " AND minute_vn<?"
+            latest_args.append(live_cutoff)
+        latest_sql += " ORDER BY minute_vn DESC LIMIT 1"
+        latest_row = db.execute(latest_sql, latest_args).fetchone()
+        if not latest_row:
+            return {"source": source, "session_date": session_date, "rows": [], "n0": 0, "n1": 0, "n2": 0,
+                    "n3": 0, "empty": True, "message": "Chưa có bar phút liên tục hợp lệ trong phiên gần nhất."}
+
+        latest_minute = datetime.fromisoformat(latest_row["minute_vn"]).replace(
+            tzinfo=None, second=0, microsecond=0
+        )
+        if live_cutoff:
+            end = datetime.fromisoformat(str(effective)).replace(tzinfo=None, second=0, microsecond=0)
+            fresh = (end - latest_minute).total_seconds() <= 60 and end.date() == latest_minute.date()
+            if not fresh:
+                end = latest_minute + timedelta(minutes=1)
+        else:
+            end = latest_minute + timedelta(minutes=1)
+        start = end - timedelta(minutes=window_minutes)
+        start_key = start.isoformat(timespec="minutes")
+        end_key = end.isoformat(timespec="minutes")
         rows = db.execute("""SELECT symbol,minute_vn,market,session_phase,baseline_bucket,
                     bid_depth_value,ask_depth_value,n_snapshots,coverage_status
-                FROM bars_1m WHERE source=? AND session_date=? AND coverage_status='ok'
+                FROM bars_1m WHERE source=? AND session_date=? AND minute_vn>=? AND minute_vn<?
+                  AND coverage_status='ok' AND baseline_bucket IN ('OPEN','MID','CLOSE')
                   AND bid_depth_value IS NOT NULL AND ask_depth_value IS NOT NULL
-                ORDER BY minute_vn""", (source, session_date)).fetchall()
-    bars = [dict(row) for row in rows]
-    # A market-clock cut-off prevents drawing bars from later in the day when
-    # the app clock is simulated or the collector has already persisted ahead.
-    effective = market_meta.get("effective_now")
-    if effective and state in {"IN_SESSION", "LUNCH_BREAK"}:
-        bars = [row for row in bars if row["minute_vn"] < str(effective)[:16]]
+                ORDER BY minute_vn""",
+            (source, session_date, start_key, end_key),
+        ).fetchall()
+
     by_symbol = {}
-    for row in bars:
-        # Auction buckets are not valid continuous-session depth observations.
-        if row.get("baseline_bucket") not in {"OPEN", "MID", "CLOSE"}:
-            continue
-        by_symbol.setdefault(row["symbol"], []).append(row)
-    all_minutes = sorted({datetime.fromisoformat(row["minute_vn"]).replace(tzinfo=None, second=0, microsecond=0).isoformat(timespec="minutes")
-                          for group in by_symbol.values() for row in group})
-    if not all_minutes:
-        return {"source": source, "session_date": session_date, "rows": [], "n0": len(by_symbol), "n1": 0,
-                "n2": 0, "n3": 0, "empty": True, "message": "Chưa có bar phút liên tục hợp lệ trong phiên gần nhất."}
-    latest_minute = datetime.fromisoformat(all_minutes[-1])
-    effective_stamp = datetime.fromisoformat(str(effective)).replace(tzinfo=None) if effective else None
-    if state in {"IN_SESSION", "LUNCH_BREAK"} and effective_stamp:
-        end = effective_stamp.replace(second=0, microsecond=0)
-        fresh = (end - latest_minute).total_seconds() <= 60 and end.date() == latest_minute.date()
-        if not fresh:
-            end = latest_minute.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    else:
-        end = latest_minute.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    start = end - timedelta(minutes=window_minutes)
-    selected_minutes = {minute for minute in all_minutes if start <= datetime.fromisoformat(minute) < end}
-    if not selected_minutes:
-        return {"source": source, "session_date": session_date, "rows": [], "n0": len(by_symbol), "n1": 0,
-                "n2": 0, "n3": 0, "empty": True, "message": "Chưa có bar phút hoàn tất trong cửa sổ thời gian đã chọn."}
-    selected = {symbol: [row for row in group
-                         if datetime.fromisoformat(row["minute_vn"]).replace(tzinfo=None, second=0, microsecond=0).isoformat(timespec="minutes") in selected_minutes]
-                for symbol, group in by_symbol.items()}
-    selected = {symbol: group for symbol, group in selected.items() if group}
+    for row in rows:
+        by_symbol.setdefault(row["symbol"], []).append(dict(row))
+    if not by_symbol:
+        return {"source": source, "session_date": session_date, "rows": [], "n0": 0, "n1": 0, "n2": 0,
+                "n3": 0, "empty": True, "message": "Chưa có bar phút liên tục hợp lệ trong cửa sổ đã chọn."}
+    selected = by_symbol
     metadata = database.fetch_security_metadata("ssi")
     n0 = len(metadata)
     n1 = sum(1 for symbol, item in metadata.items() if is_rankable_stock(symbol, item.get("stock_type")))

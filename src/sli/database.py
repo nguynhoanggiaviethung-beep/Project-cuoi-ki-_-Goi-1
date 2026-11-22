@@ -4,6 +4,7 @@ import sqlite3
 import time
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
+from statistics import median
 
 from . import config
 from . import market_rules
@@ -30,6 +31,21 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
+def _collector_health_values(state):
+    as_json=lambda value: json.dumps(value if value is not None else [],ensure_ascii=False,separators=(",",":"))
+    return (
+        state.get("subscription_status"),as_json(state.get("subscription_topics")),
+        as_json(state.get("subscribed_boards")),int(state.get("subscription_ack_count") or 0),
+        state.get("subscription_error"),state.get("quote_persistence_status"),
+        state.get("trade_subscription_status"),as_json(state.get("trade_subscription_topics")),
+        state.get("trade_persistence_status"),state.get("last_persisted_at"),
+        int(state.get("trade_messages_received") or 0),int(state.get("trade_messages_saved") or 0),
+        int(state.get("trade_messages_dropped") or 0),int(state.get("trade_messages_filtered") or 0),
+        state.get("last_trade_received_at"),state.get("last_trade_persisted_at"),
+        int(state.get("queue_depth") or 0),int(state.get("trade_queue_depth") or 0),
+    )
+
+
 def start_collector_run(worker_id=None, process_id=None):
     now = datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
     with connect() as db:
@@ -50,26 +66,35 @@ def finish_collector_run(run_id, status, state):
         return
     with connect() as db:
         db.execute("""UPDATE collector_run_details SET ended_at=?,heartbeat_at=?,status=?,connection_status=?,messages_received=?,rows_valid=?,
-            rows_invalid=?,duplicate_messages=?,reconnect_count=?,queue_dropped=?,last_message_at=?,last_error=? WHERE id=?""",
+            rows_invalid=?,duplicate_messages=?,reconnect_count=?,queue_dropped=?,last_message_at=?,last_error=?,
+            subscription_status=?,subscription_topics=?,subscribed_boards=?,subscription_ack_count=?,subscription_error=?,
+            quote_persistence_status=?,trade_subscription_status=?,trade_subscription_topics=?,trade_persistence_status=?,
+            last_persisted_at=?,trade_messages_received=?,trade_messages_saved=?,trade_messages_dropped=?,trade_messages_filtered=?,
+            last_trade_received_at=?,last_trade_persisted_at=?,queue_depth=?,trade_queue_depth=? WHERE id=?""",
             (datetime.now(config.TIMEZONE).isoformat(timespec="seconds"), datetime.now(config.TIMEZONE).isoformat(timespec="seconds"), status,
-             state.get("connection_status"),
-             state.get("messages_received", 0), state.get("rows_valid", 0), state.get("rows_invalid", 0),
-             state.get("duplicate_messages", 0), state.get("reconnect_count", 0), state.get("queue_dropped", 0),
-             state.get("last_message_at"), state.get("last_error"), run_id))
+             state.get("connection_status"),state.get("messages_received",0),state.get("rows_valid",0),state.get("rows_invalid",0),
+             state.get("duplicate_messages",0),state.get("reconnect_count",0),state.get("queue_dropped",0),
+             state.get("last_message_at"),state.get("last_error"),*_collector_health_values(state),run_id))
 
 
 def update_collector_heartbeat(run_id, state):
     if not run_id:
         return
     now = datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
-    with connect() as db:
+    # Heartbeats are best-effort and must not hold the live collector behind
+    # long analytics/history writes to the shared SQLite database.
+    with connect(timeout=2) as db:
         db.execute("""UPDATE collector_run_details SET heartbeat_at=?,connection_status=?,messages_received=?,rows_valid=?,
-            rows_invalid=?,duplicate_messages=?,reconnect_count=?,queue_dropped=?,last_message_at=?,last_error=?
+            rows_invalid=?,duplicate_messages=?,reconnect_count=?,queue_dropped=?,last_message_at=?,last_error=?,
+            subscription_status=?,subscription_topics=?,subscribed_boards=?,subscription_ack_count=?,subscription_error=?,
+            quote_persistence_status=?,trade_subscription_status=?,trade_subscription_topics=?,trade_persistence_status=?,
+            last_persisted_at=?,trade_messages_received=?,trade_messages_saved=?,trade_messages_dropped=?,trade_messages_filtered=?,
+            last_trade_received_at=?,last_trade_persisted_at=?,queue_depth=?,trade_queue_depth=?
             WHERE id=? AND ended_at IS NULL""",
-            (now, state.get("connection_status"), state.get("messages_received", 0), state.get("rows_valid", 0),
-             state.get("rows_invalid", 0), state.get("duplicate_messages", 0),
-             state.get("reconnect_count", 0), state.get("queue_dropped", 0),
-             state.get("last_message_at"), state.get("last_error"), run_id))
+            (now,state.get("connection_status"),state.get("messages_received",0),state.get("rows_valid",0),
+             state.get("rows_invalid",0),state.get("duplicate_messages",0),state.get("reconnect_count",0),
+             state.get("queue_dropped",0),state.get("last_message_at"),state.get("last_error"),
+             *_collector_health_values(state),run_id))
 
 
 def close_abandoned_collector_runs():
@@ -81,10 +106,18 @@ def close_abandoned_collector_runs():
         return cursor.rowcount
 
 
-def latest_collector_run():
-    with connect() as db:
+def latest_collector_run(timeout=30):
+    with connect(timeout=timeout) as db:
         row = db.execute("SELECT * FROM collector_run_details ORDER BY id DESC LIMIT 1").fetchone()
     return dict(row) if row else None
+
+
+def latest_observation_received_at(source="ssi", timeout=1):
+    """Read only the newest persisted quote timestamp through its covering index."""
+    with connect(timeout=timeout) as db:
+        row = db.execute("SELECT received_at_utc FROM observations WHERE source=? "
+                         "ORDER BY received_at_utc DESC LIMIT 1", (source,)).fetchone()
+    return row[0] if row else None
 
 
 def request_collector_stop(worker_id):
@@ -223,16 +256,71 @@ def fetch_bars_window_by_symbol(source, start_at, end_before, max_minutes=390):
     if max_minutes is None:
         return _fetch_bars_range_cached(source, start_at, end_before, int(time.monotonic() // 5))
     max_minutes=max(1,min(int(max_minutes),390))
-    sql="""WITH window_rows AS (
-        SELECT * FROM bars_1m WHERE source=? AND minute_vn>=? AND minute_vn<?
-    ), ranked AS (
-        SELECT *,ROW_NUMBER() OVER(PARTITION BY symbol ORDER BY minute_vn DESC) rn
-        FROM window_rows
-    ) SELECT * FROM ranked WHERE rn<=? ORDER BY symbol,minute_vn"""
-    with connect() as db:rows=db.execute(sql,(source,start_at,end_before,max_minutes)).fetchall()
+    # The window is minute-bounded; stream in the covering minute/symbol index
+    # order and trim per symbol in Python. This avoids a full ROW_NUMBER sort
+    # over hundreds of thousands of rows on each ranking refresh.
+    sql="""SELECT symbol,minute_vn,session_phase,baseline_bucket,spread_bps,spread_ticks,
+        total_depth_value,n_snapshots,coverage_status FROM bars_1m
+        WHERE source=? AND minute_vn>=? AND minute_vn<? ORDER BY minute_vn,symbol"""
+    with connect() as db:rows=db.execute(sql,(source,start_at,end_before)).fetchall()
     grouped={}
     for row in rows:grouped.setdefault(row["symbol"],[]).append(dict(row))
+    for symbol,points in grouped.items():
+        if len(points)>max_minutes:grouped[symbol]=points[-max_minutes:]
     return grouped
+
+
+def aggregate_historical_bar_profile(source, start_at, end_before, symbol=None):
+    """Aggregate minute bars during an historical range without materializing full bar rows."""
+    return _aggregate_historical_bar_profile_cached(source,start_at,end_before,symbol.upper() if symbol else None,
+                                                    int(time.monotonic()//5))
+
+
+@lru_cache(maxsize=8)
+def _aggregate_historical_bar_profile_cached(source, start_at, end_before, symbol, _five_second_bucket):
+    columns = ("spread_bps", "spread_ticks", "total_depth_value", "queue_imbalance")
+    sql = "SELECT symbol,minute_vn,spread_bps,spread_ticks,total_depth_value,queue_imbalance,n_snapshots FROM bars_1m WHERE source=? AND minute_vn>=? AND minute_vn<?"
+    args = [source, start_at, end_before]
+    if symbol:
+        sql += " AND symbol=?"
+        args.append(symbol.upper())
+    sql += " ORDER BY minute_vn,symbol"
+    profile = []
+    current_minute = None
+    values = None
+    symbols_count = snapshots = bar_count = 0
+
+    def flush(minute, bucket, symbol_count, snapshot_count, count):
+        if minute is None:
+            return
+        return {"minute": f"{minute}:00+07:00",
+                "median_spread_bps": median(bucket["spread_bps"]) if bucket["spread_bps"] else None,
+                "median_spread_ticks": median(bucket["spread_ticks"]) if bucket["spread_ticks"] else None,
+                "median_total_depth_value": median(bucket["total_depth_value"]) if bucket["total_depth_value"] else None,
+                "median_queue_imbalance": median(bucket["queue_imbalance"]) if bucket["queue_imbalance"] else None,
+                "bar_count": count, "snapshot_count": snapshot_count, "symbols_count": symbol_count}
+
+    with connect() as db:
+        for row in db.execute(sql, args):
+            minute = str(row["minute_vn"])[:16]
+            if minute != current_minute:
+                item = flush(current_minute, values or {}, symbols_count, snapshots, bar_count)
+                if item:
+                    profile.append(item)
+                current_minute = minute
+                values = {key: [] for key in columns}
+                symbols_count = snapshots = bar_count = 0
+            symbols_count += 1
+            snapshots += int(row["n_snapshots"] or 0)
+            bar_count += 1
+            for key in columns:
+                value = row[key]
+                if value is not None:
+                    values[key].append(value)
+    item = flush(current_minute, values or {}, symbols_count, snapshots, bar_count)
+    if item:
+        profile.append(item)
+    return profile
 
 
 @lru_cache(maxsize=8)
@@ -286,9 +374,15 @@ def latest_bar_minute(source):
 
 
 def latest_historical_date(source="ssi"):
-    # Ask the indexed per-symbol date range for each catalogued common stock.
-    # MAX(replace(trading_date,...)) forced a full scan of millions of OHLC rows.
-    with connect() as db:
+    # The latest daily OHLC date changes at most once per session. Avoid running
+    # 1,500 indexed lookups on every 5-second health/dashboard refresh.
+    bucket = int(time.time() // 300)
+    return _latest_historical_date_cached(source, bucket)
+
+
+@lru_cache(maxsize=16)
+def _latest_historical_date_cached(source, _five_minute_bucket):
+    with connect(timeout=5) as db:
         row=db.execute("""SELECT MAX(last_date) FROM (
             SELECT (SELECT MAX(h.trading_date) FROM historical_prices h
                     WHERE h.source=c.source AND h.symbol=c.symbol AND h.timeframe='1d') AS last_date
@@ -313,6 +407,31 @@ def historical_date_bounds(source="ssi"):
             )""",(source,)).fetchone()
     return {"earliest_date":str(row["earliest_date"]).replace("/","-") if row and row["earliest_date"] else None,
             "latest_date":str(row["latest_date"]).replace("/","-") if row and row["latest_date"] else None}
+
+
+def recent_historical_dates(source="ssi", limit=30):
+    """Return recent distinct daily OHLC sessions, newest first."""
+    limit=max(1,min(int(limit or 30),500))
+    # Use the symbol/date index instead of DISTINCT over the full market table.
+    # These liquid reference symbols share the exchange trading calendar and
+    # keep the range-control endpoint fast while the collector writes to SQLite.
+    with connect() as db:
+        symbols=["FPT","SSI","VCB","HPG","VNM"]
+        dates=set()
+        for symbol in symbols:
+            rows=db.execute("""SELECT trading_date FROM historical_prices
+                WHERE source=? AND symbol=? AND timeframe='1d'
+                ORDER BY trading_date DESC LIMIT ?""",(source,symbol,limit)).fetchall()
+            dates.update(str(row["trading_date"]).replace("/","-") for row in rows if row["trading_date"])
+            if len(dates)>=limit:break
+        if not dates:
+            row=db.execute("SELECT symbol FROM historical_prices WHERE source=? AND timeframe='1d' LIMIT 1",(source,)).fetchone()
+            if row:
+                rows=db.execute("""SELECT trading_date FROM historical_prices
+                    WHERE source=? AND symbol=? AND timeframe='1d'
+                    ORDER BY trading_date DESC LIMIT ?""",(source,row["symbol"],limit)).fetchall()
+                dates.update(str(item["trading_date"]).replace("/","-") for item in rows if item["trading_date"])
+    return sorted(dates,reverse=True)[:limit]
 
 
 def latest_data_as_of(source="ssi"):
@@ -344,17 +463,20 @@ def _cached_baseline_qualified_symbols(source,before_session):
         rows=db.execute("""WITH prior_sessions AS (
               SELECT session_date FROM bars_1m WHERE source=? AND session_date<?
               GROUP BY session_date ORDER BY session_date DESC LIMIT ?
-            ), qualified AS (
-              SELECT b.symbol,b.baseline_bucket,COUNT(*) AS n FROM bars_1m b
+            ), paired AS (
+              SELECT b.symbol,b.baseline_bucket,b.session_date FROM bars_1m b
               JOIN prior_sessions s ON s.session_date=b.session_date
               WHERE b.source=? AND b.baseline_bucket IS NOT NULL AND b.coverage_status='ok'
-              GROUP BY b.symbol,b.baseline_bucket HAVING COUNT(b.spread_bps)>=?
-                AND COUNT(b.total_depth_value)>=?
-                AND COUNT(DISTINCT CASE WHEN b.spread_bps IS NOT NULL AND b.total_depth_value IS NOT NULL
-                                        THEN b.session_date END)>=?
-            ) SELECT DISTINCT symbol FROM qualified""",
+                AND b.spread_bps IS NOT NULL AND b.total_depth_value IS NOT NULL
+            ), same_phase AS (
+              SELECT symbol,baseline_bucket FROM paired GROUP BY symbol,baseline_bucket
+              HAVING COUNT(*)>=? AND COUNT(DISTINCT session_date)>=?
+            ), pooled AS (
+              SELECT symbol FROM paired GROUP BY symbol
+              HAVING COUNT(*)>=? AND COUNT(DISTINCT session_date)>=?
+            ) SELECT symbol FROM same_phase UNION SELECT symbol FROM pooled""",
             (source,before_session,config.BASELINE_SESSIONS,source,config.BASELINE_MIN_BARS,
-             config.BASELINE_MIN_BARS,config.BASELINE_SESSIONS)).fetchall()
+             config.MIN_BASELINE_SESSIONS,config.BASELINE_MIN_BARS,config.MIN_BASELINE_SESSIONS)).fetchall()
     return frozenset(row[0] for row in rows)
 
 
@@ -398,9 +520,9 @@ def update_stale_alert(source, stale, threshold_seconds, latest_data_at=None):
             db.execute("UPDATE system_alerts SET status='resolved',ended_at=? WHERE id=?", (now, active["id"]))
 
 
-def connect():
+def connect(timeout=30):
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(config.DB_PATH, timeout=30, factory=_ClosingConnection)
+    db = sqlite3.connect(config.DB_PATH, timeout=timeout, factory=_ClosingConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
     db.execute("PRAGMA synchronous = NORMAL")
@@ -412,7 +534,12 @@ def initialize():
         # WAL is a database-level setting. Set it during initialization only;
         # repeating this pragma on every request connection can serialize
         # otherwise independent reads behind a writer.
-        db.execute("PRAGMA journal_mode = WAL")
+        # journal_mode is a database-wide setting; changing it while the live
+        # collector owns a write transaction can stall every web restart. Only
+        # enable WAL for a new/non-WAL database.
+        mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() != "wal":
+            db.execute("PRAGMA journal_mode = WAL")
         db.executescript("""
         CREATE TABLE IF NOT EXISTS observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -526,7 +653,16 @@ def initialize():
             rows_valid INTEGER NOT NULL DEFAULT 0, rows_invalid INTEGER NOT NULL DEFAULT 0,
             duplicate_messages INTEGER NOT NULL DEFAULT 0, reconnect_count INTEGER NOT NULL DEFAULT 0,
             queue_dropped INTEGER NOT NULL DEFAULT 0, last_message_at TEXT, last_error TEXT,
-            worker_id TEXT, process_id INTEGER, heartbeat_at TEXT, connection_status TEXT
+            worker_id TEXT, process_id INTEGER, heartbeat_at TEXT, connection_status TEXT,
+            subscription_status TEXT, subscription_topics TEXT NOT NULL DEFAULT '[]',
+            subscribed_boards TEXT NOT NULL DEFAULT '[]', subscription_ack_count INTEGER NOT NULL DEFAULT 0,
+            subscription_error TEXT, quote_persistence_status TEXT,
+            trade_subscription_status TEXT, trade_subscription_topics TEXT NOT NULL DEFAULT '[]',
+            trade_persistence_status TEXT, last_persisted_at TEXT,
+            trade_messages_received INTEGER NOT NULL DEFAULT 0, trade_messages_saved INTEGER NOT NULL DEFAULT 0,
+            trade_messages_dropped INTEGER NOT NULL DEFAULT 0, trade_messages_filtered INTEGER NOT NULL DEFAULT 0,
+            last_trade_received_at TEXT, last_trade_persisted_at TEXT,
+            queue_depth INTEGER NOT NULL DEFAULT 0, trade_queue_depth INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS collector_worker_control (
             worker_id TEXT PRIMARY KEY, command TEXT NOT NULL, requested_at TEXT NOT NULL
@@ -547,6 +683,9 @@ def initialize():
         CREATE TABLE IF NOT EXISTS user_settings (
             profile_id TEXT PRIMARY KEY CHECK(profile_id='local'),
             standard_order_shares INTEGER NOT NULL DEFAULT 10000,
+            order_value_million INTEGER NOT NULL DEFAULT 100,
+            tolerance_bps INTEGER NOT NULL DEFAULT 30,
+            order_side TEXT NOT NULL DEFAULT 'buy',
             favorable_spread_pctl REAL NOT NULL DEFAULT 25,
             stress_spread_pctl REAL NOT NULL DEFAULT 90,
             favorable_depth_pctl REAL NOT NULL DEFAULT 75,
@@ -566,6 +705,17 @@ def initialize():
             PRIMARY KEY(watchlist_id,symbol)
         );
         CREATE INDEX IF NOT EXISTS ix_watchlist_items_order ON watchlist_items(watchlist_id,position,symbol);
+        CREATE TABLE IF NOT EXISTS portfolio_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            shares INTEGER NOT NULL CHECK(shares > 0 AND shares % 100 = 0),
+            average_cost REAL NOT NULL CHECK(average_cost > 0),
+            opened_on TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS ix_portfolio_positions_symbol ON portfolio_positions(symbol);
         """)
         db.execute("INSERT OR IGNORE INTO user_settings(profile_id,updated_at) VALUES('local',?)",
                    (datetime.now(config.TIMEZONE).isoformat(timespec='seconds'),))
@@ -597,6 +747,7 @@ def initialize():
             db.execute("CREATE INDEX IF NOT EXISTS ix_observations_symbol_time ON observations(source,symbol,received_at_utc)")
             db.execute("CREATE INDEX IF NOT EXISTS ix_observations_received ON observations(source,received_at_utc)")
             db.execute("PRAGMA foreign_keys=ON")
+        _backup_profile_before_inv_d_migration(db)
         _migrate_schema(db)
         # _refresh_bar filters by received_at_vn for each (source, symbol, minute).
         # The UTC-only indexes made every bar refresh scan the full observations table.
@@ -617,14 +768,81 @@ def _migrate_schema(db):
         "metrics": {"spread_abs": "REAL", "spread_ticks": "REAL", "tick_size": "REAL"},
         "bars_1m": {"bid_depth_value": "REAL", "ask_depth_value": "REAL"},
         "alerts": {"bucket": "TEXT", "baseline_mode": "TEXT", "consecutive_bars": "INTEGER NOT NULL DEFAULT 1"},
-        "collector_run_details": {"queue_dropped": "INTEGER NOT NULL DEFAULT 0", "worker_id": "TEXT",
-                                   "process_id": "INTEGER", "heartbeat_at": "TEXT", "connection_status": "TEXT"},
+        "collector_run_details": {
+            "queue_dropped": "INTEGER NOT NULL DEFAULT 0", "worker_id": "TEXT",
+            "process_id": "INTEGER", "heartbeat_at": "TEXT", "connection_status": "TEXT",
+            "subscription_status": "TEXT", "subscription_topics": "TEXT NOT NULL DEFAULT '[]'",
+            "subscribed_boards": "TEXT NOT NULL DEFAULT '[]'", "subscription_ack_count": "INTEGER NOT NULL DEFAULT 0",
+            "subscription_error": "TEXT", "quote_persistence_status": "TEXT",
+            "trade_subscription_status": "TEXT", "trade_subscription_topics": "TEXT NOT NULL DEFAULT '[]'",
+            "trade_persistence_status": "TEXT", "last_persisted_at": "TEXT",
+            "trade_messages_received": "INTEGER NOT NULL DEFAULT 0", "trade_messages_saved": "INTEGER NOT NULL DEFAULT 0",
+            "trade_messages_dropped": "INTEGER NOT NULL DEFAULT 0", "trade_messages_filtered": "INTEGER NOT NULL DEFAULT 0",
+            "last_trade_received_at": "TEXT", "last_trade_persisted_at": "TEXT",
+            "queue_depth": "INTEGER NOT NULL DEFAULT 0", "trade_queue_depth": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "user_settings": {"order_value_million": "INTEGER NOT NULL DEFAULT 100",
+                          "tolerance_bps": "INTEGER NOT NULL DEFAULT 30", "order_side": "TEXT NOT NULL DEFAULT 'buy'"},
     }
     for table, fields in additions.items():
         existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
         for field, declaration in fields.items():
             if field not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {field} {declaration}")
+
+
+def _backup_profile_before_inv_d_migration(db):
+    """Back up only the local profile before adding INV-D settings columns."""
+    columns={row[1] for row in db.execute("PRAGMA table_info(user_settings)")}
+    required={"order_value_million","tolerance_bps","order_side"}
+    if not required-columns or not columns:return None
+    row=db.execute("SELECT * FROM user_settings WHERE profile_id='local'").fetchone()
+    lists=db.execute("SELECT id,name FROM watchlists ORDER BY id").fetchall()
+    items=db.execute("SELECT watchlist_id,symbol,note FROM watchlist_items ORDER BY watchlist_id,position,symbol").fetchall()
+    by_list={int(entry["id"]):[] for entry in lists}
+    for item in items:by_list[int(item["watchlist_id"])].append({"symbol":item["symbol"],"note":item["note"]})
+    payload={"format":"sli-local-profile-pre-inv-d-v1","settings":dict(row) if row else {},
+             "watchlists":[{"name":entry["name"],"items":by_list[int(entry["id"])]} for entry in lists]}
+    folder=config.DB_PATH.parent;folder.mkdir(parents=True,exist_ok=True)
+    stamp=datetime.now(config.TIMEZONE).strftime("%Y%m%d-%H%M%S")
+    target=folder/f"local-profile-before-inv-d-{stamp}.json"
+    target.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+    return target
+
+
+def migrate_inv_d_settings():
+    """Apply the small additive INV-D profile migration without full DB bootstrap."""
+    additions={"order_value_million":"INTEGER NOT NULL DEFAULT 100",
+               "tolerance_bps":"INTEGER NOT NULL DEFAULT 30",
+               "order_side":"TEXT NOT NULL DEFAULT 'buy'"}
+    with connect(timeout=30) as db:
+        exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_settings'").fetchone()
+        if not exists:return False
+        columns={row[1] for row in db.execute("PRAGMA table_info(user_settings)")}
+        missing={key:value for key,value in additions.items() if key not in columns}
+        if not missing:return False
+        _backup_profile_before_inv_d_migration(db)
+        for field,declaration in missing.items():
+            db.execute(f"ALTER TABLE user_settings ADD COLUMN {field} {declaration}")
+    return True
+
+
+def migrate_inv_c_positions():
+    """Create the local positions table additively without full DB bootstrap."""
+    with connect(timeout=30) as db:
+        existed=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='portfolio_positions'").fetchone()
+        db.execute("""CREATE TABLE IF NOT EXISTS portfolio_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            shares INTEGER NOT NULL CHECK(shares > 0 AND shares % 100 = 0),
+            average_cost REAL NOT NULL CHECK(average_cost > 0),
+            opened_on TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS ix_portfolio_positions_symbol ON portfolio_positions(symbol)")
+    return not bool(existed)
 
 
 def get_local_settings():
@@ -634,7 +852,7 @@ def get_local_settings():
 
 
 def update_local_settings(values):
-    allowed={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
+    allowed={"standard_order_shares","order_value_million","tolerance_bps","order_side","quiet_start","quiet_end","notification_channel"}
     updates={key:value for key,value in values.items() if key in allowed}
     if not updates:return get_local_settings()
     updates["updated_at"]=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
@@ -652,6 +870,22 @@ def fetch_local_watchlists():
     grouped={int(row["id"]):[] for row in lists}
     for row in items:grouped[int(row["watchlist_id"])].append(dict(row))
     return [{**dict(row),"items":grouped[int(row["id"])],"item_count":len(grouped[int(row["id"])])} for row in lists]
+
+
+def fetch_deepest_saved_symbols(source="ssi", limit=10):
+    """Return symbols with deepest latest valid saved SSI 1-minute bars (starter data only)."""
+    limit=max(1,min(int(limit),10))
+    with connect() as db:
+        rows=db.execute("""WITH latest AS (
+            SELECT symbol,MAX(minute_vn) AS minute_vn FROM bars_1m
+            WHERE source=? AND coverage_status='ok' GROUP BY symbol
+        )
+        SELECT b.symbol,COALESCE(b.bid_depth_value,0)+COALESCE(b.ask_depth_value,0) AS depth_value
+        FROM latest l JOIN bars_1m b ON b.source=? AND b.symbol=l.symbol AND b.minute_vn=l.minute_vn
+        JOIN securities_catalog c ON c.source=b.source AND c.symbol=b.symbol
+        WHERE c.stock_type='stock' AND (b.bid_depth_value IS NOT NULL OR b.ask_depth_value IS NOT NULL)
+        ORDER BY depth_value DESC,b.symbol LIMIT ?""",(source,source,limit)).fetchall()
+    return [dict(row) for row in rows]
 
 
 def create_local_watchlist(name):
@@ -708,12 +942,42 @@ def reorder_local_watchlist(watchlist_id,symbols):
         db.execute("UPDATE watchlists SET updated_at=? WHERE id=?",(now,watchlist_id))
 
 
-def replace_local_profile(settings,watchlists):
+def fetch_local_positions():
+    with connect() as db:
+        rows=db.execute("SELECT * FROM portfolio_positions ORDER BY symbol,opened_on,id").fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_local_position(symbol,shares,average_cost,opened_on,note=""):
+    now=datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
+    with connect() as db:
+        cursor=db.execute("""INSERT INTO portfolio_positions
+            (symbol,shares,average_cost,opened_on,note,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?)""",(symbol.upper(),int(shares),float(average_cost),opened_on,note,now,now))
+        return int(cursor.lastrowid)
+
+
+def update_local_position(position_id,symbol,shares,average_cost,opened_on,note=""):
+    now=datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
+    with connect() as db:
+        cursor=db.execute("""UPDATE portfolio_positions SET symbol=?,shares=?,average_cost=?,
+            opened_on=?,note=?,updated_at=? WHERE id=?""",
+            (symbol.upper(),int(shares),float(average_cost),opened_on,note,now,int(position_id)))
+        return cursor.rowcount>0
+
+
+def delete_local_position(position_id):
+    with connect() as db:
+        cursor=db.execute("DELETE FROM portfolio_positions WHERE id=?",(int(position_id),))
+        return cursor.rowcount>0
+
+
+def replace_local_profile(settings,watchlists,positions=None):
     now=datetime.now(config.TIMEZONE).isoformat(timespec='seconds')
     with connect() as db:
         db.execute("SAVEPOINT import_local_profile")
         try:
-            allowed={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
+            allowed={"standard_order_shares","order_value_million","tolerance_bps","order_side","quiet_start","quiet_end","notification_channel"}
             clean={key:value for key,value in settings.items() if key in allowed}
             if clean:
                 assignments=",".join(f"{key}=?" for key in clean)
@@ -725,6 +989,13 @@ def replace_local_profile(settings,watchlists):
                 for position,entry in enumerate(item["items"]):
                     db.execute("INSERT INTO watchlist_items(watchlist_id,symbol,position,note,added_at) VALUES(?,?,?,?,?)",
                                (list_id,entry["symbol"],position,entry.get("note",''),now))
+            if positions is not None:
+                db.execute("DELETE FROM portfolio_positions")
+                for position in positions:
+                    db.execute("""INSERT INTO portfolio_positions
+                        (symbol,shares,average_cost,opened_on,note,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?)""",(position["symbol"],position["shares"],position["average_cost"],
+                        position["opened_on"],position.get("note", ""),now,now))
             db.execute("RELEASE SAVEPOINT import_local_profile")
         except Exception:
             db.execute("ROLLBACK TO SAVEPOINT import_local_profile")
@@ -737,10 +1008,12 @@ def backup_local_profile_json():
     import json
     from pathlib import Path
     settings=get_local_settings()
-    allowed={"standard_order_shares","quiet_start","quiet_end","notification_channel"}
+    allowed={"standard_order_shares","order_value_million","tolerance_bps","order_side","quiet_start","quiet_end","notification_channel"}
     payload={"format":"sli-local-profile-v1","settings":{key:settings[key] for key in allowed},
              "watchlists":[{"name":row["name"],"items":[{"symbol":item["symbol"],"note":item["note"]} for item in row["items"]]}
-                           for row in fetch_local_watchlists()]}
+                           for row in fetch_local_watchlists()],
+             "positions":[{key:row[key] for key in ("symbol","shares","average_cost","opened_on","note")}
+                           for row in fetch_local_positions()]}
     folder=Path(config.DB_PATH).parent
     folder.mkdir(parents=True,exist_ok=True)
     stamp=datetime.now(config.TIMEZONE).strftime("%Y%m%d-%H%M%S")
@@ -885,19 +1158,19 @@ def _baseline_bars(db, bar):
         return [], "insufficient"
     placeholders = ",".join("?" for _ in prior_sessions)
     args = [bar["source"], bar["symbol"], *prior_sessions]
-    bucket_rows = db.execute(f"SELECT * FROM bars_1m WHERE source=? AND symbol=? AND market=? AND coverage_status='ok' AND session_date IN ({placeholders}) AND baseline_bucket=? ORDER BY minute_vn",
+    bucket_rows = db.execute(f"SELECT * FROM bars_1m WHERE source=? AND symbol=? AND market=? AND coverage_status='ok' AND session_date IN ({placeholders}) AND baseline_bucket=? AND spread_bps IS NOT NULL AND total_depth_value IS NOT NULL ORDER BY minute_vn",
                              (bar["source"],bar["symbol"],bar["market"],*prior_sessions,bar["baseline_bucket"])).fetchall() if bar["baseline_bucket"] else []
-    # Require enough bars across distinct prior sessions for this symbol, board and
-    # intraday phase; many minutes from only a few sessions are not independent days.
-    spread_rows=[row for row in bucket_rows if row["spread_bps"] is not None]
-    depth_rows=[row for row in bucket_rows if row["total_depth_value"] is not None]
-    spread_sessions={row["session_date"] for row in spread_rows}
-    depth_sessions={row["session_date"] for row in depth_rows}
-    sessions_used=len(spread_sessions & depth_sessions)
-    if (len(spread_rows)>=config.BASELINE_MIN_BARS
-            and len(depth_rows)>=config.BASELINE_MIN_BARS
-            and sessions_used>=config.BASELINE_SESSIONS):
-        return bucket_rows, "bucket"
+
+    def qualifies(rows):
+        sessions_used=len({row["session_date"] for row in rows})
+        return sessions_used >= config.MIN_BASELINE_SESSIONS and len(rows) >= config.BASELINE_MIN_BARS
+
+    if qualifies(bucket_rows):
+        return bucket_rows, "same_phase"
+    pooled_rows=db.execute(f"SELECT * FROM bars_1m WHERE source=? AND symbol=? AND market=? AND coverage_status='ok' AND session_date IN ({placeholders}) AND baseline_bucket IS NOT NULL AND spread_bps IS NOT NULL AND total_depth_value IS NOT NULL ORDER BY minute_vn",
+                           (bar["source"],bar["symbol"],bar["market"],*prior_sessions)).fetchall()
+    if qualifies(pooled_rows):
+        return pooled_rows, "pooled"
     return [], "insufficient"
 
 
@@ -1020,26 +1293,86 @@ def fetch_observations(source, symbol=None, limit=500, start_at=None, end_at=Non
 
 
 
+def _observation_utc_bound(value):
+    """Normalize an API timestamp to the UTC format used by the observation index."""
+    if not value:
+        return None
+    stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=config.TIMEZONE)
+    return stamp.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def fetch_recent_observations_by_symbol(source, limit=240, start_at=None, end_at=None, phase=None):
-    """Fetch recent observations per symbol via the source/symbol/time index."""
-    limit=max(1,min(int(limit),5000))
-    query="""SELECT o.id,o.symbol,o.received_at_utc,o.received_at_vn,o.source_ts_vn,
+    """Fetch bounded observations through the source/symbol/time index."""
+    limit = max(1, min(int(limit), 5000))
+    start_utc = _observation_utc_bound(start_at)
+    end_utc = _observation_utc_bound(end_at)
+    time_clauses = []
+    time_args = []
+    if start_utc:
+        time_clauses.append("o2.received_at_utc>=?")
+        time_args.append(start_utc)
+    if end_utc:
+        time_clauses.append("o2.received_at_utc<=?")
+        time_args.append(end_utc)
+    if phase:
+        time_clauses.append("o2.session_phase=?")
+        time_args.append(phase.upper())
+    subquery_filter = (" AND " + " AND ".join(time_clauses)) if time_clauses else ""
+    select_columns = """o.id,o.symbol,o.received_at_utc,o.received_at_vn,o.source_ts_vn,
       o.market,o.session_phase,o.validation_status,o.validation_reason,o.last_price,
       o.bid_price_1,o.bid_volume_1,o.ask_price_1,o.ask_volume_1,
       m.mid_price,m.spread_bps,m.spread_ticks,m.bid_depth_qty,m.ask_depth_qty,
-      m.bid_depth_value,m.ask_depth_value,m.total_depth_value,m.queue_imbalance
-      FROM observations o JOIN metrics m ON m.observation_id=o.id WHERE o.source=? AND o.symbol=?"""
+      m.bid_depth_value,m.ask_depth_value,m.total_depth_value,m.queue_imbalance"""
+
     with connect() as db:
-        symbols=[row[0] for row in db.execute("SELECT DISTINCT symbol FROM observations WHERE source=? ORDER BY symbol",(source,))]
-        grouped={}
+        catalog = db.execute(
+            "SELECT symbol FROM securities_catalog WHERE source=? ORDER BY symbol", (source,)
+        ).fetchall()
+        grouped = {}
+        if limit == 1 and catalog:
+            # One indexed latest-row lookup per catalog ticker; never scan each
+            # ticker's full multi-year history to answer the dashboard KPI.
+            sql = f"""SELECT {select_columns}
+              FROM securities_catalog c
+              JOIN observations o ON o.id=(
+                SELECT o2.id FROM observations o2 INDEXED BY ix_observations_symbol_time
+                WHERE o2.source=? AND o2.symbol=c.symbol{subquery_filter}
+                ORDER BY o2.received_at_utc DESC,o2.id DESC LIMIT 1
+              )
+              JOIN metrics m ON m.observation_id=o.id
+              WHERE c.source=? ORDER BY c.symbol"""
+            rows = db.execute(sql, [source, *time_args, source]).fetchall()
+            for row in rows:
+                grouped.setdefault(row["symbol"], []).append(dict(row))
+            return grouped
+
+        symbols = [row["symbol"] for row in catalog]
+        if not symbols:
+            symbols = [row[0] for row in db.execute(
+                "SELECT DISTINCT symbol FROM observations WHERE source=? ORDER BY symbol", (source,)
+            )]
         for ticker in symbols:
-            sql=query; args=[source,ticker]
-            if start_at: sql+=" AND datetime(COALESCE(o.received_at_vn,o.received_at_utc))>=datetime(?)"; args.append(start_at)
-            if end_at: sql+=" AND datetime(COALESCE(o.received_at_vn,o.received_at_utc))<=datetime(?)"; args.append(end_at)
-            if phase: sql+=" AND o.session_phase=?"; args.append(phase.upper())
-            sql+=" ORDER BY o.received_at_utc DESC,o.id DESC LIMIT ?"; args.append(limit)
-            rows=db.execute(sql,args).fetchall()
-            if rows: grouped[ticker]=[dict(row) for row in reversed(rows)]
+            clauses = ["o.source=?", "o.symbol=?"]
+            args = [source, ticker]
+            if start_utc:
+                clauses.append("o.received_at_utc>=?")
+                args.append(start_utc)
+            if end_utc:
+                clauses.append("o.received_at_utc<=?")
+                args.append(end_utc)
+            if phase:
+                clauses.append("o.session_phase=?")
+                args.append(phase.upper())
+            args.append(limit)
+            sql = f"""SELECT {select_columns}
+              FROM observations o JOIN metrics m ON m.observation_id=o.id
+              WHERE {" AND ".join(clauses)}
+              ORDER BY o.received_at_utc DESC,o.id DESC LIMIT ?"""
+            rows = db.execute(sql, args).fetchall()
+            if rows:
+                grouped[ticker] = [dict(row) for row in reversed(rows)]
     return grouped
 
 def fetch_recent_bars_by_symbol(source, limit=500, start_at=None, end_at=None, bucket=None):
@@ -1137,6 +1470,81 @@ def fetch_historical_prices(symbol=None, limit=90, source="ssi", exclude_date=No
     return list(reversed([dict(row) for row in rows]))
 
 
+def fetch_watchlist_daily_activity(symbols, as_of, source="ssi", in_session=False):
+    """Return SSI traded-value context for watchlist symbols from stored trades/OHLC."""
+    clean=sorted({str(symbol).strip().upper() for symbol in symbols if symbol})
+    if not clean:return {}
+    from datetime import datetime, timedelta
+    clock=as_of if isinstance(as_of,datetime) else datetime.fromisoformat(str(as_of).replace("Z","+00:00"))
+    day=clock.date().isoformat(); minute=clock.strftime("%H:%M")
+    placeholders=",".join("?" for _ in clean)
+    history_sql=f"""SELECT symbol,replace(trading_date,'/','-') AS day,value
+        FROM historical_prices WHERE source=? AND timeframe='1d' AND symbol IN ({placeholders})
+          AND replace(trading_date,'/','-')<=? AND value IS NOT NULL
+        ORDER BY symbol,day DESC"""
+    args=[source,*clean,day]
+    with connect(timeout=10) as db:
+        historical=db.execute(history_sql,args).fetchall()
+    history_by_symbol={symbol:[] for symbol in clean}
+    for row in historical:history_by_symbol.setdefault(row["symbol"],[]).append(dict(row))
+    # Only the in-session calculation needs trade ticks. Outside the session,
+    # use the same saved daily OHLC inputs without scanning ticks. During the
+    # session, query each symbol through the (source,symbol,time) index in
+    # parallel; this keeps the original 50-calendar-day trade reference set
+    # and aggregation unchanged while avoiding a broad multi-symbol scan.
+    trades=[]
+    if in_session:
+        from concurrent.futures import ThreadPoolExecutor
+        trade_start=(clock.date()-timedelta(days=50)).isoformat()+"T00:00:00"
+        trade_end=clock.isoformat(timespec="seconds")
+        trade_sql="""SELECT symbol,substr(received_at_vn,1,10) AS day,substr(received_at_vn,12,5) AS minute,
+            SUM(price*quantity) AS value FROM trade_ticks
+            WHERE source=? AND symbol=? AND validation_status='valid'
+              AND received_at_vn>=? AND received_at_vn<=?
+            GROUP BY symbol,day,minute ORDER BY symbol,day,minute"""
+        def read_symbol_trades(symbol):
+            with connect(timeout=10) as db:
+                return db.execute(trade_sql,(source,symbol,trade_start,trade_end)).fetchall()
+        with ThreadPoolExecutor(max_workers=min(4,len(clean)) or 1) as pool:
+            for rows in pool.map(read_symbol_trades,clean):trades.extend(rows)
+    trade_by_symbol={symbol:{} for symbol in clean}
+    for row in trades:
+        by_day=trade_by_symbol.setdefault(row["symbol"],{}).setdefault(row["day"],{})
+        by_day[row["minute"]]=float(row["value"] or 0)
+    result={}
+    for symbol in clean:
+        hist=history_by_symbol.get(symbol,[])
+        prior=[float(row["value"]) for row in hist if row["day"]<day and row["value"] is not None][:20]
+        today_rows=[row for row in hist if row["day"]==day and row["value"] is not None]
+        symbol_trades=trade_by_symbol.get(symbol,{})
+        today_trade=symbol_trades.get(day,{})
+        running=sum(value for stamp,value in today_trade.items() if stamp<=minute) if today_trade else None
+        same_time_by_date=sorted(((trade_day,sum(value for stamp,value in minutes.items() if stamp<=minute))
+                                  for trade_day,minutes in symbol_trades.items() if trade_day<day and minutes),
+                                 key=lambda item:item[0],reverse=True)[:20]
+        same_time_values=[value for _,value in same_time_by_date]
+        if in_session and running is not None:
+            today_value=running
+            if len(same_time_values)>=20:
+                prior=same_time_values;basis="running_vs_same_time_20_sessions"
+            else:
+                basis="running_vs_20_full_sessions"
+        elif today_rows:
+            today_value=float(today_rows[0]["value"]); basis="daily_ohlc_value"
+        elif in_session:
+            today_value=None; basis="intraday_trade_value_unavailable"
+        else:
+            latest=next((row for row in hist if row["value"] is not None),None)
+            today_value=float(latest["value"]) if latest else None
+            basis="latest_completed_daily_ohlc"
+            prior=[float(row["value"]) for row in hist if latest and row["day"]<latest["day"] and row["value"] is not None][:20]
+        average=sum(prior)/len(prior) if prior else None
+        ratio=(today_value/average*100) if today_value is not None and average and average>0 else None
+        result[symbol]={"ratio":ratio,"avg20_value":average,"today_value":today_value,
+                        "basis":basis,"sessions_used":len(prior),"window_label":f"Phiên {day}"}
+    return result
+
+
 def list_historical_symbols(source="ssi"):
     with connect() as db:
         rows=db.execute("SELECT DISTINCT symbol FROM historical_prices WHERE source=? ORDER BY symbol",(source,)).fetchall()
@@ -1186,6 +1594,18 @@ def count_alerts(source, symbol=None):
         alerts_count = db.execute("SELECT COUNT(*) FROM alerts WHERE source=?", (source,)).fetchone()[0]
         system_count = db.execute("SELECT COUNT(*) FROM system_alerts WHERE source=?", (source,)).fetchone()[0]
     return int(alerts_count) + int(system_count)
+
+
+def fetch_active_alert_types_by_symbol(source, symbols):
+    clean=sorted({str(symbol).upper() for symbol in symbols if symbol})
+    if not clean:return {}
+    placeholders=",".join("?" for _ in clean)
+    with connect() as db:
+        rows=db.execute(f"SELECT symbol,alert_type FROM alerts WHERE source=? AND status='active' AND symbol IN ({placeholders}) ORDER BY symbol,alert_type",
+                        [source,*clean]).fetchall()
+    grouped={}
+    for row in rows:grouped.setdefault(row["symbol"],set()).add(row["alert_type"])
+    return grouped
 
 
 def count_active_alerts_by_symbol(source, symbols):
@@ -1369,39 +1789,100 @@ def fetch_recent_trades(source="ssi", symbol=None, limit=100):
     return [dict(row) for row in reversed(rows)]
 
 
+def latest_trade_timestamp(source="ssi"):
+    """Latest persisted trade receipt time, using the source/time index."""
+    with connect() as db:
+        row=db.execute("SELECT received_at_vn FROM trade_ticks WHERE source=? ORDER BY received_at_vn DESC,id DESC LIMIT 1",(source,)).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def recent_trade_dates(source="ssi", before_date=None, limit=5):
+    """Trading dates with persisted, valid prints, newest first.
+
+    Step backwards through the source/time index instead of DISTINCT over the
+    entire tick table; this stays bounded as the local tick archive grows.
+    """
+    limit=max(1,min(int(limit),30))
+    cutoff=f"{str(before_date)[:10]}T00:00:00" if before_date else "9999-12-31T23:59:59"
+    sql="""SELECT substr(received_at_vn,1,10) AS session_date
+        FROM trade_ticks WHERE source=? AND received_at_vn<?
+        ORDER BY received_at_vn DESC,id DESC LIMIT 1"""
+    dates=[]
+    with connect() as db:
+        for _ in range(limit):
+            row=db.execute(sql,(source,cutoff)).fetchone()
+            if not row or not row["session_date"]:break
+            day=str(row["session_date"])
+            dates.append(day)
+            cutoff=f"{day}T00:00:00"
+    return dates
+
+
+def fetch_trade_value_by_minute(source, board, session_dates):
+    """Aggregate actual SSI trade value by board, session and minute."""
+    dates=sorted({str(day).replace("/","-")[:10] for day in session_dates if day})
+    if not dates:return []
+    start=f"{dates[0]}T00:00:00"
+    end=(datetime.fromisoformat(dates[-1])+timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+    placeholders=",".join("?" for _ in dates)
+    sql=f"""SELECT substr(t.received_at_vn,1,10) AS session_date,
+        substr(t.received_at_vn,12,5) AS minute,
+        SUM(t.price*t.quantity) AS traded_value,
+        COUNT(*) AS trade_count
+        FROM trade_ticks t JOIN securities_catalog c
+          ON c.source=t.source AND c.symbol=t.symbol
+        WHERE t.source=? AND upper(c.board)=? AND lower(c.stock_type)='stock'
+          AND t.validation_status='valid' AND t.received_at_vn>=? AND t.received_at_vn<?
+          AND substr(t.received_at_vn,1,10) IN ({placeholders})
+        GROUP BY session_date,minute ORDER BY session_date,minute"""
+    args=[source,str(board).upper(),start,end,*dates]
+    with connect(timeout=10) as db:rows=db.execute(sql,args).fetchall()
+    return [dict(row) for row in rows]
+
+
 def list_catalog_boards(source="ssi"):
     with connect() as db:
         rows=db.execute("SELECT DISTINCT board FROM securities_catalog WHERE source=? AND board IS NOT NULL ORDER BY board",(source,)).fetchall()
     return [row["board"] for row in rows]
 
 
-def fetch_market_breadth(limit=90, source="ssi", start_date=None, end_date=None):
+def fetch_market_breadth(limit=90, source="ssi", start_date=None, end_date=None, board=None):
     limit=max(2,min(int(limit),10000))
+    selected_board=str(board or "").strip().upper() or None
     with connect() as db:
-        rows=db.execute("""WITH daily AS (
-            SELECT symbol,trading_date,close_price,volume,
-              LAG(close_price) OVER(PARTITION BY symbol ORDER BY trading_date) AS prior_close
-            FROM historical_prices WHERE source=? AND timeframe='1d' AND close_price IS NOT NULL
+        rows=db.execute("""WITH universe AS (
+            SELECT symbol,board FROM securities_catalog
+            WHERE source=? AND lower(trim(stock_type))='stock'
+              AND (? IS NULL OR upper(trim(board))=?)
+        ), daily AS (
+            SELECT h.symbol,h.trading_date,h.close_price,h.volume,
+              LAG(h.close_price) OVER(PARTITION BY h.symbol ORDER BY h.trading_date) AS prior_close
+            FROM historical_prices h JOIN universe u ON u.symbol=h.symbol
+            WHERE h.source=? AND h.timeframe='1d' AND h.close_price IS NOT NULL
         ), breadth AS (
             SELECT trading_date,
               SUM(CASE WHEN close_price>prior_close THEN 1 ELSE 0 END) AS advancing,
               SUM(CASE WHEN close_price<prior_close THEN 1 ELSE 0 END) AS declining,
               SUM(CASE WHEN close_price=prior_close THEN 1 ELSE 0 END) AS unchanged,
-              SUM(COALESCE(volume,0)) AS total_volume
+              SUM(COALESCE(volume,0)) AS total_volume,
+              COUNT(DISTINCT symbol) AS observed_symbols,
+              SUM(CASE WHEN prior_close IS NULL THEN 1 ELSE 0 END) AS no_prior_close,
+              (SELECT COUNT(*) FROM universe) AS total_symbols
             FROM daily WHERE prior_close IS NOT NULL GROUP BY trading_date
         ) SELECT * FROM breadth WHERE (? IS NULL OR replace(trading_date,'/','-')>=?)
           AND (? IS NULL OR replace(trading_date,'/','-')<=?) ORDER BY trading_date DESC LIMIT ?""",
-          (source,start_date,start_date,end_date,end_date,limit)).fetchall()
+          (source,selected_board,selected_board,source,start_date,start_date,end_date,end_date,limit)).fetchall()
     return list(reversed([dict(row) for row in rows]))
 
 
-def fetch_market_ohlc_sessions(limit=60, source="ssi", start_date=None, end_date=None):
+def fetch_market_ohlc_sessions(limit=60, source="ssi", start_date=None, end_date=None, board=None):
     """Aggregate common-stock OHLC using indexed per-symbol date ranges."""
     limit=max(1,min(int(limit),10000))
     # SSI dates are zero-padded YYYY/MM/DD strings; normalize input once to
     # preserve index use on (source,symbol,timeframe,trading_date).
     start_db=str(start_date).replace("-","/")[:10] if start_date else None
     end_db=str(end_date).replace("-","/")[:10] if end_date else None
+    selected_board=str(board or "").strip().upper() or None
     bounded_filters=[]
     range_params=[]
     if start_db:
@@ -1438,6 +1919,7 @@ def fetch_market_ohlc_sessions(limit=60, source="ssi", start_date=None, end_date
     query=f"""WITH securities AS (
           SELECT symbol FROM securities_catalog
           WHERE source=? AND lower(trim(stock_type))='stock'
+            AND (? IS NULL OR upper(trim(board))=?)
         ), bounded AS (
           SELECT h.symbol,h.trading_date,h.value,h.volume,h.fetched_at,h.close_price
           FROM securities s CROSS JOIN historical_prices h
@@ -1461,7 +1943,7 @@ def fetch_market_ohlc_sessions(limit=60, source="ssi", start_date=None, end_date
         )
         SELECT * FROM sessions {final_filter}
         ORDER BY trading_date DESC LIMIT ?"""
-    params=(source,source,*range_params,*prior_params,*final_params,limit)
+    params=(source,selected_board,selected_board,source,*range_params,*prior_params,*final_params,limit)
     with connect() as db:
         rows=db.execute(query,params).fetchall()
     return list(reversed([dict(row) for row in rows]))
@@ -1483,15 +1965,53 @@ def historical_symbols_with_date(trading_date, source="ssi"):
     return {row["symbol"] for row in rows}
 
 
-def historical_session_coverage(trading_date, source="ssi"):
+def historical_session_coverage(trading_date, source="ssi", board=None):
     day=str(trading_date).replace("-","/")[:10]
+    selected_board=str(board or "").strip().upper() or None
     with connect() as db:
         row=db.execute("""SELECT COUNT(DISTINCT h.symbol) present,
-            (SELECT COUNT(*) FROM securities_catalog c WHERE c.source=? AND lower(c.stock_type)='stock') expected
+            (SELECT COUNT(*) FROM securities_catalog c WHERE c.source=? AND lower(c.stock_type)='stock'
+              AND (? IS NULL OR upper(trim(c.board))=?)) expected
             FROM historical_prices h JOIN securities_catalog c ON c.source=h.source AND c.symbol=h.symbol
-            WHERE h.source=? AND h.timeframe='1d' AND h.trading_date=? AND lower(c.stock_type)='stock'""",
-            (source,source,day)).fetchone()
+            WHERE h.source=? AND h.timeframe='1d' AND h.trading_date=? AND lower(c.stock_type)='stock'
+              AND (? IS NULL OR upper(trim(c.board))=?)""",
+            (source,selected_board,selected_board,source,day,selected_board,selected_board)).fetchone()
     return {"present":int(row["present"] or 0),"expected":int(row["expected"] or 0)}
+
+
+def reconcile_session_summaries(source="ssi", session_date=None):
+    """Rebuild stored session bar counts from the authoritative bars_1m rows.
+
+    This repairs summary drift after archive imports or historical bar rebuilds.
+    It intentionally preserves OHLC status and closed_at metadata.
+    """
+    clauses = ["b.source=?", "lower(c.stock_type)='stock'"]
+    args = [source]
+    if session_date:
+        clauses.append("b.session_date=?")
+        args.append(str(session_date).replace("/", "-")[:10])
+    with connect(timeout=30) as db:
+        expected = int(db.execute(
+            "SELECT COUNT(*) FROM securities_catalog WHERE source=? AND lower(stock_type)='stock'",
+            (source,),
+        ).fetchone()[0] or 0)
+        rows = db.execute(f"""SELECT b.session_date,COUNT(*) AS bar_count,
+                COUNT(DISTINCT b.symbol) AS symbol_count
+            FROM bars_1m b JOIN securities_catalog c
+              ON c.source=b.source AND c.symbol=b.symbol
+            WHERE {' AND '.join(clauses)} GROUP BY b.session_date""", args).fetchall()
+        now = datetime.now(config.TIMEZONE).isoformat(timespec="seconds")
+        for row in rows:
+            count = int(row["symbol_count"] or 0)
+            db.execute("""INSERT INTO sessions
+                (session_date,source,status,bar_count,symbol_count,expected_symbols,coverage_ratio,closed_at)
+                VALUES(?,?,'closed_ohlc_pending',?,?,?,?,?)
+                ON CONFLICT(session_date,source) DO UPDATE SET
+                  bar_count=excluded.bar_count,symbol_count=excluded.symbol_count,
+                  expected_symbols=excluded.expected_symbols,coverage_ratio=excluded.coverage_ratio""",
+                (row["session_date"], source, int(row["bar_count"] or 0), count, expected,
+                 count / expected if expected else 0, now))
+    return {"sessions_reconciled": len(rows), "expected_symbols": expected}
 
 
 def record_session_close(session_date, source="ssi"):
@@ -1502,8 +2022,10 @@ def record_session_close(session_date, source="ssi"):
         expected=db.execute("SELECT COUNT(*) FROM securities_catalog WHERE source=? AND lower(stock_type)='stock'",(source,)).fetchone()[0]
         db.execute("""INSERT INTO sessions(session_date,source,status,bar_count,symbol_count,expected_symbols,coverage_ratio,closed_at)
             VALUES(?,?,'closed_ohlc_pending',?,?,?,?,?)
-            ON CONFLICT(session_date,source) DO UPDATE SET status='closed_ohlc_pending',bar_count=excluded.bar_count,
-            symbol_count=excluded.symbol_count,expected_symbols=excluded.expected_symbols,coverage_ratio=excluded.coverage_ratio,closed_at=excluded.closed_at""",
+            ON CONFLICT(session_date,source) DO UPDATE SET
+            status=CASE WHEN sessions.status IN ('complete','ohlc_incomplete') THEN sessions.status ELSE 'closed_ohlc_pending' END,
+            bar_count=excluded.bar_count,symbol_count=excluded.symbol_count,expected_symbols=excluded.expected_symbols,
+            coverage_ratio=excluded.coverage_ratio,closed_at=excluded.closed_at""",
             (session_date,source,int(stats["bars"] or 0),int(stats["symbols"] or 0),int(expected or 0),
              (int(stats["symbols"] or 0)/int(expected)) if expected else 0,datetime.now(config.TIMEZONE).isoformat(timespec="seconds")))
 

@@ -23,10 +23,15 @@ FAVORABLE_SPREAD_PERCENTILE = 25.0
 STRESS_SPREAD_PERCENTILE = 90.0
 FAVORABLE_DEPTH_PERCENTILE = 75.0
 STRESS_DEPTH_PERCENTILE = 10.0
-# P90/P10 tail estimates need enough independent prior sessions in the same phase.
-BASELINE_MIN_OBSERVATIONS = 120
+# Percentile baseline qualification: require 120 distinct completed sessions and
+# at least 120 valid bars. Prefer the same intraday phase; pool the symbol's
+# phases when that phase is sparse. This is a screening convention, not a rule.
+MIN_BASELINE_SESSIONS = 120
 BASELINE_MIN_BARS = 120
+# Historical lookback cap; matches the qualification horizon.
 BASELINE_SESSIONS = 120
+BASELINE_MIN_OBSERVATIONS = BASELINE_MIN_BARS
+PEER_MIN_SIZE = 20
 MIN_BAR_SNAPSHOTS = int(os.getenv("MIN_BAR_SNAPSHOTS", "1"))
 ALERT_CONSECUTIVE_BARS = int(os.getenv("ALERT_CONSECUTIVE_BARS", "3"))
 ALERT_COOLDOWN_MIN = int(os.getenv("ALERT_COOLDOWN_MIN", "15"))
@@ -35,6 +40,7 @@ MIN_BARS_FOR_RANKING = max(1, int(os.getenv("MIN_BARS_FOR_RANKING", os.getenv("R
 # Backward-compatible name retained for existing callers.
 RANKING_MIN_BARS = MIN_BARS_FOR_RANKING
 RANKING_MIN_SNAPSHOTS = max(200, int(os.getenv("RANKING_MIN_SNAPSHOTS", "200")))
+ORDER_COST_LEVELS = max(1, min(10, int(os.getenv("ORDER_COST_LEVELS", "3"))))
 # Alert thresholds alias the same fixed classification thresholds used by watchlists.
 SPREAD_PERCENTILE = STRESS_SPREAD_PERCENTILE
 DEPTH_PERCENTILE = STRESS_DEPTH_PERCENTILE

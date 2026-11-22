@@ -90,7 +90,7 @@ def make_trade(row, session_date):
     }
 
 
-def import_archive(path: Path, catalog: dict[str, dict], dry_run: bool):
+def import_archive(path: Path, catalog: dict[str, dict], dry_run: bool, replay_quotes: bool = False):
     session_date = path.stem
     archive = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=30)
     archive.row_factory = sqlite3.Row
@@ -120,14 +120,14 @@ def import_archive(path: Path, catalog: dict[str, dict], dry_run: bool):
                           "archive_trade_rows": trade_count}, ensure_ascii=False))
         archive.close()
         return
-    if already_imported:
+    if already_imported and not replay_quotes:
         print(json.dumps({"date": session_date, "status": "already_imported", "archive_file": path.name},
                          ensure_ascii=False), flush=True)
         archive.close()
         return
 
     inserted_quotes = duplicate_quotes = invalid_quotes = 0
-    if not existing_bars:
+    if not existing_bars or replay_quotes:
         cursor = archive.execute("SELECT * FROM quote WHERE src!='eod' ORDER BY ts_ms,id")
         batch = []
         scanned = 0
@@ -157,7 +157,11 @@ def import_archive(path: Path, catalog: dict[str, dict], dry_run: bool):
         database.record_session_close(session_date, "ssi")
 
     inserted_trades = 0
-    if trade_count:
+    # Quote recovery must not replay trade rows. The compact daily archive
+    # stores normalized event timestamps, while the primary database's trade
+    # deduplication key includes SSI's original timestamp string; replaying the
+    # archive can therefore create duplicate trade_ticks.
+    if trade_count and not replay_quotes:
         cursor = archive.execute("SELECT * FROM trade ORDER BY ts_ms,id")
         batch = []
         scanned_trades = 0
@@ -207,6 +211,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Chỉ báo cáo độ phủ, không ghi database")
     parser.add_argument("--date", action="append", help="Chỉ nhập các ngày YYYY-MM-DD; có thể truyền nhiều lần")
+    parser.add_argument("--replay-quotes", action="store_true",
+                        help="Đọc lại quote archive dù đã có bar; dữ liệu trùng sẽ được loại bằng payload hash")
     args = parser.parse_args()
     database.initialize()
     catalog = database.fetch_security_metadata("ssi")
@@ -217,7 +223,7 @@ def main():
         selected = set(args.date)
         paths = [path for path in paths if path.stem in selected]
     for path in paths:
-        import_archive(path, catalog, args.dry_run)
+        import_archive(path, catalog, args.dry_run, replay_quotes=args.replay_quotes)
 
 
 if __name__ == "__main__":

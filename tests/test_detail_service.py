@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 from src.sli import detail_service
@@ -43,6 +43,67 @@ def test_detail_does_not_invent_baseline_without_history():
     assert result["baseline_eligible"] is False
     assert result["widgets"]["charts"]["data"]["baseline_sample_count"] == 0
     assert result["widgets"]["kpis"]["data"]["spread_percentile"] is None
+
+
+def _bars_for_baseline(phases_by_day, current_extra=0):
+    rows=[]
+    for day,phase,count in phases_by_day:
+        for index in range(count):
+            hour,minute=(10,index%60) if phase=="MID" else (14,30+index%30) if phase=="CLOSE" else (9,15+index%30)
+            rows.append({"symbol":"FPT","minute_vn":f"{day}T{hour:02d}:{minute:02d}+07:00","session_date":day,
+                         "market":"HOSE","session_phase":"CONTINUOUS_AM" if phase!="CLOSE" else "CONTINUOUS_PM",
+                         "baseline_bucket":phase,"coverage_status":"ok","spread_bps":10+index/100,
+                         "total_depth_value":1_000_000+index,"n_snapshots":3})
+    for index in range(current_extra):
+        rows.append({"symbol":"FPT","minute_vn":f"2026-11-06T14:{index%30:02d}+07:00","session_date":"2026-11-06",
+                     "market":"HOSE","session_phase":"CONTINUOUS_PM","baseline_bucket":"CLOSE",
+                     "coverage_status":"ok","spread_bps":500+index,"total_depth_value":2_000_000+index,"n_snapshots":3})
+    rows.append({"symbol":"FPT","minute_vn":"2026-11-06T14:59+07:00","session_date":"2026-11-06",
+                 "market":"HOSE","session_phase":"CONTINUOUS_PM","baseline_bucket":"CLOSE",
+                 "coverage_status":"ok","spread_bps":12,"total_depth_value":900_000,"n_snapshots":3})
+    return sorted(rows,key=lambda row:row["minute_vn"])
+
+
+def _build_with_bars(bars):
+    as_of=datetime.fromisoformat("2026-11-06T15:00:00+07:00")
+    patches=mocked_storage([sample_quote("2026-11-06T14:59:00+07:00")],bars)
+    with patches[0],patches[1],patches[2],patches[3],patches[4]:
+        return detail_service.build_detail("FPT","ssi",as_of,window_sessions=1)
+
+
+def _baseline_sessions(count,phase,extra_first=0):
+    days=[(date(2026,11,6)-timedelta(days=offset)).isoformat() for offset in range(count,0,-1)]
+    return [(day,phase,1+(extra_first if index==0 else 0)) for index,day in enumerate(days)]
+
+
+def test_baseline_uses_same_phase_when_120_prior_sessions_and_bars_exist():
+    bars=_bars_for_baseline(_baseline_sessions(120,"CLOSE"))
+    result=_build_with_bars(bars)
+    assert result["baseline_eligible"] is True
+    assert result["baseline_mode"]=="same_phase"
+    assert result["baseline_sessions_have"]==120
+    assert result["baseline_bars_have"]==120
+    assert result["baseline_sessions_need"]==120
+    assert result["baseline_bars_need"]==120
+
+
+def test_baseline_pools_phases_for_the_same_symbol_when_current_phase_is_sparse():
+    bars=_bars_for_baseline(_baseline_sessions(120,"MID"))
+    result=_build_with_bars(bars)
+    assert result["baseline_eligible"] is True
+    assert result["baseline_mode"]=="pooled"
+    assert result["baseline_sessions_have"]==120
+    assert result["baseline_bars_have"]==120
+
+
+def test_baseline_needs_120_prior_sessions_and_does_not_look_ahead():
+    # Extra current-session bars cannot replace one missing completed session.
+    bars=_bars_for_baseline(_baseline_sessions(119,"CLOSE",extra_first=1),current_extra=100)
+    result=_build_with_bars(bars)
+    assert result["baseline_eligible"] is False
+    assert result["baseline_mode"]=="insufficient"
+    assert result["baseline_sessions_have"]==119
+    assert result["baseline_bars_have"]==120
 
 
 def test_detail_rejects_non_stock_catalog_entry():

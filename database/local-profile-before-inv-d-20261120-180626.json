@@ -1,0 +1,46 @@
+{
+  "format": "sli-local-profile-pre-inv-d-v1",
+  "settings": {
+    "profile_id": "local",
+    "standard_order_shares": 10000,
+    "favorable_spread_pctl": 25.0,
+    "stress_spread_pctl": 90.0,
+    "favorable_depth_pctl": 75.0,
+    "stress_depth_pctl": 10.0,
+    "quiet_start": "20:05",
+    "quiet_end": "22:05",
+    "notification_channel": "browser",
+    "updated_at": "2026-11-17T19:05:54+07:00"
+  },
+  "watchlists": [
+    {
+      "name": "Danh mục của tôi",
+      "items": [
+        {
+          "symbol": "REE",
+          "note": ""
+        },
+        {
+          "symbol": "ACV",
+          "note": ""
+        },
+        {
+          "symbol": "FPT",
+          "note": ""
+        },
+        {
+          "symbol": "VNM",
+          "note": ""
+        },
+        {
+          "symbol": "PET",
+          "note": ""
+        },
+        {
+          "symbol": "SSI",
+          "note": ""
+        }
+      ]
+    }
+  ]
+}

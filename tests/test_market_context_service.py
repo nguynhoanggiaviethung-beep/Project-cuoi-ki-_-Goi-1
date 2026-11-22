@@ -58,7 +58,10 @@ def test_closed_market_marks_partial_latest_ohlc_pending_and_uses_last_complete_
     ]
     meta = {"state": "CLOSED", "closed_reason": "weekend", "session_date": "2026-11-06",
             "session_sync": {"status": "ohlc_incomplete"}}
-    with patch("src.sli.market_context_service.database.fetch_market_ohlc_sessions", return_value=rows):
+    with patch("src.sli.market_context_service._closed_ohlc_cache", {}), \
+         patch("src.sli.market_context_service.database.fetch_market_ohlc_sessions", return_value=rows), \
+         patch("src.sli.market_context_service.database.historical_session_coverage",
+               return_value={"present": 0, "expected": 1521}):
         result = get_market_turnover(market_meta=meta)
 
     assert result["pending_session_date"] == "2026-11-06"

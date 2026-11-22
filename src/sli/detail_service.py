@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from statistics import median
 
 from . import config, database
+from .analytics import percentile_rank, quantile
 from .market_rules import session_phase
 from .ranking import is_rankable_stock
 
@@ -93,7 +94,7 @@ def _independent(fn):
         return {"status": "unavailable", "data": None, "message": "Khối dữ liệu hiện chưa khả dụng."}
 
 
-def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=None, to_date=None):
+def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=None, to_date=None, watchlist_mode=False):
     """Build all detail widgets from persisted metrics/bars using one snapshot clock."""
     as_of = as_of or datetime.now(config.TIMEZONE)
     if as_of.tzinfo is None:
@@ -130,9 +131,12 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=
     if one_sided and state in {"quote", "stale", "outside_session"}:
         state = "one_sided"
 
-    history_load = _independent(lambda: database.fetch_historical_prices(ticker, limit=1000, source="ssi"))
-    alert_load = _independent(lambda: [item for item in database.fetch_alerts(source, limit=500)
-                                      if item.get("symbol") == ticker and item.get("status") == "active"])
+    # The watchlist needs only recent closes; the detail page keeps full history.
+    # Avoid reading unrelated symbols' alert rows once per watchlist row.
+    history_limit = 25 if watchlist_mode else 1000
+    history_load = _independent(lambda: database.fetch_historical_prices(ticker, limit=history_limit, source="ssi"))
+    alert_load = _independent(lambda: [item for item in database.fetch_alerts(source, limit=500, symbol=ticker)
+                                      if item.get("status") == "active"])
     bar_start=f"{from_date}T00:00:00" if from_date else None
     bar_end=f"{to_date}T23:59:59" if to_date else None
     bars_load = _independent(lambda: database.fetch_bars(source, symbol=ticker, limit=50000,
@@ -156,28 +160,40 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=
         baseline_sessions=set([day for day in sessions if day<from_date][:config.BASELINE_SESSIONS])
     else:
         baseline_sessions = set(sessions[max(1, min(int(window_sessions), 20)):][:config.BASELINE_SESSIONS])
-    baseline = [bar for bar in bars if str(bar.get("session_date")) in baseline_sessions
-                and bar.get("coverage_status") == "ok"
-                and bar.get("baseline_bucket") == current_bucket
-                and (not market or bar.get("market") == market)]
-    spread_sessions={str(bar.get("session_date")) for bar in baseline if bar.get("spread_bps") is not None}
-    depth_sessions={str(bar.get("session_date")) for bar in baseline if bar.get("total_depth_value") is not None}
-    baseline_session_count=len(spread_sessions & depth_sessions)
-    spread_values = sorted(float(b["spread_bps"]) for b in baseline if b.get("spread_bps") is not None)
-    depth_values = sorted(float(b["total_depth_value"]) for b in baseline if b.get("total_depth_value") is not None)
-    baseline_eligible=(baseline_session_count>=config.BASELINE_SESSIONS
-                       and len(spread_values)>=config.BASELINE_MIN_BARS
-                       and len(depth_values)>=config.BASELINE_MIN_BARS)
+    baseline_candidates = [bar for bar in bars if str(bar.get("session_date")) in baseline_sessions
+                           and bar.get("coverage_status") == "ok"
+                           and (not market or bar.get("market") == market)
+                           and bar.get("spread_bps") is not None
+                           and bar.get("total_depth_value") is not None]
+
+    def qualifies(rows):
+        days = {str(row.get("session_date")) for row in rows if row.get("session_date")}
+        return (len(days), len(rows))
+
+    same_phase_rows = [bar for bar in baseline_candidates
+                       if current_bucket is not None and bar.get("baseline_bucket") == current_bucket]
+    same_phase_sessions, same_phase_bars = qualifies(same_phase_rows)
+    min_sessions = int(getattr(config, "MIN_BASELINE_SESSIONS", config.BASELINE_SESSIONS))
+    min_bars = int(config.BASELINE_MIN_BARS)
+    if same_phase_sessions >= min_sessions and same_phase_bars >= min_bars:
+        baseline, baseline_mode = same_phase_rows, "same_phase"
+    else:
+        pooled_rows = [bar for bar in baseline_candidates if bar.get("baseline_bucket")]
+        pooled_sessions, pooled_bars = qualifies(pooled_rows)
+        if pooled_sessions >= min_sessions and pooled_bars >= min_bars:
+            baseline, baseline_mode = pooled_rows, "pooled"
+        else:
+            baseline, baseline_mode = [], "insufficient"
+    baseline_session_count, baseline_bar_count = qualifies(baseline)
+    spread_values = sorted(float(b["spread_bps"]) for b in baseline)
+    depth_values = sorted(float(b["total_depth_value"]) for b in baseline)
+    baseline_eligible = bool(baseline)
     def percentile(values, p):
-        if not values:
-            return None
-        return values[round((len(values) - 1) * p)]
+        return quantile(values,p*100)
     spread = (latest or {}).get("spread_bps")
-    spread_percentile = (sum(value <= float(spread) for value in spread_values) / len(spread_values) * 100
-                         if spread is not None and spread_values else None)
+    spread_percentile = percentile_rank(spread_values,spread)
     depth = (latest or {}).get("total_depth_value")
-    depth_percentile = (sum(value <= float(depth) for value in depth_values) / len(depth_values) * 100
-                        if depth is not None and depth_values else None)
+    depth_percentile = percentile_rank(depth_values,depth)
     active_alerts = alert_load["data"] or []
     latest_price = price_rows[-1] if price_rows else None
     prior_price = price_rows[-2] if len(price_rows) > 1 else None
@@ -223,6 +239,11 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=
         "snapshot_count": len(rows), "valid_snapshot_count": len(valid),
         "baseline_eligible": baseline_eligible,
         "baseline_session_count": baseline_session_count,
+        "baseline_mode": baseline_mode,
+        "baseline_sessions_have": baseline_session_count if baseline_eligible else max(same_phase_sessions, pooled_sessions if 'pooled_sessions' in locals() else 0),
+        "baseline_sessions_need": min_sessions,
+        "baseline_bars_have": baseline_bar_count if baseline_eligible else max(same_phase_bars, pooled_bars if 'pooled_bars' in locals() else 0),
+        "baseline_bars_need": min_bars,
         "widgets": {},
     }
     result["widgets"]["company"] = _independent(lambda: {"name": metadata.get("name_vi"), "board": market})
@@ -244,6 +265,11 @@ def build_detail(symbol, source="ssi", as_of=None, window_sessions=5, from_date=
         "depth_curve": depth_curve, "levels_used": depth_curve["levels_used"],
         "baseline_sample_count": len(baseline), "baseline_eligible": baseline_eligible,
         "baseline_session_count": baseline_session_count,
+        "baseline_mode": baseline_mode,
+        "baseline_sessions_have": result["baseline_sessions_have"],
+        "baseline_sessions_need": min_sessions,
+        "baseline_bars_have": result["baseline_bars_have"],
+        "baseline_bars_need": min_bars,
         "spread_baseline_p25": percentile(spread_values, .25) if baseline_eligible else None,
         "spread_baseline_p90": percentile(spread_values, .90) if baseline_eligible else None,
     })

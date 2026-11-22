@@ -3,8 +3,9 @@ import unittest
 from pathlib import Path
 
 from src.sli import config, database
-from src.sli.analytics import calculate_metrics, map_message, quantile, validate_observation
-from src.sli.bookwalk import estimate
+from src.sli.api import _derive_pipeline_state
+from src.sli.analytics import calculate_metrics, map_message, percentile_rank, quantile, validate_observation
+from src.sli.bookwalk import estimate, book_walk_by_value, max_order_within_threshold
 from src.sli.market_rules import baseline_bucket, session_phase, tick_size
 from src.sli.worker_lock import CollectorWorkerLock, WorkerAlreadyRunning
 
@@ -106,8 +107,57 @@ class BackendCoreTests(unittest.TestCase):
         self.assertEqual(partial["status"], "partial_exceeds_visible_depth")
         self.assertEqual(partial["fill_ratio"], 0.6)
 
+    def test_bookwalk_by_value_and_threshold_matches_inv_d_appendix(self):
+        asks=[(101_000,800),(101_500,1_200),(102_000,1_500)]
+        bids=[(99_000,1_000),(98_500,1_500),(98_000,2_000)]
+        result=book_walk_by_value(asks,202_600_000,100_000,"buy")
+        self.assertEqual(result["status"],"full")
+        self.assertEqual(result["filled_value"],202_600_000)
+        self.assertEqual(result["vwap"],101_300)
+        self.assertAlmostEqual(result["slippage_bps"],130)
+        self.assertEqual(result["fill_ratio"],1)
+        partial=book_walk_by_value(asks,500_000_000,100_000,"buy")
+        self.assertEqual(partial["status"],"partial_exceeds_visible_depth")
+        self.assertEqual(partial["filled_value"],355_600_000)
+        self.assertEqual(partial["visible_depth_value"],355_600_000)
+        maximum=max_order_within_threshold(asks,100_000,"buy",150)
+        self.assertEqual(maximum["shares"],2_800)
+        self.assertEqual(maximum["value"],284_200_000)
+        self.assertFalse(maximum["full_depth"])
+        sold=book_walk_by_value(bids,202_600_000,100_000,"sell")
+        self.assertEqual(sold["status"],"full")
+        self.assertEqual(sold["levels_used"],2)
+        self.assertGreater(sold["slippage_bps"],0)
+        sell_max=max_order_within_threshold(bids,100_000,"sell",150)
+        self.assertEqual(sell_max["shares"],3_500)
+        self.assertEqual(sell_max["value"],344_750_000)
+        too_small=book_walk_by_value(asks,1_000_000,100_000,"buy")
+        self.assertEqual(too_small["status"],"unavailable")
+        zero=max_order_within_threshold(asks,100_000,"buy",0)
+        self.assertTrue(zero["zero"])
+        self.assertEqual(zero["shares"],0)
+
+    def test_bookwalk_cash_examples_and_visible_depth_limit(self):
+        levels=[(45_250,8_000),(45_300,12_000),(45_350,15_000)]
+        mid=45_225
+        small=book_walk_by_value(levels,50_000_000,mid,"buy")
+        self.assertEqual(small["status"],"full")
+        self.assertLessEqual(abs(small["slippage_bps"]-5.5),0.2)
+        large=book_walk_by_value(levels,500_000_000,mid,"buy")
+        self.assertEqual(large["status"],"full")
+        self.assertLessEqual(abs(large["slippage_bps"]-8.5),0.2)
+        low_price=book_walk_by_value([(8_350,10_000),(8_360,15_000),(8_370,20_000)],500_000_000,8_340,"buy")
+        self.assertEqual(low_price["status"],"partial_exceeds_visible_depth")
+        self.assertLess(low_price["filled_value"],500_000_000)
+        odd_lot=book_walk_by_value([(10_000,199)],999_999,10_000,"buy")
+        self.assertEqual(odd_lot["status"],"unavailable")
+        no_side=book_walk_by_value([],50_000_000,45_225,"buy")
+        self.assertEqual(no_side["status"],"unavailable")
+
     def test_quantile_linear_interpolation(self):
         self.assertEqual(quantile([0, 10, 20, 30], 50), 15)
+        self.assertEqual(percentile_rank([0, 10, 20, 30], 15), 50)
+        self.assertEqual(percentile_rank([0, 10, 10, 20], 10), 50)
 
     def test_database_schema_and_state_change_dedup(self):
         original = config.DB_PATH
@@ -148,18 +198,76 @@ class BackendCoreTests(unittest.TestCase):
                 database.update_collector_heartbeat(run_id, {
                     "connection_status": "connected", "messages_received": 7,
                     "rows_valid": 6, "rows_invalid": 1, "last_message_at": "2026-11-06T10:00:00+07:00",
+                    "subscription_status": "confirmed", "subscription_topics": ["quote.hose"],
+                    "subscribed_boards": ["HOSE"], "subscription_ack_count": 1,
+                    "quote_persistence_status": "saved", "last_persisted_at": "2026-11-06T10:00:01+07:00",
+                    "trade_subscription_status": "partial", "trade_subscription_topics": ["trade.hose"],
+                    "trade_persistence_status": "saved", "trade_messages_received": 3,
+                    "trade_messages_saved": 2, "last_trade_received_at": "2026-11-06T10:00:00+07:00",
+                    "last_trade_persisted_at": "2026-11-06T10:00:01+07:00", "queue_depth": 0,
                 })
                 run = database.latest_collector_run()
                 self.assertEqual(run["worker_id"], "worker-test")
                 self.assertEqual(run["process_id"], 1234)
                 self.assertEqual(run["connection_status"], "connected")
                 self.assertEqual(run["messages_received"], 7)
+                self.assertEqual(run["subscription_status"], "confirmed")
+                self.assertEqual(run["subscription_ack_count"], 1)
+                self.assertEqual(run["quote_persistence_status"], "saved")
+                self.assertEqual(run["last_persisted_at"], "2026-11-06T10:00:01+07:00")
+                self.assertEqual(run["trade_messages_saved"], 2)
                 self.assertIsNotNone(run["heartbeat_at"])
                 self.assertEqual(database.close_abandoned_collector_runs(), 1)
                 run = database.latest_collector_run()
                 self.assertEqual(run["status"], "abandoned")
                 self.assertIsNotNone(run["ended_at"])
                 self.assertEqual(database.close_abandoned_collector_runs(), 0)
+            finally:
+                config.DB_PATH = original
+
+    def test_realtime_health_requires_every_pipeline_stage(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 11, 20, 4, 0, tzinfo=timezone.utc)
+        recent = "2026-11-20T11:59:50+07:00"
+        common = dict(expected_stream=True, worker_active=True, connection_status="connected",
+                      subscription_status="confirmed", received_at=recent, persisted_at=recent,
+                      received_count=1, valid_count=1, persistence_status="saved",
+                      queue_depth=0, queue_dropped=0, database_busy=False, now=now)
+        result = _derive_pipeline_state(**common)
+        self.assertEqual(result["state"], "live")
+        self.assertTrue(result["verified"])
+        self.assertTrue(all(result["checks"].values()))
+
+        result = _derive_pipeline_state(**{**common, "subscription_status": "unverified"})
+        self.assertEqual(result["state"], "subscription_unverified")
+        self.assertFalse(result["verified"])
+        result = _derive_pipeline_state(**{**common, "received_at": None, "received_count": 0})
+        self.assertEqual(result["state"], "awaiting_quote")
+        result = _derive_pipeline_state(**{**common, "persisted_at": None, "persistence_status": "writing"})
+        self.assertEqual(result["state"], "awaiting_persistence")
+        result = _derive_pipeline_state(**{**common, "persistence_status": "failed"})
+        self.assertEqual(result["state"], "persistence_error")
+        result = _derive_pipeline_state(**{**common, "queue_dropped": 1})
+        self.assertEqual(result["state"], "degraded")
+        result = _derive_pipeline_state(**{**common, "expected_stream": False})
+        self.assertEqual(result["state"], "outside_session")
+
+    def test_inv_c_positions_migration_is_additive_and_idempotent(self):
+        original = config.DB_PATH
+        with tempfile.TemporaryDirectory() as folder:
+            config.DB_PATH = Path(folder) / "profile.sqlite3"
+            try:
+                with database.connect() as db:
+                    db.execute("CREATE TABLE watchlists(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+                    db.execute("INSERT INTO watchlists(id,name) VALUES(1,'Existing')")
+                self.assertTrue(database.migrate_inv_c_positions())
+                self.assertFalse(database.migrate_inv_c_positions())
+                with database.connect() as db:
+                    columns = {row[1] for row in db.execute("PRAGMA table_info(portfolio_positions)")}
+                    self.assertTrue({"symbol", "shares", "average_cost", "opened_on", "note"}.issubset(columns))
+                    self.assertEqual(db.execute("SELECT name FROM watchlists WHERE id=1").fetchone()[0], "Existing")
+                position_id = database.add_local_position("FPT", 1000, 100000, "2026-11-20", "test")
+                self.assertEqual(database.fetch_local_positions()[0]["id"], position_id)
             finally:
                 config.DB_PATH = original
 
@@ -175,10 +283,14 @@ class BackendCoreTests(unittest.TestCase):
     def test_completed_session_baseline_triggers_combined_alert(self):
         original_path = config.DB_PATH
         original_min = config.BASELINE_MIN_BARS
+        original_sessions = config.BASELINE_SESSIONS
+        original_min_sessions = config.MIN_BASELINE_SESSIONS
         original_k = config.ALERT_CONSECUTIVE_BARS
         with tempfile.TemporaryDirectory() as folder:
             config.DB_PATH = Path(folder) / "alerts.sqlite3"
             config.BASELINE_MIN_BARS = 2
+            config.BASELINE_SESSIONS = 1
+            config.MIN_BASELINE_SESSIONS = 1
             config.ALERT_CONSECUTIVE_BARS = 1
             try:
                 database.initialize()
@@ -211,6 +323,8 @@ class BackendCoreTests(unittest.TestCase):
             finally:
                 config.DB_PATH = original_path
                 config.BASELINE_MIN_BARS = original_min
+                config.BASELINE_SESSIONS = original_sessions
+                config.MIN_BASELINE_SESSIONS = original_min_sessions
                 config.ALERT_CONSECUTIVE_BARS = original_k
 
 

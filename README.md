@@ -31,10 +31,11 @@ Stock Liquidity Intelligence (SLI) giúp nhà đầu tư quan sát điều kiệ
 
 ```text
 .
-├── app.py                   # Điểm khởi chạy FastAPI/Uvicorn
+├── app.py                   # Backend FastAPI/Uvicorn và API dữ liệu
+├── streamlit_app.py         # Giao diện người dùng Streamlit
 ├── src/sli/                 # API, lịch phiên, collector, phân tích và SQLite
 ├── frontend/                # Dashboard HTML, CSS, JavaScript và tài nguyên tĩnh
-├── scripts/                 # Worker SSI, tác vụ Windows và công cụ kiểm tra dữ liệu
+├── scripts/                 # Worker SSI, tác vụ Windows, launcher Streamlit và công cụ dữ liệu
 ├── tests/                   # Kiểm thử các logic backend
 ├── database/                # SQLite cục bộ (không đưa dữ liệu runtime lên GitHub)
 ├── docs/images/             # Hình minh họa kiến trúc và repository
@@ -58,7 +59,7 @@ Mở PowerShell tại thư mục gốc repository (thư mục có `app.py`).
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.lock
+.\.venv\Scripts\python.exe -m pip install -r requirements-streamlit.txt
 ```
 
 Nếu `.venv` đã tồn tại và hoạt động, bỏ qua lệnh tạo môi trường. Có thể dùng `requirements.txt` nếu muốn cài các phiên bản tương thích thay vì các phiên bản đã khóa.
@@ -74,26 +75,48 @@ notepad .env
 
 Điền khóa vào `SSI_API_KEY` và `SSI_API_SECRET`. Giữ `DB_PATH=database/sli.sqlite3` nếu muốn dùng database mặc định. **Không commit `.env`, khóa SSI hoặc các file SQLite lên GitHub.** Các file này đã được đưa vào `.gitignore`.
 
-### 4. Khởi chạy web
+### 4. Khởi chạy hệ thống (giao diện Streamlit)
+
+Mở PowerShell tại thư mục dự án:
+
+```powershell
+cd C:\Project-cuoi-ki-_-Goi-1
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\scripts\run_streamlit.ps1
+```
+
+Launcher kiểm tra sức khỏe FastAPI ở cổng 8000. Nếu backend chưa chạy, launcher khởi động FastAPI ở chế độ nền; FastAPI phục vụ API và tự yêu cầu chạy collector SSI thành tiến trình worker riêng khi `.env` có đủ khóa. Sau đó launcher mở giao diện Streamlit tại <http://127.0.0.1:8501/>. Nếu API hoặc Streamlit đã chạy khỏe mạnh, launcher dùng lại tiến trình đó, không tạo bản trùng.
+
+Địa chỉ sử dụng:
+
+- <http://127.0.0.1:8501/>: giao diện Streamlit khuyên dùng; mặc định nhúng nguyên dashboard hiện có để giữ giao diện và tương tác.
+- <http://127.0.0.1:8000/>: mở trực tiếp dashboard FastAPI, không qua lớp Streamlit.
+- <http://127.0.0.1:8000/api/status>: trạng thái backend, feed và độ mới dữ liệu.
+
+Nếu muốn chạy trực tiếp dashboard FastAPI thay vì mở giao diện Streamlit, dùng lệnh sau trong PowerShell (chỉ chạy khi cổng 8000 chưa có backend):
 
 ```powershell
 .\.venv\Scripts\python.exe app.py
 ```
 
-Mở <http://127.0.0.1:8000/>. Giữ cửa sổ terminal chạy web mở. Khi có đủ hai khóa SSI, backend sẽ tự khởi chạy worker nền. Trạng thái kiểm tra tại:
+Sau đó mở <http://127.0.0.1:8000/>. Cửa sổ này chạy backend ở foreground; nhấn `Ctrl+C` sẽ dừng web API. Collector SSI chạy riêng, nhưng nên kiểm tra `/api/collector/runs` sau khi khởi động lại để xác nhận worker vẫn hoạt động.
+
+Nút **Làm mới dữ liệu** xóa cache giao diện và tải lại từ API. Trạng thái backend:
 
 - <http://127.0.0.1:8000/api/status>
 - <http://127.0.0.1:8000/api/market-clock>
 - <http://127.0.0.1:8000/api/quality>
 - <http://127.0.0.1:8000/api/collector/runs>
 
-Nếu worker chưa chạy, có thể mở terminal thứ hai để khởi động thủ công:
+Dừng giao diện bằng `Ctrl+C` trong cửa sổ Streamlit. Backend và collector tiếp tục chạy nền để không làm gián đoạn thu thập.
+
+Nếu `/api/status` báo worker chưa chạy dù `.env` có đủ khóa, kiểm tra log `logs\ssi_worker.log` và trạng thái tại `/api/collector/runs` trước. Chỉ khởi động thủ công khi đã xác nhận không có collector đang chạy:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\ssi_worker.py
 ```
 
-Worker có khóa chống chạy trùng. Trước khi chạy thủ công, kiểm tra `/api/status` để tránh mở thêm worker không cần thiết. Nhấn `Ctrl+C` trong terminal của worker để dừng worker; nhấn `Ctrl+C` trong terminal web để dừng web.
+Worker có khóa chống chạy trùng. Không chạy lệnh worker chỉ vì trang hoặc tab tải chậm. Nhấn `Ctrl+C` trong terminal chạy Streamlit chỉ dừng giao diện Streamlit; FastAPI nền và collector worker vẫn tiếp tục. Đóng tab trình duyệt cũng không dừng hai tiến trình này. Khi FastAPI khởi động, nó kiểm tra PID worker hiện có trước khi yêu cầu collector chạy để tránh tạo worker trùng.
 
 ### Tự khởi chạy collector khi đăng nhập Windows
 
@@ -110,25 +133,11 @@ Task Scheduler không lưu khóa SSI; worker đọc `.env`. Gỡ tác vụ:
 Unregister-ScheduledTask -TaskName "Stock Liquidity Intelligence - SSI Collector" -Confirm:$false
 ```
 
-## Nếu cổng 8000 đang được sử dụng
+## Nếu cổng 8000 hoặc 8501 đang được sử dụng
 
-`WinError 10048` nghĩa là một tiến trình đã chiếm `127.0.0.1:8000`; thường web cũ vẫn đang chạy. Mở <http://127.0.0.1:8000/> trước. Nếu cần khởi động lại, dừng web trong terminal cũ bằng `Ctrl+C`, rồi chạy lại một lần.
+Cổng 8000 dành cho FastAPI backend; cổng 8501 dành cho Streamlit. Launcher kiểm tra sức khỏe trước khi mở và không tự dừng tiến trình đang giữ cổng. Nếu Streamlit đang chạy, dùng <http://127.0.0.1:8501/>. Nếu backend không phản hồi nhưng cổng 8000 vẫn bị chiếm, kiểm tra tiến trình trước; không dừng `ssi_worker.py` hoặc backend đang thu dữ liệu.
 
-Để tìm tiến trình giữ cổng:
-
-```powershell
-netstat -ano | findstr :8000
-tasklist /FI "PID eq <PID>"
-```
-
-Chỉ dừng tiến trình sau khi xác nhận đó là web của dự án. Nếu muốn dùng cổng khác:
-
-```powershell
-$env:SLI_PORT = "8001"
-.\.venv\Scripts\python.exe app.py
-```
-
-Sau đó mở <http://127.0.0.1:8001/>.
+Nếu FastAPI đang phản hồi ở cổng 8000, chạy `scripts\run_streamlit.ps1`; launcher sẽ dùng lại backend đó và không restart nó. Restart FastAPI làm giao diện/API gián đoạn ngắn, nhưng collector là tiến trình riêng nên vẫn chạy và ghi database. Khi backend lên lại, nó kiểm tra PID worker để tránh khởi chạy trùng. Cổng Streamlit có thể đổi khi chạy trực tiếp, ví dụ `.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py --server.port 8502`; nếu API không ở `127.0.0.1:8000`, đặt `SLI_API_BASE` và `SLI_WEB_BASE` tương ứng trong môi trường Streamlit.
 
 ## Đồng bộ lịch sử và vận hành dữ liệu
 
@@ -137,6 +146,32 @@ Sau đó mở <http://127.0.0.1:8001/>.
 - Quote và trade được lưu trong database chính và kho SQLite theo ngày. Các biểu đồ đọc dữ liệu đã chuẩn hóa trong database chính.
 - Khi database không có bar cho một mã/phút, điều đó không tự động có nghĩa là lỗi ghi: nguồn có thể không gửi cập nhật cho mã đó trong phút ấy.
 - Lịch sử xếp hạng, spread và độ sâu phụ thuộc vào dữ liệu thực tế đã thu thập. Không thể khôi phục dữ liệu WebSocket của những phiên máy không chạy collector.
+
+### Đối soát độ phủ bar của các phiên đã lưu
+
+Nếu số bar_count/symbol_count trong bảng sessions không khớp với bars_1m sau khi nhập kho ngày hoặc dựng lại bar, chạy lệnh bảo trì sau trong PowerShell. Lệnh chỉ cập nhật bảng tổng hợp phiên, không xóa bar/OHLC và không dừng collector:
+
+~~~powershell
+.\.venv\Scripts\python.exe scripts\reconcile_session_summaries.py
+~~~
+
+Độ phủ sổ lệnh (bar) và độ phủ OHLC là hai phép đo riêng. Nguồn SSI gửi quote theo sự kiện nên ứng dụng không thể bảo đảm 100% mọi mã/phút nếu nhà cung cấp không gửi dữ liệu; dashboard phải báo tỷ lệ thực tế thay vì nội suy dữ liệu thiếu.
+
+### Xác minh luồng realtime và ghi database
+
+`/api/status` và `/api/quality` báo riêng trạng thái quote và trade. Chỉ trạng thái `live` / `realtime_verified=true` mới có nghĩa là worker còn sống, socket đã nối, SSI xác nhận đăng ký đủ kênh, đã nhận message mới, đã ghi ít nhất một bản ghi hợp lệ vào SQLite, database không bận và hàng đợi không có message bị rớt. `connected` một mình chỉ xác nhận socket, không chứng minh dữ liệu đang đến hoặc đã được lưu. Các trạng thái `subscription_unverified`, `awaiting_quote`, `awaiting_persistence`, `persistence_error`, `persistence_stale` và `degraded` chỉ rõ mắt xích cần xử lý; quote và trade được đánh giá độc lập. Ngoài giờ giao dịch liên tục, hệ thống báo `outside_session` và hiển thị mốc dữ liệu gần nhất thay vì gọi dữ liệu cũ là LIVE.
+
+Trang **Dữ liệu & phương pháp** hiển thị đăng ký sàn/kênh, ACK, message, mốc ghi DB, độ dài hàng đợi và số message rớt. Cơ chế health đọc snapshot heartbeat đã lấy nền, không quét lịch sử hay chờ truy vấn biểu đồ trong request giao diện. Các cột health mới được thêm bằng migration khi collector/backend khởi động lần kế tiếp; không tự chạy migration giữa một phiên thu dữ liệu.
+
+Schema INV-C `portfolio_positions` được tạo bằng migration bổ sung khi FastAPI backend khởi động; migration không chạy full bootstrap hoặc đổi chế độ WAL của database lịch sử. Worker SSI chạy tách tiến trình, nên cập nhật backend để nạp route không yêu cầu khởi chạy lại worker. Hồ sơ vị thế được lưu cục bộ và bắt đầu rỗng; người dùng tự thêm vị thế thật, ứng dụng không tạo dữ liệu danh mục mẫu.
+
+### Quy tắc baseline phân vị
+
+Nhãn thuận lợi/căng thẳng dùng phân vị lịch sử riêng theo mã và cùng pha trong ngày. Chỉ tính khi có ít nhất 120 phiên hoàn tất và tối thiểu 120 bar hợp lệ; nếu cùng pha chưa đủ mẫu, hệ thống gộp các pha hợp lệ của chính mã đó nhưng vẫn yêu cầu đủ 120 phiên. Dưới ngưỡng này, giao diện phải báo thiếu baseline và không gán nhãn. Đây là quy ước sàng lọc của đồ án, không phải ngưỡng bắt buộc của HOSE/HNX/UPCoM.
+
+### Phân tích vị thế INV-C
+
+Trang Danh mục của tôi → Vị thế đang nắm giữ lưu số cổ phiếu, giá vốn, ngày mua và ghi chú trong SQLite cục bộ. Số phiên thoát ước tính được tính bằng số cổ phiếu / (ADV20 × tỷ lệ tham gia); cần đủ 20 phiên OHLC có khối lượng. Tỷ lệ tham gia mặc định 10%, người dùng có thể chọn 5–30%. Mô phỏng bán theo bid dùng snapshot SSI và tối đa ba mức hiển thị; kết quả không phải cam kết khớp lệnh và hệ thống không gửi lệnh.
 
 ## Cấu hình thường dùng
 
@@ -161,3 +196,11 @@ Cài thêm công cụ phát triển nếu cần:
 ```
 
 Các kiểm thử không cần khóa SSI; việc lấy dữ liệu thật cần thông tin xác thực FastConnect hợp lệ trong `.env`.
+
+## Giao diện Streamlit
+
+Streamlit tại cổng 8501 là giao diện khuyên dùng. Ở cấu hình mặc định, `streamlit_app.py` nhúng dashboard FastAPI tại cổng 8000 để giữ nguyên toàn bộ giao diện và tương tác. Có thể mở trực tiếp cổng 8000 nếu muốn bỏ lớp Streamlit; cả hai địa chỉ dùng chung API và database, không tạo hai bộ dữ liệu riêng. Khởi động hằng ngày bằng `scripts\run_streamlit.ps1`.
+
+Các trang Streamlit gồm tổng quan, danh mục cục bộ, chi tiết mã, xếp hạng, lịch sử cảnh báo và trạng thái/chất lượng dữ liệu. Những phép tính nặng chỉ tải khi người dùng mở hoặc yêu cầu trang tương ứng. Trong phiên, phần biểu đồ được làm mới định kỳ và cache ngắn; ngoài phiên, giao diện đọc lịch sử đã lưu với cache dài hơn. Nút làm mới chủ động xóa cache.
+
+Tắt Streamlit không dừng FastAPI hay collector. Backend và database không bị thay thế; Streamlit đọc/ghi hồ sơ người dùng qua API hiện có và không tự ghi vào SQLite.
