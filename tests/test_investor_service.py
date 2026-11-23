@@ -147,16 +147,15 @@ def test_local_watchlist_schema_is_additive_and_item_order_is_preserved(tmp_path
         assert db.execute("SELECT value FROM preserved_user_data").fetchone()[0] == "kept"
 
 
-def test_empty_local_watchlists_get_a_persistent_default_list(monkeypatch):
+def test_empty_local_watchlists_read_does_not_write_default_list(monkeypatch):
     state={"lists":[]}
     def fetch():return list(state["lists"])
     def create(name):state["lists"].append({"id":1,"name":name,"items":[],"item_count":0});return 1
     monkeypatch.setattr(database,"fetch_local_watchlists",fetch)
     monkeypatch.setattr(database,"create_local_watchlist",create)
     result=api.local_watchlists()
-    assert result["watchlists"][0]["name"]=="Danh mục của tôi"
-    assert api.local_watchlists()["watchlists"][0]["id"]==1
-    assert len(state["lists"])==1
+    assert result["watchlists"]==[]
+    assert state["lists"]==[]
 
 
 def test_deepest_starter_symbols_come_only_from_saved_valid_ssi_bars(tmp_path,monkeypatch):

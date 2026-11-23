@@ -262,36 +262,10 @@ function table(headers, rows, emptyText = "Chưa có dữ liệu.") {
 function statusCell(label, value) {
   return '<div class="status-cell"><small>' + escapeHtml(label) + '</small><strong>' + escapeHtml(value ?? "—") + '</strong></div>';
 }
-let collectorEnsureInFlight = false;
-let collectorEnsureAttemptAt = 0;
-function ensureCollectorOnPageLoad(data) {
-  if (!["live", "ssi"].includes(data.source)) return;
-  if (data.status_db_busy) return;
-  if (data.worker_process_alive) return;
-  if (localStorage.getItem("sli-collector-manually-stopped") === "1") return;
-  const heartbeatFresh = data.worker_status === "running" &&
-    Number(data.worker_heartbeat_age_seconds ?? Infinity) <= 15;
-  if (heartbeatFresh || collectorEnsureInFlight || Date.now() - collectorEnsureAttemptAt < 60000) return;
-  collectorEnsureInFlight = true;
-  collectorEnsureAttemptAt = Date.now();
-  api("/api/collector/start", { method: "POST" })
-    .then((result) => {
-      if (result?.ok) {
-        window.setTimeout(refreshStatus, 1200);
-      } else {
-        connectionStatusTimer = window.setTimeout(refreshStatus, 10000);
-      }
-    })
-    .catch(() => {
-      connectionStatusTimer = window.setTimeout(refreshStatus, 10000);
-    })
-    .finally(() => { collectorEnsureInFlight = false; });
-}
 async function refreshStatus() {
   try {
     const data = await api("/api/status");
     state.status = data;
-    ensureCollectorOnPageLoad(data);
     clearTimeout(connectionStatusTimer);
     window.MarketClock.update(data.meta||data);
     state.source = data.source;
@@ -316,12 +290,14 @@ async function refreshStatus() {
     const ohlcSync=clock.session_sync||data.session_sync||{};
     const syncCoverage=ohlcSync.ohlc_expected?` · ${fmt(ohlcSync.ohlc_symbols||0,0)}/${fmt(ohlcSync.ohlc_expected,0)} mã`:"";
     const syncLabel=(ohlcSync.status&&ohlcSync.status!=='complete'&&ohlcSync.status!=='not_started')?` · OHLC chưa đồng bộ${syncCoverage}`:"";
-    const marketMessage=marketState==="IN_SESSION"?`Trong phiên · ${fmtDate(latestOhlcDate)} · cập nhật mỗi ${clock.refresh_seconds||5} giây`:
-      marketState==="LUNCH_BREAK"?`Nghỉ trưa · OHLC gần nhất ${fmtDate(latestOhlcDate)} · dữ liệu đến 11:30`:
+    const liveSessionDate=clock.session_date||data.session_date||latestOhlcDate;
+    const marketMessage=marketState==="IN_SESSION"?`Trong phiên · ${fmtDate(liveSessionDate)} · OHLC gần nhất ${fmtDate(latestOhlcDate)} · cập nhật mỗi ${clock.refresh_seconds||5} giây`:
+      marketState==="LUNCH_BREAK"?`Nghỉ trưa · phiên ${fmtDate(liveSessionDate)} · OHLC gần nhất ${fmtDate(latestOhlcDate)} · dữ liệu đến 11:30`:
       `Ngoài phiên · OHLC gần nhất ${fmtDate(latestOhlcDate)}${syncLabel} · mở phiên lúc ${fmtTime(clock.next_open_at)}`;
     const liveSummary=data.feed_state==="live"?"Realtime đã được xác nhận":
       data.feed_state==="outside_session"?"Đang xem dữ liệu đã lưu; chờ phiên tiếp theo":
       ["delayed","stale","persistence_stale"].includes(data.feed_state)?"Dữ liệu đang trễ; xem chi tiết trong Trạng thái dữ liệu":
+      data.feed_state==="awaiting_persistence"&&data.trade_realtime_verified?"Giao dịch khớp đang lưu realtime; chưa có snapshot sổ lệnh hợp lệ":
       ["persistence_error","awaiting_persistence"].includes(data.feed_state)?"Chưa xác nhận ghi dữ liệu mới vào cơ sở dữ liệu":
       data.feed_state==="degraded"?"Luồng đang có message bị rớt; độ phủ có thể thiếu":`Trạng thái: ${viStatus(data.connection_status)}`;
     let message = live

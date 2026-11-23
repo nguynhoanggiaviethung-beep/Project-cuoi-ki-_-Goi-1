@@ -28,12 +28,42 @@ if os.getenv("SLI_NATIVE_STREAMLIT_UI", "0").strip() != "1":
     [data-testid="stIFrame"] { border:0!important; }
     </style>
     """, unsafe_allow_html=True)
-    st.iframe(
-        f"{os.getenv('SLI_WEB_BASE', 'http://127.0.0.1:8000/')}{'&' if '?' in os.getenv('SLI_WEB_BASE', 'http://127.0.0.1:8000/') else '?'}_sli_build=20261122-ui-filter-v2",
-        width="stretch",
-        height=900,
-        alt="Bảng điều khiển Stock Liquidity Intelligence bản gốc",
-    )
+
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    @st.fragment(run_every="15m", key="dashboard-refresh")
+    def dashboard_frame():
+        base = os.getenv("SLI_WEB_BASE", "http://127.0.0.1:8000/")
+        parts = urlsplit(base)
+        query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                 if key not in {"_sli_build", "_sli_refresh"}]
+        query.extend([
+            ("_sli_build", "20261122-ui-filter-v2"),
+            ("_sli_refresh", str(int(datetime.now().timestamp()))),
+        ])
+        embed_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+        try:
+            response = requests.get(f"{API_BASE}/api/status", timeout=(2, 8))
+            response.raise_for_status()
+            db_status = response.json()
+            db_stamp = db_status.get("last_persisted_at") or db_status.get("last_data_at")
+            if db_stamp:
+                parsed = datetime.fromisoformat(str(db_stamp).replace("Z", "+00:00"))
+                db_stamp = parsed.astimezone(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%H:%M:%S %d/%m/%Y")
+            else:
+                db_stamp = "chưa có bản ghi"
+        except (requests.RequestException, ValueError, TypeError):
+            db_stamp = "chưa đọc được trạng thái database"
+
+        st.caption(f"Trang tự cập nhật mỗi 15 phút · Bản ghi database gần nhất: {db_stamp}")
+        st.iframe(
+            embed_url,
+            width="stretch",
+            height=900,
+            alt="Bảng điều khiển Stock Liquidity Intelligence bản gốc",
+        )
+
+    dashboard_frame()
     st.stop()
 
 st.markdown("""

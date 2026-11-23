@@ -85,21 +85,23 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 .\scripts\run_streamlit.ps1
 ```
 
-Launcher kiểm tra sức khỏe FastAPI ở cổng 8000. Nếu backend chưa chạy, launcher khởi động FastAPI ở chế độ nền; FastAPI phục vụ API và tự yêu cầu chạy collector SSI thành tiến trình worker riêng khi `.env` có đủ khóa. Sau đó launcher mở giao diện Streamlit tại <http://127.0.0.1:8501/>. Nếu API hoặc Streamlit đã chạy khỏe mạnh, launcher dùng lại tiến trình đó, không tạo bản trùng.
+Launcher kiểm tra sức khỏe FastAPI ở cổng 8000. Nếu backend chưa chạy, launcher khởi động FastAPI ở chế độ nền; backend không tự khởi động hay dừng collector. Sau đó launcher mở giao diện Streamlit tại <http://127.0.0.1:8501/>. Nếu API hoặc Streamlit đã chạy khỏe mạnh, launcher dùng lại tiến trình đó, không tạo bản trùng.
 
-Địa chỉ sử dụng:
-
-- <http://127.0.0.1:8501/>: giao diện Streamlit khuyên dùng; mặc định nhúng nguyên dashboard hiện có để giữ giao diện và tương tác.
-- <http://127.0.0.1:8000/>: mở trực tiếp dashboard FastAPI, không qua lớp Streamlit.
-- <http://127.0.0.1:8000/api/status>: trạng thái backend, feed và độ mới dữ liệu.
-
-Nếu muốn chạy trực tiếp dashboard FastAPI thay vì mở giao diện Streamlit, dùng lệnh sau trong PowerShell (chỉ chạy khi cổng 8000 chưa có backend):
+Để thu thập SSI độc lập với web, mở **một PowerShell riêng** và chạy:
 
 ```powershell
-.\.venv\Scripts\python.exe app.py
+cd C:\Project-cuoi-ki-_-Goi-1
+.\.venv\Scripts\python.exe run_collector.py
 ```
 
-Sau đó mở <http://127.0.0.1:8000/>. Cửa sổ này chạy backend ở foreground; nhấn `Ctrl+C` sẽ dừng web API. Collector SSI chạy riêng, nhưng nên kiểm tra `/api/collector/runs` sau khi khởi động lại để xác nhận worker vẫn hoạt động.
+Giữ tiến trình này chạy trong phiên giao dịch; đóng tab hoặc restart FastAPI không dừng worker. Nút **Kết nối dữ liệu** trong giao diện vẫn có thể khởi chạy worker theo yêu cầu rõ ràng. Worker dùng khóa chống chạy trùng.
+
+**Chỉ dùng một giao diện và một lệnh chạy:** mở <http://127.0.0.1:8501/> bằng Streamlit, khởi chạy qua `scripts\run_streamlit.ps1`. Không chạy `app.py` riêng. Cổng 8000 là API nội bộ và dashboard được Streamlit nhúng để giữ nguyên giao diện; mở trực tiếp `http://127.0.0.1:8000/` sẽ chuyển về Streamlit. API vẫn có thể được kiểm tra tại:
+
+- <http://127.0.0.1:8000/api/status>
+- <http://127.0.0.1:8000/api/market-clock>
+- <http://127.0.0.1:8000/api/quality>
+- <http://127.0.0.1:8000/api/collector/runs>
 
 Nút **Làm mới dữ liệu** xóa cache giao diện và tải lại từ API. Trạng thái backend:
 
@@ -108,7 +110,7 @@ Nút **Làm mới dữ liệu** xóa cache giao diện và tải lại từ API.
 - <http://127.0.0.1:8000/api/quality>
 - <http://127.0.0.1:8000/api/collector/runs>
 
-Dừng giao diện bằng `Ctrl+C` trong cửa sổ Streamlit. Backend và collector tiếp tục chạy nền để không làm gián đoạn thu thập.
+Dừng giao diện bằng `Ctrl+C` trong cửa sổ Streamlit. Backend được launcher quản lý ở chế độ nền; collector là tiến trình riêng. Dừng giao diện hoặc backend không dừng collector.
 
 Nếu `/api/status` báo worker chưa chạy dù `.env` có đủ khóa, kiểm tra log `logs\ssi_worker.log` và trạng thái tại `/api/collector/runs` trước. Chỉ khởi động thủ công khi đã xác nhận không có collector đang chạy:
 
@@ -116,7 +118,7 @@ Nếu `/api/status` báo worker chưa chạy dù `.env` có đủ khóa, kiểm 
 .\.venv\Scripts\python.exe scripts\ssi_worker.py
 ```
 
-Worker có khóa chống chạy trùng. Không chạy lệnh worker chỉ vì trang hoặc tab tải chậm. Nhấn `Ctrl+C` trong terminal chạy Streamlit chỉ dừng giao diện Streamlit; FastAPI nền và collector worker vẫn tiếp tục. Đóng tab trình duyệt cũng không dừng hai tiến trình này. Khi FastAPI khởi động, nó kiểm tra PID worker hiện có trước khi yêu cầu collector chạy để tránh tạo worker trùng.
+Worker có khóa chống chạy trùng. Không chạy lệnh worker chỉ vì trang hoặc tab tải chậm. Nhấn `Ctrl+C` trong terminal chạy Streamlit chỉ dừng giao diện Streamlit; FastAPI và collector worker vẫn tiếp tục. Đóng tab trình duyệt cũng không dừng hai tiến trình này. Mở/restart FastAPI không tự sinh collector mới.
 
 ### Tự khởi chạy collector khi đăng nhập Windows
 
@@ -133,11 +135,9 @@ Task Scheduler không lưu khóa SSI; worker đọc `.env`. Gỡ tác vụ:
 Unregister-ScheduledTask -TaskName "Stock Liquidity Intelligence - SSI Collector" -Confirm:$false
 ```
 
-## Nếu cổng 8000 hoặc 8501 đang được sử dụng
+## Cổng chạy
 
-Cổng 8000 dành cho FastAPI backend; cổng 8501 dành cho Streamlit. Launcher kiểm tra sức khỏe trước khi mở và không tự dừng tiến trình đang giữ cổng. Nếu Streamlit đang chạy, dùng <http://127.0.0.1:8501/>. Nếu backend không phản hồi nhưng cổng 8000 vẫn bị chiếm, kiểm tra tiến trình trước; không dừng `ssi_worker.py` hoặc backend đang thu dữ liệu.
-
-Nếu FastAPI đang phản hồi ở cổng 8000, chạy `scripts\run_streamlit.ps1`; launcher sẽ dùng lại backend đó và không restart nó. Restart FastAPI làm giao diện/API gián đoạn ngắn, nhưng collector là tiến trình riêng nên vẫn chạy và ghi database. Khi backend lên lại, nó kiểm tra PID worker để tránh khởi chạy trùng. Cổng Streamlit có thể đổi khi chạy trực tiếp, ví dụ `.\.venv\Scripts\python.exe -m streamlit run streamlit_app.py --server.port 8502`; nếu API không ở `127.0.0.1:8000`, đặt `SLI_API_BASE` và `SLI_WEB_BASE` tương ứng trong môi trường Streamlit.
+Chỉ mở giao diện tại <http://127.0.0.1:8501/> và chỉ khởi chạy bằng `scripts\run_streamlit.ps1`. Launcher kiểm tra sức khỏe, tái sử dụng FastAPI/Streamlit nếu đang chạy, và chỉ khởi tạo phần còn thiếu; không tạo thêm bản chạy song song. Cổng 8000 là backend nội bộ cần cho dashboard được nhúng, không phải địa chỉ giao diện thứ hai. Nếu một cổng bị chiếm nhưng dịch vụ không khỏe mạnh, kiểm tra tiến trình thay vì chạy thêm lệnh `app.py` hoặc `streamlit run`.
 
 ## Đồng bộ lịch sử và vận hành dữ liệu
 
@@ -199,8 +199,9 @@ Các kiểm thử không cần khóa SSI; việc lấy dữ liệu thật cần 
 
 ## Giao diện Streamlit
 
-Streamlit tại cổng 8501 là giao diện khuyên dùng. Ở cấu hình mặc định, `streamlit_app.py` nhúng dashboard FastAPI tại cổng 8000 để giữ nguyên toàn bộ giao diện và tương tác. Có thể mở trực tiếp cổng 8000 nếu muốn bỏ lớp Streamlit; cả hai địa chỉ dùng chung API và database, không tạo hai bộ dữ liệu riêng. Khởi động hằng ngày bằng `scripts\run_streamlit.ps1`.
+Streamlit tại cổng 8501 là giao diện duy nhất dành cho người dùng. `streamlit_app.py` nhúng dashboard để giữ nguyên giao diện và tương tác; FastAPI tại cổng 8000 chỉ phục vụ nội bộ cho iframe và API. Chạy dự án bằng `scripts\run_streamlit.ps1`; không khởi chạy `app.py` riêng hoặc mở cổng 8000 làm giao diện.
 
 Các trang Streamlit gồm tổng quan, danh mục cục bộ, chi tiết mã, xếp hạng, lịch sử cảnh báo và trạng thái/chất lượng dữ liệu. Những phép tính nặng chỉ tải khi người dùng mở hoặc yêu cầu trang tương ứng. Trong phiên, phần biểu đồ được làm mới định kỳ và cache ngắn; ngoài phiên, giao diện đọc lịch sử đã lưu với cache dài hơn. Nút làm mới chủ động xóa cache.
 
 Tắt Streamlit không dừng FastAPI hay collector. Backend và database không bị thay thế; Streamlit đọc/ghi hồ sơ người dùng qua API hiện có và không tự ghi vào SQLite.
+

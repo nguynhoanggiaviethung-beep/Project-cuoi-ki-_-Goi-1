@@ -678,7 +678,7 @@
   function overviewDateParams(){const from=readOverviewDateInput('#overview-history-from'),to=readOverviewDateInput('#overview-history-to'),board=document.querySelector('#overview-board')?.value||'ALL';return {from,to,board,query:`${from?'&from_date='+encodeURIComponent(from):''}${to?'&to_date='+encodeURIComponent(to):''}${board!=='ALL'?'&board='+encodeURIComponent(board):''}`};}
   function updateOverviewFilterPresentation(){
     const latest=latestStoredDate(),clock=window.MarketClock?.get?.()||{},label=document.querySelector('#overview-latest-label');
-    if(label){const asOf=latest||clock.session_date||'';label.textContent=asOf?`Phiên gần nhất (${formatVnDate(asOf).slice(0,5)})`:'Phiên gần nhất';}
+    if(label){const asOf=latest||clock.session_date||'',liveSession=['IN_SESSION','LUNCH_BREAK'].includes(clock.market_state);label.textContent=asOf?`${liveSession?'OHLC gần nhất':'Phiên gần nhất'} (${formatVnDate(asOf).slice(0,5)})`:'Phiên gần nhất';}
     const f=overviewDataStore.filters,chip=document.querySelector('#overview-custom-range-chip'),chipText=chip?.querySelector('span');
     if(chip&&chipText){const active=f.preset==='custom';chip.hidden=!active;if(active)chipText.textContent=`${formatVnDate(f.dateFrom)} – ${formatVnDate(f.dateTo)}`;}
     const rangeLabel=f.preset==='custom'?`${formatVnDate(f.dateFrom)} – ${formatVnDate(f.dateTo)}`:document.querySelector(`[data-overview-range="${f.preset}"]`)?.textContent.trim()||'Phiên gần nhất';
@@ -693,10 +693,8 @@
     overviewDataStore.boundsPromise=(async()=>{
       let bounds=overviewDataStore.bounds||{};
       try{bounds={...bounds,...await call('/api/market-history-range',{noStore:true})};}catch{}
-      if(!Array.isArray(bounds.recent_sessions)||bounds.recent_sessions.length<30){
-        const candidates=['FPT','SSI','VCB','HPG','VNM'];
-        for(const symbol of candidates){try{const data=await call(`/api/price-history?symbol=${symbol}&limit=60`,{noStore:true}),rows=data.series_by_symbol?.[symbol]||[],dates=[...new Set(rows.map(row=>String(row.trading_date||'').replaceAll('/','-').slice(0,10)).filter(Boolean))].sort().reverse();if(dates.length){bounds.recent_sessions=dates;if(!bounds.latest_date||dates[0]>bounds.latest_date)bounds.latest_date=dates[0];if(!bounds.earliest_date||dates.at(-1)<bounds.earliest_date)bounds.earliest_date=dates.at(-1);if(dates.length>=30)break;}}catch{}}
-      }
+      // The range endpoint already returns every trading session available in SSI storage.
+      // Do not serially query five price histories when fewer than 30 sessions exist.
       overviewDataStore.bounds=bounds;overviewDataStore.boundsFetchedAt=Date.now();updateOverviewFilterPresentation();return bounds;
     })().finally(()=>{overviewDataStore.boundsPromise=null;});
     return overviewDataStore.boundsPromise;
@@ -746,11 +744,12 @@
   function renderOverviewLiquidityKpis(data,chosen,windowMinutes,status){
     const groups=data?.series_by_symbol||{},symbols=chosen&&chosen!=='__all__'?[chosen]:Object.keys(groups),rows=symbols.flatMap(symbol=>groups[symbol]||[]),valid=rows.filter(row=>row.validation_status==='valid');
     const median=values=>{const sorted=values.filter(value=>value!=null&&Number.isFinite(Number(value))).map(Number).sort((a,b)=>a-b);return sorted.length?(sorted[(sorted.length-1)>>1]+sorted[sorted.length>>1])/2:null;};
-    const spread=median(valid.map(row=>row.spread_bps)),ticks=median(valid.map(row=>row.spread_ticks)),depth=median(valid.map(row=>row.total_depth_value)),asOf=status?.last_persisted_at||status?.last_data_at;
-    overviewCard('kpi-symbols','Mã có snapshot hợp lệ',num(valid.length,0),asOf?`Snapshot lưu gần nhất ${String(asOf).replace('T',' ').slice(0,19)}`:'Chưa có mốc snapshot đã lưu');
+    const validCount=data?.summary_only?Number(data.valid_observation_count||0):valid.length,totalCount=data?.summary_only?Number(data.observation_count||0):rows.length;
+    const spread=data?.summary_only?data.median_spread_bps:median(valid.map(row=>row.spread_bps)),ticks=data?.summary_only?data.median_spread_ticks:median(valid.map(row=>row.spread_ticks)),depth=data?.summary_only?data.median_total_depth_value:median(valid.map(row=>row.total_depth_value)),asOf=status?.last_persisted_at||status?.last_data_at;
+    overviewCard('kpi-symbols','Mã có snapshot hợp lệ',num(validCount,0),asOf?`Snapshot lưu gần nhất ${String(asOf).replace('T',' ').slice(0,19)}`:'Chưa có mốc snapshot đã lưu');
     overviewCard('kpi-spread','Spread trung vị',spread==null?'—':`${num(spread,2)} bps · ${num(ticks,1)} ticks`,'Quote hợp lệ mới nhất/mã · ticks phản ánh bước giá');
     overviewCard('kpi-depth','Độ sâu top 3 trung vị',num(depth,0),'Giá trị ba mức bid/ask · quote hợp lệ');
-    overviewCard('kpi-valid','Chất lượng dữ liệu',rows.length?`${num(valid.length/rows.length*100,1)}%`:'—',`${num(valid.length,0)} / ${num(rows.length,0)} mã · cửa sổ ${windowMinutes} phút`);
+    overviewCard('kpi-valid','Chất lượng dữ liệu',totalCount?`${num(validCount/totalCount*100,1)}%`:'—',`${num(validCount,0)} / ${num(totalCount,0)} mã · cửa sổ ${windowMinutes} phút`);
   }
   function overviewChartHeading(nodeId,title,description){const node=document.querySelector('#'+nodeId),panel=node?.closest('.panel');if(!panel)return;const h=panel.querySelector('.panel-heading h2'),p=panel.querySelector('.panel-heading p');if(h)h.textContent=title;if(p)p.textContent=description;}
   function syncChartHistoryButtons(){document.querySelectorAll('[data-overview-history]').forEach(button=>{const history=!!chartHistoryMode[button.dataset.overviewHistory];button.textContent=history?'Về phiên gần nhất':'Xem lịch sử';button.setAttribute('aria-pressed',String(history));button.title=history?'Quay lại phiên gần nhất':'Hiển thị các phiên trong khoảng ngày đã chọn';});}
@@ -894,15 +893,36 @@
     const all=chosen==='__all__';
     if(all){
       const range=overviewDateParams(),d=await call(`/api/market-breadth?limit=10000${range.query}`),rawRows=d.rows||[],rawLatest=d.rows?.[d.rows.length-1];
+      const singleSessionDate=range.from&&range.to&&range.from===range.to?range.from:rawRows.length===1?String(rawRows[0].trading_date||'').replaceAll('/','-'):null;
+      let intradayBreadthRows=[];
+      if(singleSessionDate){try{const boardQuery=range.board!=='ALL'?`&board=${encodeURIComponent(range.board)}`:'';const intraday=await call(`/api/market-breadth-intraday?session_date=${encodeURIComponent(singleSessionDate)}${boardQuery}`);intradayBreadthRows=intraday.rows||[];}catch{}}
       const expectedDate=String(status.session_date||'').replaceAll('-','/'),actualDate=String(rawLatest?.trading_date||'').replaceAll('-','/');
       const syncState=status.meta?.session_sync?.status;
       const pendingSync=!!expectedDate&&(expectedDate!==actualDate||['not_started','closed_ohlc_pending','ohlc_incomplete'].includes(syncState));
       const rows=rawRows,latest=rows[rows.length-1],sync=status.meta?.session_sync||{},pendingCoverage=d.pending_session_coverage||{present:sync.ohlc_symbols||0,expected:sync.ohlc_expected||0},coverageText=pendingCoverage.expected?`OHLC ${formatVnDate(expectedDate)} có ${num(pendingCoverage.present,0)}/${num(pendingCoverage.expected,0)} mã; mã không có bản ghi không được tính là đứng giá.`:'';
       const historyDateLabel=pendingSync?`Có dữ liệu · ${formatVnDate(expectedDate)}`:(latest?.trading_date||'—');
       const historicalSymbolCount=overviewDataStore.bounds?.historical_symbols_with_data??status.historical_symbols_with_data;
-      overviewChartHeading('spread-chart','Độ rộng thị trường SSI','Số mã tăng / giảm theo phiên, tính từ OHLC ngày');
-      lineChart(document.querySelector('#spread-chart'),[{name:'Mã tăng giá · xanh lá',rows:rows.map(r=>({...r,count:r.advancing})),color:'#008A45'},{name:'Mã giảm giá · đỏ',rows:rows.map(r=>({...r,count:r.declining})),color:'#E2231A'}],'count','Số mã tăng / giảm theo phiên');
-      setChartNote('spread-chart','Hai đường lần lượt là số mã tăng và số mã giảm toàn thị trường trong từng phiên; so sánh giá đóng cửa OHLC SSI với phiên liền trước. Không phải giá cổ phiếu hay spread.');
+      if(singleSessionDate){
+        overviewChartHeading('spread-chart',`Độ rộng thị trường SSI · phiên ${formatVnDate(singleSessionDate)}`,'Số mã tăng / giảm theo phút trong phiên · giờ Việt Nam');
+        if(intradayBreadthRows.length){
+          lineChart(document.querySelector('#spread-chart'),[{name:'Mã tăng giá · xanh lá',rows:intradayBreadthRows.map(r=>({...r,count:r.advancing})),color:'#008A45'},{name:'Mã giảm giá · đỏ',rows:intradayBreadthRows.map(r=>({...r,count:r.declining})),color:'#E2231A'}],'count','Số mã tăng / giảm theo phút trong phiên');
+          setChartNote('spread-chart',`Dữ liệu TradeMessage SSI đã lưu · mỗi điểm là trạng thái cuối phút, tính giá khớp gần nhất của từng mã trong phiên so với giá đóng cửa OHLC SSI phiên trước và giữ trạng thái giữa các phút không có giao dịch. Mã chưa có giao dịch được tính là chưa quan sát, không phải đứng giá. Di chuột để xem số mã tham gia; ${num(intradayBreadthRows.at(-1)?.observed_symbols,0)}/${num(intradayBreadthRows.at(-1)?.total_symbols,0)} mã có giá so sánh ở điểm cuối.`);
+          const netRows=intradayBreadthRows.map(r=>({...r,count:Number(r.advancing||0)-Number(r.declining||0)}));
+          overviewChartHeading('imbalance-chart','Chênh lệch số mã tăng – giảm trong phiên','Theo phút · số mã tăng trừ số mã giảm');
+          lineChart(document.querySelector('#imbalance-chart'),[{name:'Tăng trừ giảm',rows:netRows,color:'#008A45'}],'count','Chênh lệch số mã tăng trừ số mã giảm theo phút');
+          setChartNote('imbalance-chart','Đường trên 0: số mã tăng nhiều hơn; dưới 0: số mã giảm nhiều hơn. Tính từ TradeMessage SSI đã lưu, so với giá đóng cửa phiên trước; không phải mất cân bằng sổ lệnh.');
+          const finalPoint=intradayBreadthRows.at(-1);document.querySelector('#imbalance-reading').textContent=`Phiên ${formatVnDate(singleSessionDate)} đến ${formatVnTime(finalPoint.minute)}: ${num(finalPoint.advancing,0)} mã tăng, ${num(finalPoint.declining,0)} mã giảm, ${num(finalPoint.unchanged,0)} đứng giá trong ${num(finalPoint.observed_symbols,0)} mã đã có giao dịch SSI; mã còn lại chưa được tính.`;
+        }else{
+          const chart=document.querySelector('#spread-chart');if(chart)chart.innerHTML=`<div class="empty-state">Chưa có TradeMessage SSI hợp lệ đã lưu cho phiên ${esc(formatVnDate(singleSessionDate))} để dựng diễn biến theo phút. OHLC ngày chỉ cho một điểm, nên không dùng thay cho biểu đồ thời gian trong phiên.</div>`;
+          setChartNote('spread-chart','Chỉ vẽ theo thời gian khi database có giao dịch khớp SSI đã lưu.');
+          overviewChartHeading('imbalance-chart','Chênh lệch số mã tăng – giảm trong phiên','Chưa có giao dịch SSI theo phút đã lưu');
+          const other=document.querySelector('#imbalance-chart');if(other)other.innerHTML='<div class="empty-state">Chưa có dữ liệu TradeMessage SSI theo phút cho phiên đã chọn.</div>';
+        }
+      }else{
+        overviewChartHeading('spread-chart','Độ rộng thị trường SSI','Số mã tăng / giảm theo phiên, tính từ OHLC ngày');
+        lineChart(document.querySelector('#spread-chart'),[{name:'Mã tăng giá · xanh lá',rows:rows.map(r=>({...r,count:r.advancing})),color:'#008A45'},{name:'Mã giảm giá · đỏ',rows:rows.map(r=>({...r,count:r.declining})),color:'#E2231A'}],'count','Số mã tăng / giảm theo phiên');
+        setChartNote('spread-chart','Hai đường lần lượt là số mã tăng và số mã giảm toàn thị trường trong từng phiên; so sánh giá đóng cửa OHLC SSI với phiên liền trước. Không phải giá cổ phiếu hay spread.');
+      }
       overviewChartHeading('depth-chart','Độ sâu hai phía sổ lệnh','Các phiên có bar SSI trong khoảng lịch sử đang chọn');
       overviewChartHeading('imbalance-chart','Chênh lệch số mã tăng – giảm','Thống kê giá lịch sử; không phải mất cân bằng sổ lệnh');
       advanceDeclineChart(document.querySelector('#imbalance-chart'),rows);
@@ -911,7 +931,7 @@
       const missingComparable=breadth.no_comparison??Math.max(0,totalUniverse-Number(latest?.advancing||0)-Number(latest?.declining||0)-Number(latest?.unchanged||0));
       document.querySelector('#imbalance-reading').textContent=`Phiên ${latest?.trading_date?formatVnDate(latest.trading_date):'—'}: ${num(latest?.advancing,0)} mã tăng, ${num(latest?.declining,0)} mã giảm, ${num(latest?.unchanged,0)} đứng giá; ${num(missingComparable,0)} mã không đủ dữ liệu so sánh (trên ${num(totalUniverse,0)} mã).`;
       const intradaySavedDate=depthPayload?.session_date,intradaySavedLast=depthPayload?.rows?.at(-1)?.minute,intradayFreshness=intradaySavedDate?`Dữ liệu sổ lệnh cuối đã lưu: phiên ${formatVnDate(intradaySavedDate)}${intradaySavedLast?`, ${formatVnTime(intradaySavedLast)}`:''}.`:'Chưa có bar thanh khoản SSI đã lưu để đối chiếu.';
-      document.querySelector('#overview-analysis').textContent=pendingSync?`Ngoài giờ giao dịch · phiên SSI ${formatVnDate(expectedDate)} được cập nhật từ ${num(pendingCoverage.present,0)}/${num(pendingCoverage.expected,0)} mã có OHLC; lưu gần nhất lúc ${fmtDateTime(status.meta?.data_as_of||status.data_as_of)}. Biểu đồ độ rộng dùng bản ghi có sẵn; mã thiếu bản ghi không được tính là đứng giá. Đây là OHLC lịch sử, không phải realtime hoặc spread/depth. ${intradayFreshness}`:`Ngoài giờ giao dịch · ${historicalSymbolCount==null?'chưa thống kê số mã có OHLC lịch sử SSI ở trạng thái nhanh':`OHLC lịch sử SSI cho ${num(historicalSymbolCount,0)} mã`}. Các thẻ và biểu đồ trên đang tóm tắt giá/khối lượng phiên ${latest?.trading_date?formatVnDate(latest.trading_date):'—'}; đây không phải chỉ số spread/depth của sổ lệnh. ${intradayFreshness}`;
+      document.querySelector('#overview-analysis').textContent=intradayBreadthRows.length?`Phiên ${formatVnDate(singleSessionDate)} · biểu đồ độ rộng chạy theo phút từ TradeMessage SSI đã lưu đến ${formatVnTime(intradayBreadthRows.at(-1).minute)}. Các biểu đồ OHLC khác vẫn là dữ liệu theo ngày; mã không có giao dịch SSI trong phiên không được tính là đứng giá. ${intradayFreshness}`:pendingSync?`Ngoài giờ giao dịch · phiên SSI ${formatVnDate(expectedDate)} được cập nhật từ ${num(pendingCoverage.present,0)}/${num(pendingCoverage.expected,0)} mã có OHLC; lưu gần nhất lúc ${fmtDateTime(status.meta?.data_as_of||status.data_as_of)}. Biểu đồ độ rộng dùng bản ghi có sẵn; mã thiếu bản ghi không được tính là đứng giá. Đây là OHLC lịch sử, không phải realtime hoặc spread/depth. ${intradayFreshness}`:`Ngoài giờ giao dịch · ${historicalSymbolCount==null?'chưa thống kê số mã có OHLC lịch sử SSI ở trạng thái nhanh':`OHLC lịch sử SSI cho ${num(historicalSymbolCount,0)} mã`}. Các thẻ và biểu đồ trên đang tóm tắt giá/khối lượng phiên ${latest?.trading_date?formatVnDate(latest.trading_date):'—'}; đây không phải chỉ số spread/depth của sổ lệnh. ${intradayFreshness}`;
     }else{
       const range=overviewDateParams(),d=await call(`/api/price-history?symbol=${encodeURIComponent(chosen)}&limit=10000${range.query}`),rawRows=(d.series_by_symbol||{})[chosen]||[];
       const expectedDate=String(status.session_date||'').replaceAll('-','/'),rawLatest=rawRows[rawRows.length-1],actualDate=String(rawLatest?.trading_date||'').replaceAll('-','/'),syncState=status.meta?.session_sync?.status;
@@ -959,6 +979,31 @@
     pendingVisibleLoads.set(key,{observer});
     observer.observe(node);
   }
+  function loadLiveMarketBreadthChart(status){
+    const date=String(status?.session_date||status?.meta?.session_date||'').slice(0,10),node=document.querySelector('#imbalance-chart');
+    if(!date||!node)return;
+    const board=overviewDataStore.filters.board||document.querySelector('#overview-board')?.value||'ALL';
+    const boardQuery=board!=='ALL'?`&board=${encodeURIComponent(board)}`:'';
+    const generation=overviewDataStore.generation,filterKey=overviewFilterKey();
+    overviewChartHeading('imbalance-chart','Độ rộng thị trường · số mã tăng/giảm theo phút',`Phiên ${formatVnDate(date)} · giao dịch SSI đã lưu`);
+    node.innerHTML='<div class="widget-skeleton" aria-label="Đang tải độ rộng thị trường"></div>';
+    call(`/api/market-breadth-intraday?session_date=${encodeURIComponent(date)}${boardQuery}`).then(data=>{
+      if(generation!==overviewDataStore.generation||filterKey!==overviewFilterKey()||window.sliRoute!=='overview')return;
+      const points=data.rows||[];
+      if(!points.length){node.innerHTML='<div class="empty-state">Chưa có giao dịch SSI đã lưu để tính độ rộng thị trường trong phiên này.</div>';return;}
+      const series=[
+        {name:'Mã tăng',rows:points.map(p=>({...p,count:Number(p.advancing||0)})),color:'#008A45'},
+        {name:'Mã giảm',rows:points.map(p=>({...p,count:Number(p.declining||0)})),color:'#E2231A'}
+      ];
+      lineChart(node,series,'count','Số mã tăng / giảm theo phút · mã chưa có giao dịch không tính là đứng giá');
+      const last=points.at(-1),reading=document.querySelector('#imbalance-reading');
+      if(reading)reading.textContent=`Đến ${formatVnTime(last.minute)}: ${num(last.advancing,0)} mã tăng, ${num(last.declining,0)} mã giảm, ${num(last.unchanged,0)} đứng giá trong ${num(last.observed_symbols,0)} mã đã có giao dịch.`;
+      setChartNote('imbalance-chart',`Tính từ giá khớp SSI mới nhất mỗi mã so với giá đóng cửa phiên liền trước; trạng thái được giữ giữa các phút chưa có giao dịch. Mã chưa phát sinh giao dịch không bị tính là đứng giá. Có ${num(last.observed_symbols,0)}/${num(last.total_symbols,0)} mã được quan sát ở điểm cuối.`);
+    }).catch(()=>{
+      if(generation!==overviewDataStore.generation||filterKey!==overviewFilterKey()||window.sliRoute!=='overview')return;
+      node.innerHTML='<div class="empty-state">Chưa tải được độ rộng thị trường từ giao dịch SSI đã lưu. Biểu đồ thanh khoản vẫn hoạt động.</div>';
+    });
+  }
   function scheduleOverviewBackground(windowMinutes,status,profileData=null){
     const range=overviewDateParams(),key=`${range.from}|${range.to}|${windowMinutes}`;
     loadWhenNearViewport(`depth:${key}`,'#depth-chart',()=>loadOverviewDepth(windowMinutes));
@@ -991,7 +1036,7 @@
       syncOverviewHistoricalDate(status,freshBounds);
       const marketClosed=status.market_state==='CLOSED';
       if(marketClosed){
-        const snapshotRequest=call(`/api/overview?window_minutes=${windowMinutes}${chosen!=='__all__'?'&symbol='+encodeURIComponent(chosen):''}`).catch(()=>null);
+        const snapshotRequest=call(`/api/overview?summary_only=true&window_minutes=${windowMinutes}${chosen!=='__all__'?'&symbol='+encodeURIComponent(chosen):''}`).catch(()=>null);
         const historyRequest=(async()=>{try{await showHistoricalInOverview(chosen,status);}catch{
           const analysis=document.querySelector('#overview-analysis');
           if(analysis)analysis.textContent='Chưa tải được OHLC lịch sử SSI; các biểu đồ thanh khoản vẫn được giữ riêng.';
@@ -1003,7 +1048,7 @@
         return;
       }
       const [d,profileData]=await Promise.all([
-        call(`/api/overview?window_minutes=${windowMinutes}${chosen!=='__all__'?'&symbol='+encodeURIComponent(chosen):''}`),
+        call(`/api/overview?summary_only=true&window_minutes=${windowMinutes}${chosen!=='__all__'?'&symbol='+encodeURIComponent(chosen):''}`),
         call(`/api/intraday-profile?window_minutes=${windowMinutes}${chartHistoryMode.spread?overviewDateParams().query:''}${spreadSymbol!=='__all__'?'&symbol='+encodeURIComponent(spreadSymbol):''}`)
       ]);
       restoreLiquidityOverviewHeadings();
@@ -1014,18 +1059,21 @@
       const chartRows=(profileData.profile||[]).map(p=>({minute:p.minute,spread_bps:p.median_spread_bps,total_depth_value:p.median_total_depth_value,queue_imbalance:p.median_queue_imbalance,sample_count:p.symbols_count,snapshot_count:p.snapshot_count}));
       const allMode=spreadSymbol==='__all__',line=[{name:allMode?'Trung vị giữa các mã':'Mã '+spreadSymbol,rows:chartRows,color:'#008A45'}];
       overviewChartHeading('spread-chart',allMode?'Spread trung vị toàn bộ mã theo phút':`Spread theo phút · ${spreadSymbol}`,chartHistoryMode.spread?`Lịch sử · ${num(profileData.sessions_count||0,0)} phiên · ${overviewDateParams().from||'đầu dữ liệu'} đến ${overviewDateParams().to||'mới nhất'}`:`Phiên gần nhất · bar hoàn tất đến ${profileData.profile?.at(-1)?.minute||'—'}`);
-      overviewChartHeading('imbalance-chart',allMode?'Mất cân bằng trung vị toàn bộ mã':`Mất cân bằng mua/bán · ${spreadSymbol}`,`Chỉ số từ cùng bar một phút đã hoàn tất`);
+      const liveMarket=['IN_SESSION','LUNCH_BREAK'].includes(status.market_state);
+      if(!liveMarket)overviewChartHeading('imbalance-chart',allMode?'Mất cân bằng trung vị toàn bộ mã':`Mất cân bằng mua/bán · ${spreadSymbol}`,`Chỉ số từ cùng bar một phút đã hoàn tất`);
       lineChart(document.querySelector('#spread-chart'),line,'spread_bps','Spread trung vị (điểm cơ bản, bps)');
-      lineChart(document.querySelector('#imbalance-chart'),line,'queue_imbalance','Mất cân bằng bid/ask (tỷ lệ)');
+      if(liveMarket){const breadthNode=document.querySelector('#imbalance-chart');if(breadthNode)breadthNode.innerHTML='<div class="widget-skeleton" aria-label="Đang tải độ rộng thị trường"></div>';}
+      else lineChart(document.querySelector('#imbalance-chart'),line,'queue_imbalance','Mất cân bằng bid/ask (tỷ lệ)');
       overviewCoreRendered=true;
+      if(liveMarket)loadLiveMarketBreadthChart(status);
       const method='Mỗi phút: lấy trung vị snapshot hợp lệ của từng mã, rồi lấy trung vị giữa các mã. Hai biểu đồ spread dùng cùng tập bar, cùng cách tính và cùng số mã tham gia; phút hiện tại chưa hoàn tất bị loại.';
       setChartNote('spread-chart',`${allMode?'Tất cả mã. ':`Chỉ ${spreadSymbol}. `}${method} Số mã tham gia hiển thị khi rê chuột.`);
-      setChartNote('imbalance-chart',`${allMode?'Tất cả mã. ':`Chỉ ${chosen}. `}${method} Dương nghiêng về khối lượng bid, âm nghiêng về ask.`);
+      if(!liveMarket)setChartNote('imbalance-chart',`${allMode?'Tất cả mã. ':`Chỉ ${chosen}. `}${method} Dương nghiêng về khối lượng bid, âm nghiêng về ask.`);
       const period=`${String(profileData.window_start||'').slice(11,16)}–${String(profileData.completed_through_exclusive||'').slice(11,16)} giờ Việt Nam`;
       const latestMin=profileData.profile?.at(-1)?.minute||'—';
       const freshness=!status.market_session_expected?'Ngoài giờ liên tục; đang xem các bar SSI đã hoàn tất gần nhất.':status.processing_delayed?'Luồng SSI đang nhận dữ liệu nhưng bộ lưu có độ trễ.':'SSI đang trong phiên liên tục.';
       const context=document.querySelector('#overview-data-context');if(context)context.textContent=`${freshness} Cửa sổ biểu đồ: ${period} (${windowMinutes} phút), cập nhật đến bar ${latestMin}; loại phút chưa hoàn tất. KPI lấy quote mới nhất của mỗi mã trong đúng cửa sổ. Biểu đồ spread và diễn biến phiên dùng cùng các bar đã hoàn tất; số mã ở mỗi phút hiện khi rê chuột.`;
-      const reading=document.querySelector('#imbalance-reading');if(reading){const value=med(valid.map(r=>r.queue_imbalance));reading.textContent=value==null?'Chưa đủ quote hợp lệ để diễn giải.':Math.abs(value)<.1?'Khối lượng hai phía tương đối cân bằng ở quote mới nhất mỗi mã.':value>0?`Khối lượng bid trội hơn, trung vị ${num(value,3)}.`:`Khối lượng ask trội hơn, trung vị ${num(value,3)}.`;}
+      const reading=document.querySelector('#imbalance-reading');if(reading&&!liveMarket){const value=med(valid.map(r=>r.queue_imbalance));reading.textContent=value==null?'Chưa đủ quote hợp lệ để diễn giải.':Math.abs(value)<.1?'Khối lượng hai phía tương đối cân bằng ở quote mới nhất mỗi mã.':value>0?`Khối lượng bid trội hơn, trung vị ${num(value,3)}.`:`Khối lượng ask trội hơn, trung vị ${num(value,3)}.`;}
       const analysis=document.querySelector('#overview-analysis');if(analysis)analysis.textContent=`Phạm vi KPI: ${num(active.length,0)} mã có quote trong cửa sổ, ${num(valid.length,0)} quote hợp lệ (mỗi mã tối đa một quote mới nhất). Phạm vi biểu đồ: bar một phút đã hoàn tất trong ${windowMinutes} phút. Nguồn SSI FastConnect; đơn vị và phép tính được ghi dưới từng biểu đồ.`;
       scheduleOverviewBackground(windowMinutes,status,profileData);
     }catch(e){const node=document.querySelector('#spread-chart');if(overviewCoreRendered){const panel=document.querySelector('#overview-ranking');if(panel&&!panel.querySelector('.ranking-board'))panel.innerHTML='<div class="ranking-empty">Bảng xếp hạng đang tải chưa thành công; dữ liệu biểu đồ vẫn được giữ.</div>';}else{const hasPrior=!!node?.dataset.widgetReady;if(hasPrior){for(const url of ['/api/overview','/api/market-depth','/api/rankings','/api/intraday-profile','/api/trades','/api/market-leaders'])setOverviewWidgetState(url,'stale');}else if(node)node.innerHTML='<div class="empty-state research-retry"><span>Chưa tải được biểu đồ thanh khoản trong cửa sổ đã chọn.</span><button type="button" class="button button-secondary" id="retry-overview">Thử lại</button></div>';}}

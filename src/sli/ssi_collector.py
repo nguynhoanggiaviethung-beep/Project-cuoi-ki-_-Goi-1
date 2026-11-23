@@ -72,6 +72,8 @@ class SsiCollector:
         self._stream=None; self._lock=threading.Lock(); self._writer=None
         self._history_thread=None; self._pending_quotes=queue.Queue()
         self._pending_signal=threading.Event(); self._pending_trades=queue.Queue()
+        self._bar_writer=None; self._pending_bar_jobs={}; self._bar_jobs_lock=threading.Lock()
+        self._bar_signal=threading.Event()
         self._board_by_symbol={}
 
     def start(self):
@@ -80,7 +82,9 @@ class SsiCollector:
             self._stop.clear()
             self._clear_queue(self._pending_quotes)
             self._clear_queue(self._pending_trades)
+            with self._bar_jobs_lock:self._pending_bar_jobs.clear()
             self._pending_signal.clear()
+            self._bar_signal.clear()
             self.runtime.update(mode="ssi",connection_status="connecting",provider="SSI FastConnect · all listed stocks",
                 last_error=None,messages_received=0,rows_valid=0,rows_invalid=0,duplicate_messages=0,queue_dropped=0,reconnect_count=0,
                 queue_depth=0,queue_coalesced=0,last_message_at=None,last_persisted_at=None,
@@ -323,6 +327,20 @@ class SsiCollector:
                     if self._stop.wait(30):
                         break
                     continue
+                state=self.runtime.snapshot()
+                live_writes_pending=(
+                    int(state.get("queue_depth") or 0)>0
+                    or int(state.get("trade_queue_depth") or 0)>0
+                    or state.get("quote_persistence_status") in {"pending","writing","retrying"}
+                    or state.get("trade_persistence_status") in {"pending","writing","retrying"}
+                )
+                if live_writes_pending:
+                    # Do not let the daily OHLC backfill compete with a live
+                    # ingestion backlog for SQLite's single writer.
+                    self.runtime.update(historical_sync_phase="deferred_until_ingestion_caught_up")
+                    if self._stop.wait(30):
+                        break
+                    continue
                 _LOG.info("Bắt đầu đồng bộ OHLC SSI cho ngày %s.", session_date)
                 try:
                     self._sync_history(auth, symbols)
@@ -395,8 +413,10 @@ class SsiCollector:
                 self.runtime.update(quote_persistence_status="writing")
                 self._persist_with_retry("daily quote archive", lambda: daily_archive.persist_quote_batch(batch))
                 try:
-                    counts=self._persist_with_retry("SQLite quote batch", lambda: database.insert_observation_batch(batch,"ssi"))
+                    counts=self._persist_with_retry("SQLite quote batch", lambda: database.insert_observation_batch(
+                        batch,"ssi",refresh_bars=False))
                     if counts is not None:
+                        self._enqueue_bar_jobs(counts.pop("bar_refresh_jobs",[]))
                         self.runtime.increment("duplicate_messages",counts["duplicate"])
                         self.runtime.increment("rows_valid",counts["valid"]);self.runtime.increment("rows_invalid",counts["invalid"])
                         if counts.get("last_persisted_at"):
@@ -425,6 +445,39 @@ class SsiCollector:
                         self.runtime.update(trade_persistence_status="failed")
                 except Exception as exc:
                     self.runtime.update(trade_persistence_status="failed",last_error=f"SQLite trade batch: {str(exc)[:180]}")
+
+    def _enqueue_bar_jobs(self, jobs):
+        if not jobs:return
+        with self._bar_jobs_lock:
+            for observation,observation_id,metrics in jobs:
+                stamp=observation.get("received_at_vn") or observation.get("received_at_utc") or ""
+                try:
+                    minute=datetime.fromisoformat(stamp.replace("Z","+00:00")).astimezone(
+                        config.TIMEZONE).replace(second=0,microsecond=0).isoformat(timespec="minutes")
+                except (ValueError,TypeError):
+                    continue
+                key=(observation["symbol"],minute)
+                previous=self._pending_bar_jobs.get(key)
+                if previous is None or observation_id>previous[1]:
+                    self._pending_bar_jobs[key]=(observation,observation_id,metrics)
+            self._bar_signal.set()
+
+    def _bar_refresh_loop(self):
+        while (not self._stop.is_set()
+               or (self._writer is not None and self._writer.is_alive())
+               or self._pending_bar_jobs):
+            self._bar_signal.wait(timeout=.5)
+            jobs=[]
+            with self._bar_jobs_lock:
+                for key in list(self._pending_bar_jobs)[:25]:
+                    jobs.append(self._pending_bar_jobs.pop(key))
+                if not self._pending_bar_jobs:
+                    self._bar_signal.clear()
+            if not jobs:
+                continue
+            self._persist_with_retry(
+                "SQLite bar refresh",
+                lambda: database.refresh_observation_bar_batch(jobs,"ssi"))
 
     def _persist_with_retry(self, label, write):
         delay=.25
@@ -459,6 +512,8 @@ class SsiCollector:
             _enable_automatic_data_reauthentication(auth)
             symbols=self._load_catalog(auth)
             if not symbols:raise RuntimeError("SSI catalog không trả về cổ phiếu thường; không dùng dữ liệu giả lập.")
+            self._bar_writer=threading.Thread(target=self._bar_refresh_loop,name="sli-ssi-bar-writer",daemon=True)
+            self._bar_writer.start()
             self._writer=threading.Thread(target=self._write_loop,name="sli-ssi-db-writer",daemon=True);self._writer.start()
             stream=Stream(auth);client=stream.streaming;self._stream=client
             def on_connection(event):
@@ -542,8 +597,10 @@ class SsiCollector:
             if stream:
                 try:stream.streaming.disconnect()
                 except Exception:pass
-            if self._history_thread and self._history_thread.is_alive():self._history_thread.join(timeout=10)
+            if self._history_thread and self._history_thread.is_alive():self._history_thread.join()
             if self._writer and self._writer.is_alive():self._writer.join()
+            self._bar_signal.set()
+            if self._bar_writer and self._bar_writer.is_alive():self._bar_writer.join()
             daily_archive.close_all()
             if auth:
                 try:auth.close()

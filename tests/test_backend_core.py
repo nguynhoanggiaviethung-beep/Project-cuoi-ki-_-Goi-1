@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.sli import config, database
@@ -74,6 +75,42 @@ class BackendCoreTests(unittest.TestCase):
                 self.assertIsNotNone(bar)
                 self.assertEqual(bar["session_phase"], "CONTINUOUS_PM")
                 self.assertEqual(bar["baseline_bucket"], "CLOSE")
+            finally:
+                config.DB_PATH = original
+
+    def test_observation_batch_commits_chunks_and_refreshes_each_minute_bar(self):
+        original = config.DB_PATH
+        with tempfile.TemporaryDirectory() as folder:
+            config.DB_PATH = Path(folder) / "batch.sqlite3"
+            try:
+                database.initialize()
+                base = datetime.fromisoformat("2026-11-06T09:15:00+07:00")
+                items = []
+                for offset in range(205):
+                    local = base + timedelta(seconds=offset)
+                    utc = local.astimezone(timezone.utc)
+                    item = book()
+                    item.update({
+                        "received_at_vn": local.isoformat(timespec="milliseconds"),
+                        "received_at_utc": utc.isoformat(timespec="milliseconds"),
+                        "source_ts_vn": local.isoformat(timespec="milliseconds"),
+                        "source_timestamp": local.isoformat(timespec="milliseconds"),
+                        "raw_payload": {}, "validation_status": "valid", "flags": [],
+                        "session_phase": "CONTINUOUS_AM",
+                    })
+                    items.append(item)
+
+                result = database.insert_observation_batch(items, "ssi")
+                self.assertEqual(result["inserted"], 205)
+                self.assertEqual(result["duplicate"], 0)
+                with database.connect() as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM observations WHERE source='ssi'").fetchone()[0], 205)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM metrics").fetchone()[0], 205)
+                    bars = db.execute("SELECT n_snapshots FROM bars_1m WHERE source='ssi' ORDER BY minute_vn").fetchall()
+                self.assertEqual([row[0] for row in bars], [60, 60, 60, 25])
+                retry = database.insert_observation_batch(items, "ssi")
+                self.assertEqual(retry["inserted"], 0)
+                self.assertEqual(retry["duplicate"], 205)
             finally:
                 config.DB_PATH = original
 

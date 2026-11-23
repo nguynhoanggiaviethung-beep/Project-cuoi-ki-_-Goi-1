@@ -1,7 +1,10 @@
 import json
+import heapq
 import math
 import sqlite3
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from statistics import median
@@ -21,6 +24,17 @@ METRIC_FIELDS = (
     "total_depth_value", "queue_imbalance", "value_imbalance",
     "depth_levels_used", "calculated_at",
 )
+_READ_ONLY_DB = ContextVar("sli_read_only_db", default=False)
+
+
+@contextmanager
+def read_only_scope():
+    """Make database.connect() open query-only connections in this request context."""
+    token = _READ_ONLY_DB.set(True)
+    try:
+        yield
+    finally:
+        _READ_ONLY_DB.reset(token)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -278,6 +292,12 @@ def aggregate_historical_bar_profile(source, start_at, end_before, symbol=None):
 
 @lru_cache(maxsize=8)
 def _aggregate_historical_bar_profile_cached(source, start_at, end_before, symbol, _five_second_bucket):
+    """Aggregate completed bars and repair current-session HNX/UPCoM phase labels for display.
+
+    A prior collector build tagged some HNX/UPCoM continuous-session quotes as ATO.
+    Their raw observations and metrics remain in SQLite. Re-evaluate only those
+    rows against the exchange-specific receive-time schedule without rewriting audit data.
+    """
     columns = ("spread_bps", "spread_ticks", "total_depth_value", "queue_imbalance")
     sql = "SELECT symbol,minute_vn,spread_bps,spread_ticks,total_depth_value,queue_imbalance,n_snapshots FROM bars_1m WHERE source=? AND minute_vn>=? AND minute_vn<?"
     args = [source, start_at, end_before]
@@ -300,13 +320,68 @@ def _aggregate_historical_bar_profile_cached(source, start_at, end_before, symbo
                 "median_queue_imbalance": median(bucket["queue_imbalance"]) if bucket["queue_imbalance"] else None,
                 "bar_count": count, "snapshot_count": snapshot_count, "symbols_count": symbol_count}
 
+    def receive_time_corrections(db):
+        if source != "ssi":
+            return iter(())
+        today=datetime.now(config.TIMEZONE).date().isoformat()
+        try:
+            start_dt=datetime.fromisoformat(str(start_at).replace("Z","+00:00"))
+            end_dt=datetime.fromisoformat(str(end_before).replace("Z","+00:00"))
+            if start_dt.tzinfo is None:start_dt=start_dt.replace(tzinfo=config.TIMEZONE)
+            if end_dt.tzinfo is None:end_dt=end_dt.replace(tzinfo=config.TIMEZONE)
+            if not (start_dt.astimezone(config.TIMEZONE).date().isoformat() <= today <= end_dt.astimezone(config.TIMEZONE).date().isoformat()):
+                return iter(())
+            start_utc=start_dt.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+            end_utc=end_dt.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        except (TypeError,ValueError):
+            return iter(())
+        correction_sql="""SELECT o.symbol,o.market,o.received_at_vn,m.spread_bps,m.spread_ticks,
+            m.total_depth_value,m.queue_imbalance
+            FROM observations o JOIN metrics m ON m.observation_id=o.id
+            WHERE o.source='ssi' AND o.received_at_utc>=? AND o.received_at_utc<?
+              AND substr(o.received_at_vn,1,10)=? AND o.market IN ('HNX','UPCOM')
+              AND o.validation_status='auction_phase' AND o.validation_reason='auction_phase'
+              AND (? IS NULL OR o.symbol=?)
+              AND NOT EXISTS (SELECT 1 FROM bars_1m b WHERE b.source=o.source AND b.symbol=o.symbol
+                AND b.minute_vn=substr(o.received_at_vn,1,16)||'+07:00')
+            ORDER BY substr(o.received_at_vn,1,16),o.symbol,o.received_at_utc,o.id"""
+        cursor=db.execute(correction_sql,(start_utc,end_utc,today,symbol,symbol))
+        def rows():
+            current_key=None; bucket=None
+            def emit(key,values):
+                if key is None:return None
+                minute,ticker=key
+                return {"symbol":ticker,"minute_vn":minute+"+07:00",
+                    "spread_bps":median(values["spread_bps"]) if values["spread_bps"] else None,
+                    "spread_ticks":median(values["spread_ticks"]) if values["spread_ticks"] else None,
+                    "total_depth_value":median(values["total_depth_value"]) if values["total_depth_value"] else None,
+                    "queue_imbalance":median(values["queue_imbalance"]) if values["queue_imbalance"] else None,
+                    "n_snapshots":values["n_snapshots"]}
+            for row in cursor:
+                if market_rules.session_phase(row["received_at_vn"],row["market"]) not in {"CONTINUOUS_AM","CONTINUOUS_PM"}:
+                    continue
+                key=(str(row["received_at_vn"])[:16],row["symbol"])
+                if current_key is not None and key!=current_key:
+                    item=emit(current_key,bucket)
+                    if item:yield item
+                    bucket=None
+                if key!=current_key:
+                    current_key=key;bucket={name:[] for name in columns};bucket["n_snapshots"]=0
+                bucket["n_snapshots"]+=1
+                for name in columns:
+                    if row[name] is not None:bucket[name].append(row[name])
+            item=emit(current_key,bucket)
+            if item:yield item
+        return rows()
+
     with connect() as db:
-        for row in db.execute(sql, args):
+        merged=heapq.merge(db.execute(sql,args),receive_time_corrections(db),
+            key=lambda row:(str(row["minute_vn"])[:16],row["symbol"]))
+        for row in merged:
             minute = str(row["minute_vn"])[:16]
             if minute != current_minute:
                 item = flush(current_minute, values or {}, symbols_count, snapshots, bar_count)
-                if item:
-                    profile.append(item)
+                if item:profile.append(item)
                 current_minute = minute
                 values = {key: [] for key in columns}
                 symbols_count = snapshots = bar_count = 0
@@ -315,11 +390,9 @@ def _aggregate_historical_bar_profile_cached(source, start_at, end_before, symbo
             bar_count += 1
             for key in columns:
                 value = row[key]
-                if value is not None:
-                    values[key].append(value)
+                if value is not None:values[key].append(value)
     item = flush(current_minute, values or {}, symbols_count, snapshots, bar_count)
-    if item:
-        profile.append(item)
+    if item:profile.append(item)
     return profile
 
 
@@ -521,11 +594,21 @@ def update_stale_alert(source, stale, threshold_seconds, latest_data_at=None):
 
 
 def connect(timeout=30):
-    config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(config.DB_PATH, timeout=timeout, factory=_ClosingConnection)
+    timeout = max(5.0, min(float(timeout), 30.0))
+    read_only = _READ_ONLY_DB.get()
+    if read_only:
+        db_uri = config.DB_PATH.resolve().as_uri() + "?mode=ro"
+        db = sqlite3.connect(db_uri, uri=True, timeout=timeout, factory=_ClosingConnection)
+    else:
+        config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(config.DB_PATH, timeout=timeout, factory=_ClosingConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
+    db.execute(f"PRAGMA busy_timeout = {max(5000, int(timeout * 1000))}")
     db.execute("PRAGMA synchronous = NORMAL")
+    db.execute("PRAGMA cache_size = -8192")
+    if read_only:
+        db.execute("PRAGMA query_only = ON")
     return db
 
 
@@ -1022,8 +1105,10 @@ def backup_local_profile_json():
     return target.name
 
 
-def _insert(db, observation, source, refresh_bar=True):
-    metrics = calculate_metrics(observation)
+def _insert(db, observation, source, refresh_bar=True, metrics=None):
+    # Batch callers can pass the already calculated metrics so the hot writer
+    # does not calculate the same observation twice.
+    metrics = metrics if metrics is not None else calculate_metrics(observation)
     raw = sanitize_payload(observation.get("raw_payload") or {})
     received_vn = observation.get("received_at_vn") or _to_vietnam_time(observation.get("received_at_utc"))
     event_time = (observation.get("source_ts_vn") or observation.get("source_timestamp")
@@ -1720,26 +1805,64 @@ def fetch_latest_historical_page(search=None, page=1, page_size=50, source="ssi"
     return {"total":total,"page":page,"page_size":page_size,"rows":[dict(row) for row in rows]}
 
 
-def insert_observation_batch(observations, source="ssi", evaluate_alerts=True):
+def insert_observation_batch(observations, source="ssi", evaluate_alerts=True, refresh_bars=True):
     counts={"inserted":0,"duplicate":0,"valid":0,"invalid":0,"last_persisted_at":None}
     if not observations:return counts
-    refresh_groups={}
-    with connect() as db:
-        for observation in observations:
-            observation_id=_insert(db,observation,source,refresh_bar=False)
-            if observation_id is None: counts["duplicate"]+=1
-            else:
+    # Keep write transactions bounded. The previous implementation inserted a
+    # whole collector batch and rebuilt every affected bar before committing;
+    # long batches held SQLite's single-writer lock and delayed heartbeats and
+    # other writes. Small commits preserve the same rows and calculations while
+    # allowing other short writes to make progress between chunks.
+    chunk_size = 200
+    deferred_bar_jobs={}
+    for offset in range(0, len(observations), chunk_size):
+        refresh_groups={}
+        with connect() as db:
+            for observation in observations[offset:offset + chunk_size]:
+                metrics = calculate_metrics(observation)
+                observation_id=_insert(db,observation,source,refresh_bar=False,metrics=metrics)
+                if observation_id is None:
+                    counts["duplicate"]+=1
+                    continue
                 counts["inserted"]+=1
                 counts["valid" if observation.get("validation_status")=="valid" else "invalid"]+=1
                 stamp=observation.get("received_at_vn") or observation.get("received_at_utc") or ""
-                try: minute=datetime.fromisoformat(stamp.replace("Z","+00:00")).astimezone(config.TIMEZONE).replace(second=0,microsecond=0).isoformat(timespec="minutes")
-                except (ValueError,TypeError): minute=None
-                if minute: refresh_groups[(observation["symbol"],minute)]=(observation,observation_id)
+                try:
+                    minute=datetime.fromisoformat(stamp.replace("Z","+00:00")).astimezone(config.TIMEZONE).replace(second=0,microsecond=0).isoformat(timespec="minutes")
+                except (ValueError,TypeError):
+                    minute=None
+                if minute:
+                    refresh_groups[(observation["symbol"],minute)]=(observation,observation_id,metrics)
                 counts["last_persisted_at"]=observation.get("received_at_utc") or counts["last_persisted_at"]
-        for observation,observation_id in refresh_groups.values():
-            _refresh_bar(db,observation,source,calculate_metrics(observation),observation_id,
-                         evaluate_alerts=evaluate_alerts)
+            # Keep each transaction atomic for its observations and bars. If a
+            # later chunk must be retried, earlier chunks already have their
+            # matching bars and this chunk rolls back as a unit.
+            if refresh_bars:
+                for observation,observation_id,metrics in refresh_groups.values():
+                    _refresh_bar(db,observation,source,metrics,observation_id,
+                                 evaluate_alerts=evaluate_alerts)
+        if not refresh_bars:
+            deferred_bar_jobs.update(refresh_groups)
+    if not refresh_bars:
+        # Raw observations and metrics are committed before derived bar work is
+        # handed to the collector's coalescing materializer.
+        counts["bar_refresh_jobs"]=list(deferred_bar_jobs.values())
     return counts
+
+
+def refresh_observation_bar_batch(jobs, source="ssi", evaluate_alerts=True):
+    """Materialize coalesced bars separately from the quote ingest transaction."""
+    if not jobs:
+        return 0
+    refreshed=0
+    chunk_size=25
+    for offset in range(0,len(jobs),chunk_size):
+        with connect() as db:
+            for observation,observation_id,metrics in jobs[offset:offset+chunk_size]:
+                _refresh_bar(db,observation,source,metrics,observation_id,
+                             evaluate_alerts=evaluate_alerts)
+                refreshed+=1
+    return refreshed
 
 
 def insert_trade_batch(trades, source="ssi"):
@@ -1873,6 +1996,62 @@ def fetch_market_breadth(limit=90, source="ssi", start_date=None, end_date=None,
           AND (? IS NULL OR replace(trading_date,'/','-')<=?) ORDER BY trading_date DESC LIMIT ?""",
           (source,selected_board,selected_board,source,start_date,start_date,end_date,end_date,limit)).fetchall()
     return list(reversed([dict(row) for row in rows]))
+
+
+def fetch_market_breadth_intraday(session_date, source="ssi", board=None):
+    """Build minute-by-minute SSI market breadth from saved valid trades.
+
+    Each point carries each symbol's most recent trade price in the session,
+    compared with that symbol's last completed daily SSI close before the
+    selected session. Symbols without a saved trade are not counted as flat.
+    """
+    day=str(session_date).replace("/","-")[:10]
+    day_db=day.replace("-","/")
+    next_day=(datetime.fromisoformat(day)+timedelta(days=1)).date().isoformat()
+    selected_board=str(board or "").strip().upper() or None
+    with connect(timeout=30) as db:
+        universe=db.execute("""SELECT s.symbol,
+            (SELECT h.close_price FROM historical_prices h
+             WHERE h.source=? AND h.symbol=s.symbol AND h.timeframe='1d'
+               AND h.trading_date<? AND h.close_price IS NOT NULL
+             ORDER BY h.trading_date DESC LIMIT 1) AS prior_close
+            FROM securities_catalog s
+            WHERE s.source=? AND lower(trim(s.stock_type))='stock'
+              AND (? IS NULL OR upper(trim(s.board))=?)
+            ORDER BY s.symbol""",(source,day_db,source,selected_board,selected_board)).fetchall()
+        prior_close={row["symbol"]:float(row["prior_close"]) for row in universe if row["prior_close"] is not None}
+        cursor=db.execute("""SELECT t.symbol,substr(t.received_at_vn,12,5) AS minute,t.price
+            FROM trade_ticks t JOIN securities_catalog s
+              ON s.source=t.source AND s.symbol=t.symbol
+            WHERE t.source=? AND t.validation_status='valid'
+              AND t.received_at_vn>=? AND t.received_at_vn<?
+              AND lower(trim(s.stock_type))='stock'
+              AND (? IS NULL OR upper(trim(s.board))=?)
+            ORDER BY t.received_at_vn,t.id""",
+            (source,f"{day}T00:00:00",f"{next_day}T00:00:00",selected_board,selected_board))
+        state={};counts={1:0,0:0,-1:0};points=[];current_minute=None;ticks=0
+        def save_point(minute):
+            observed=len(state)
+            points.append({"minute":f"{day}T{minute}:00+07:00",
+                "advancing":counts[1],"unchanged":counts[0],"declining":counts[-1],
+                "observed_symbols":observed,"sample_count":observed,
+                "total_symbols":len(universe),"no_comparison":max(0,len(universe)-observed)})
+        for row in cursor:
+            minute=row["minute"]
+            if current_minute is not None and minute!=current_minute:
+                save_point(current_minute)
+            current_minute=minute;ticks+=1
+            symbol=row["symbol"];close=prior_close.get(symbol)
+            if close is None:continue
+            price=float(row["price"]);direction=1 if price>close else -1 if price<close else 0
+            old=state.get(symbol)
+            if old is not None:counts[old]-=1
+            state[symbol]=direction;counts[direction]+=1
+        if current_minute is not None:save_point(current_minute)
+    return {"source":source,"session_date":day,"board":selected_board or "ALL",
+            "rows":points,"count":len(points),"trade_ticks":ticks,
+            "symbols_with_prior_close":len(prior_close),"total_symbols":len(universe),
+            "note":"Mỗi điểm là trạng thái cuối phút từ giao dịch khớp SSI đã lưu: giá khớp mới nhất của từng mã trong phiên so với giá đóng cửa OHLC SSI phiên trước. Giá được giữ nguyên giữa các phút chưa có giao dịch; mã chưa có giao dịch trong phiên không tính là đứng giá."}
 
 
 def fetch_market_ohlc_sessions(limit=60, source="ssi", start_date=None, end_date=None, board=None):

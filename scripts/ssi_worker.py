@@ -69,7 +69,7 @@ def main() -> int:
         collector.stop()
         thread = collector._thread
         if thread and thread.is_alive():
-            thread.join(timeout=20)
+            thread.join()
         lock.release()
 
 

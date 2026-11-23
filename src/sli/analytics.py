@@ -73,7 +73,8 @@ def map_message(payload):
             elif delay_seconds < -config.CLOCK_SKEW_TOLERANCE_SECONDS:
                 time_flags.append("future_source_timestamp")
         market = market_for(symbol, item.get("market", item.get("exchange")))
-        phase = session_phase(event_time, market)
+        # Classify against the same exchange-local receive clock used to build bars.
+        phase = session_phase(received, market)
         observation = {
             "symbol": symbol,
             "source_timestamp": source_timestamp,

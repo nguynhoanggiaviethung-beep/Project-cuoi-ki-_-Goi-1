@@ -12,8 +12,7 @@ import threading
 import time
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.routing import APIRoute
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config, database
@@ -25,11 +24,9 @@ from .bookwalk import estimate as estimate_bookwalk
 from .market_clock import get_clock_now, get_market_state
 from .ranking import attach_rank_movement, calculate_symbol_row, is_rankable_stock, rank_rows
 from .collector import RuntimeState
-from .ssi_collector import SsiCollector
 
 STATIC_DIR = config.ROOT_DIR / "frontend"
 runtime = RuntimeState()
-ssi_collector = SsiCollector(runtime)
 _demo_thread = None
 _demo_stop = threading.Event()
 _worker_process = None
@@ -49,11 +46,13 @@ def _health_snapshot_loop():
         persisted_at = None
         busy = False
         try:
-            worker_run = database.latest_collector_run(timeout=1)
+            with database.read_only_scope():
+                worker_run = database.latest_collector_run(timeout=1)
         except Exception:
             busy = True
         try:
-            persisted_at = database.latest_observation_received_at("ssi", timeout=1)
+            with database.read_only_scope():
+                persisted_at = database.latest_observation_received_at("ssi", timeout=1)
         except Exception:
             busy = True
         with _health_snapshot_lock:
@@ -152,40 +151,20 @@ def _derive_pipeline_state(*,expected_stream,worker_active,connection_status,sub
             "queue_depth":int(queue_depth or 0),"queue_dropped":int(queue_dropped or 0)}
 
 
-class MarketMetaRoute(APIRoute):
-    def get_route_handler(self):
-        original=super().get_route_handler()
-        async def handler(request):
-            response=await original(request)
-            if "application/json" not in response.headers.get("content-type","") or not hasattr(response,"body"):
-                return response
-            try:
-                payload=json.loads(response.body)
-            except (ValueError,TypeError):
-                return response
-            # These routes either carry their own time window/data status or are
-            # auxiliary lookups. Avoid appending full market metadata here:
-            # _market_meta scans historical OHLC fetch timestamps and blocks the
-            # event loop on the multi-year database. In particular, rankings
-            # must finish quickly so the dashboard cannot remain on its spinner.
-            if request.url.path in {"/api/market-history-range", "/api/symbols", "/api/status", "/api/rankings"}:
-                return response
-            if isinstance(payload,dict) and "meta" not in payload:
-                selected=request.query_params.get("source") or _source()
-                payload["meta"]=_market_meta(selected)
-                headers={k:v for k,v in response.headers.items() if k.lower() not in {"content-length","content-type"}}
-                return JSONResponse(payload,status_code=response.status_code,headers=headers,background=response.background)
-            return response
-        return handler
-
-
 app = FastAPI(
     title="Stock Liquidity Intelligence",
     description="Local dashboard for observing displayed stock order-book liquidity.",
     version="0.1.0",
 )
-app.router.route_class=MarketMetaRoute
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+
+@app.middleware("http")
+async def sqlite_read_only_for_get(request: Request, call_next):
+    if request.method != "GET":
+        return await call_next(request)
+    with database.read_only_scope():
+        return await call_next(request)
 
 
 def _market_meta(source=None):
@@ -193,8 +172,21 @@ def _market_meta(source=None):
     now=time.monotonic()
     with _market_meta_lock:
         cached=_market_meta_cache.get(source)
-        if cached and now-cached[0] < 2:
-            return cached[1]
+        if cached:
+            # Metadata includes several read-only queries over the multi-GB
+            # history DB. Reuse it for a short window; expire at a market
+            # phase boundary so ATO/continuous/lunch/close labels stay timely.
+            ttl=15.0
+            next_change=cached[1].get("next_change_at")
+            if next_change:
+                try:
+                    seconds_to_change=(datetime.fromisoformat(next_change)-get_clock_now()).total_seconds()
+                    if seconds_to_change <= ttl:
+                        ttl=max(0.0,seconds_to_change)
+                except (TypeError,ValueError):
+                    pass
+            if now-cached[0] < ttl:
+                return cached[1]
         # Keep the lock during a cache miss so simultaneous dashboard requests
         # share one metadata query instead of each scanning the large SSI DB.
         result=_compute_market_meta(source)
@@ -262,16 +254,18 @@ async def market_stream(request: Request):
             # Market metadata and overview queries hit SQLite synchronously.
             # Running them on the event loop starves page reloads and status
             # requests whenever the live stream is busy.
-            meta=await asyncio.to_thread(_market_meta)
+            with database.read_only_scope():
+                meta=await asyncio.to_thread(_market_meta)
             exchange_key=tuple((name,item["state"],item.get("phase")) for name,item in sorted(meta.get("exchange_states",{}).items()))
             state_key=(meta["state"],meta.get("phase"),meta.get("session_date"),exchange_key)
             if state_key!=prior_state:
                 yield "event: market_state\ndata: "+json.dumps(meta,ensure_ascii=False)+"\n\n"
                 prior_state=state_key
             if meta["state"]=="IN_SESSION":
-                payload=await asyncio.to_thread(
-                    overview, symbol="__all__", limit=240, window_minutes=60, phase=None
-                )
+                with database.read_only_scope():
+                    payload=await asyncio.to_thread(
+                        overview, symbol="__all__", limit=240, window_minutes=60, phase=None
+                    )
                 yield "event: data_diff\ndata: "+json.dumps({"meta":meta,"data":payload},ensure_ascii=False,default=str)+"\n\n"
                 until_change=max(0.25,(datetime.fromisoformat(meta["next_change_at"])-get_clock_now()).total_seconds()/meta.get("clock_speed",1)) if meta.get("next_change_at") else 60
                 await asyncio.sleep(min(meta["refresh_seconds"] or 5,until_change))
@@ -300,32 +294,27 @@ def startup():
         # schema bootstrap or changing WAL mode on the live collector database.
         database.migrate_inv_d_settings()
         database.migrate_inv_c_positions()
-    # Keep SSI collection independent of browser tabs and start it again when
-    # the web backend is restarted, provided local SSI credentials are set.
-    if os.getenv("SSI_API_KEY", "").strip() and os.getenv("SSI_API_SECRET", "").strip():
-        def ensure_collector():
-            try:
-                current = database.latest_collector_run()
-                # Respect an explicit stop request across a web restart. A failed,
-                # abandoned, or stale worker is recovered automatically.
-                if current and current.get("status") == "stopped" and current.get("ended_at"):
-                    return
-                start_collector()
-            except Exception as exc:
-                database.log_ingestion_error(
-                    f"collector_autostart_{type(exc).__name__}: {str(exc)[:180]}", source="ssi"
-                )
-        threading.Thread(target=ensure_collector, name="sli-collector-autostart", daemon=True).start()
+    if not database.fetch_local_watchlists():
+        database.create_local_watchlist("Danh mục của tôi")
+    # Collector lifecycle is owned by run_collector.py, never by the web app.
 
 
 @app.on_event("shutdown")
 def shutdown():
-    ssi_collector.stop()
     _stop_demo_loop()
 
 
 @app.get("/")
-def home():
+def home(request: Request):
+    # Streamlit is the only user-facing entrypoint. It embeds this dashboard
+    # with a build query so the existing UI remains intact inside the shell.
+    # Direct visits to the backend root go to the canonical Streamlit URL.
+    if not request.query_params.get("_sli_build"):
+        return RedirectResponse(
+            url=os.getenv("SLI_STREAMLIT_URL", "http://127.0.0.1:8501/"),
+            status_code=302,
+            headers={"Cache-Control": "no-store"},
+        )
     return FileResponse(STATIC_DIR / "index.html")
 
 
@@ -369,7 +358,7 @@ def _serialize_row(row):
 
 
 @app.get("/api/status")
-async def status():
+def status():
     state = runtime.snapshot()
     with _health_snapshot_lock:
         worker_run = _health_snapshot.get("worker_run")
@@ -612,6 +601,19 @@ def market_breadth(limit: int = Query(default=10000, ge=2, le=10000), from_date:
             "note":"Độ rộng thị trường được tổng hợp từ OHLC ngày SSI của cổ phiếu thường: số mã tăng/giảm/đứng giá so với phiên trước. Phiên thiếu độ phủ vẫn tính từ bản ghi SSI có sẵn; mã không có bản ghi không được tính là đứng giá. Không phải dữ liệu sổ lệnh."}
 
 
+@lru_cache(maxsize=32)
+def _cached_market_breadth_intraday(session_date, board, cache_minute):
+    return database.fetch_market_breadth_intraday(session_date,source="ssi",board=board)
+
+
+@app.get("/api/market-breadth-intraday")
+def market_breadth_intraday(session_date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                            board: str | None = Query(default=None, pattern="^(HOSE|HNX|UPCOM)$")):
+    cache_minute=int(datetime.now(config.TIMEZONE).timestamp()//60)
+    result=_cached_market_breadth_intraday(session_date,board,cache_minute)
+    return result
+
+
 @app.get("/api/market-turnover")
 def market_turnover(limit: int = Query(default=10000, ge=20, le=10000),
                     metric: str = Query(default="value", pattern="^(value|volume)$"),
@@ -708,9 +710,6 @@ def delete_local_position(position_id:int):
 @app.get("/api/me/watchlists")
 def local_watchlists():
     watchlists=database.fetch_local_watchlists()
-    if not watchlists:
-        watchlist_id=database.create_local_watchlist("Danh mục của tôi")
-        watchlists=database.fetch_local_watchlists()
     return {"profile":"local","watchlists":watchlists,"max_watchlists":5,"max_symbols_per_list":50}
 
 
@@ -933,6 +932,7 @@ def import_local_profile(payload:dict=Body(...)):
 @app.get("/api/overview")
 def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le=2000),
              window_minutes: int = Query(default=60, ge=5, le=390),
+             summary_only: bool = False,
              start_at: str | None = None, end_at: str | None = None,
              phase: str | None = Query(default=None, pattern="^(ATO|CONTINUOUS_AM|BREAK|CONTINUOUS_PM|ATC|CLOSED)$")):
     source = _source()
@@ -940,26 +940,28 @@ def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le
     window_start,window_end=_market_window(window_minutes,source)
     start_at=start_at or window_start
     end_at=end_at or window_end
+    raw_groups = {}
     if selected:
         recent = database.fetch_observations(source, symbol=selected, limit=1,
             start_at=start_at, end_at=end_at, phase=phase)
-        groups = {selected: [_serialize_row(row) for row in reversed(recent)]} if recent else {}
+        raw_groups = {selected: list(reversed(recent))} if recent else {}
     else:
         # One latest quote per ticker within a shared clock window keeps KPI scope comparable.
         effective_limit = 1
         raw_groups = database.fetch_recent_observations_by_symbol(source, effective_limit, start_at, end_at, phase)
+    groups = {}
+    flattened = [row for series in raw_groups.values() for row in series]
+    if not summary_only:
         display_fields = {"symbol", "received_at_utc", "received_at_vn", "source_ts_vn", "market",
             "session_phase", "validation_status", "validation_reason", "last_price", "spread_bps",
             "spread_ticks", "mid_price", "bid_depth_value", "ask_depth_value", "total_depth_value",
             "queue_imbalance", "bid_price_1", "bid_volume_1", "ask_price_1", "ask_volume_1"}
-        groups = {}
         for ticker, rows in raw_groups.items():
             series=[]
             for row in rows:
                 clean=_serialize_row(row)
-                series.append({key: clean.get(key) for key in display_fields})
+                series.append({key:clean.get(key) for key in display_fields})
             groups[ticker]=series
-    flattened = [row for series in groups.values() for row in series]
     valid = [row for row in flattened if row["validation_status"] == "valid"]
     spreads = _numeric([row["spread_bps"] for row in valid])
     depths = _numeric([row["total_depth_value"] for row in valid])
@@ -972,9 +974,12 @@ def overview(symbol: str | None = None, limit: int = Query(default=240, ge=1, le
         "window_basis":"shared_clock_window; chart bars exclude the unfinished minute",
         "valid_snapshot_rate": len(valid) / count if count else None,
         "median_spread_bps": median(spreads) if spreads else None,
+        "median_spread_ticks": median(_numeric([row.get("spread_ticks") for row in valid])) if valid else None,
         "median_total_depth_value": median(depths) if depths else None,
         "median_queue_imbalance": median(imbalances) if imbalances else None,
-        "series": groups.get(selected, []) if selected else [], "series_by_symbol": groups}
+        "summary_only": summary_only,
+        "series": groups.get(selected, []) if selected else [],
+        "series_by_symbol": {} if summary_only else groups}
 
 
 @app.get("/api/trades")
